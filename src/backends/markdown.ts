@@ -345,6 +345,7 @@ export class MarkdownStore implements Store {
       realtimeSync: false,
       customStates: true,
       serverMintsIds: false,
+      collectionTransfer: true,
       publicFollowups: true,
     };
   }
@@ -830,6 +831,22 @@ export class MarkdownStore implements Store {
    * endpoints travel together; `requireNoSplitDeps` refuses any move that would
    * strand a link across the two files.
    */
+  /**
+   * `Store.transferMany`. A markdown backlog can only be moved into another
+   * markdown backlog, because the all-or-nothing guarantee comes from locking
+   * both files at once; any other destination is refused before a write rather
+   * than degraded into a copy-then-remove that could strand a dependency edge.
+   */
+  async transferMany(ids: string[], destination: Store): Promise<Task[]> {
+    if (!(destination instanceof MarkdownStore)) {
+      throw new AxiError(
+        `The markdown backend can only transfer tasks into another markdown backlog, not "${destination.capabilities().backend}"`,
+        "UNSUPPORTED",
+      );
+    }
+    return this.moveManyTo(ids, destination);
+  }
+
   async moveManyTo(ids: string[], target: MarkdownStore): Promise<Task[]> {
     const uniqueIds = [...new Set(ids)];
     return withLocks([this.path, target.path], () => {
