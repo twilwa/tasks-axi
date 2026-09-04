@@ -35,6 +35,35 @@ export function notFound(id: string, options: NotFoundOptions = {}): AxiError {
 }
 
 /**
+ * The one operator-facing contract for a move that copied a task into the
+ * destination, then failed to remove the source AND failed to roll the copy
+ * back. Both the atomic backend path and the command-layer fallback raise it,
+ * so the wording an operator has to act on cannot drift between them.
+ */
+export function partialMoveError(
+  id: string,
+  originalError: unknown,
+  rollbackError: unknown,
+  destination?: string,
+): AxiError {
+  return new AxiError(
+    `Move of "${id}" partially completed; task now exists in both backlogs`,
+    "CONFLICT",
+    [
+      destination
+        ? `Remove "${id}" from ${destination} manually before retrying`
+        : "Remove the duplicate from the destination backlog manually before retrying",
+      `Source removal failed: ${describeError(originalError)}`,
+      `Destination rollback failed: ${describeError(rollbackError)}`,
+    ],
+  );
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
  * A capability the active backend does not support was requested. The
  * capability is named so the error is actionable rather than a raw failure
  * (AXI house style §6; report §8 graceful degradation).

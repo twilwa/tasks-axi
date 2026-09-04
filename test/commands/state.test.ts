@@ -15,35 +15,7 @@ import {
 import { listCommand } from "../../src/commands/crud.js";
 import { AxiError } from "../../src/errors.js";
 import type { TasksContext } from "../../src/context.js";
-import type { Store } from "../../src/store.js";
-import { makeBacklog } from "../helpers.js";
-
-/**
- * A context whose store keeps every core verb but drops the atomic transfer,
- * standing in for a backend that cannot move a set of tasks in one transaction.
- */
-function withoutCollectionTransfer(ctx: TasksContext): TasksContext {
-  const store: Store = {
-    ...ctx.store,
-    capabilities: () => ({
-      ...ctx.store.capabilities(),
-      backend: "stub",
-      collectionTransfer: false,
-    }),
-    create: (input) => ctx.store.create(input),
-    get: (id) => ctx.store.get(id),
-    update: (id, patch) => ctx.store.update(id, patch),
-    remove: (id) => ctx.store.remove(id),
-    list: (query) => ctx.store.list(query),
-    transition: (id, to, opts) => ctx.store.transition(id, to, opts),
-    addDep: (id, dep) => ctx.store.addDep(id, dep),
-    removeDep: (id, dep) => ctx.store.removeDep(id, dep),
-    updatePublicFollowup: (id, mutation) =>
-      ctx.store.updatePublicFollowup(id, mutation),
-  };
-  delete store.transferMany;
-  return { ...ctx, store };
-}
+import { makeBacklog, withoutCollectionTransfer } from "../helpers.js";
 
 /** The same stub, but whose `remove` refuses the way an active obligation does. */
 function withRefusingRemove(ctx: TasksContext, error: Error): TasksContext {

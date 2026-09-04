@@ -19,7 +19,11 @@ import {
   clonePublicFollowup,
   encodePublicFollowup,
 } from "../../src/public-followup.js";
-import { makeBacklog, type TempBacklog } from "../helpers.js";
+import {
+  makeBacklog,
+  withoutCollectionTransfer,
+  type TempBacklog,
+} from "../helpers.js";
 
 const EMPTY =
   "# Backlog\n\n## In flight\n\n## Queued\n- [ ] ordinary-q1 - ordinary work\n\n## Done\n";
@@ -231,6 +235,34 @@ describe("public-followup commands", () => {
       expect(readFileSync(target.path, "utf8")).toContain(
         "<!-- tasks-axi:public-followup/v1:",
       );
+    } finally {
+      b.cleanup();
+      target.cleanup();
+    }
+  });
+
+  it("refuses to move a live obligation without an atomic transfer", async () => {
+    const b = makeBacklog(EMPTY);
+    const target = makeBacklog(
+      "# Backlog\n\n## In flight\n\n## Queued\n\n## Done\n",
+    );
+    try {
+      await add(b);
+      const before = b.read();
+      await expect(
+        mvCommand(
+          ["public-final-ab", "--to", target.path],
+          withoutCollectionTransfer(b.ctx),
+        ),
+      ).rejects.toMatchObject({
+        code: "VALIDATION_ERROR",
+        message: expect.stringContaining("live public obligation"),
+      });
+      // Refused before any write: no duplicate obligation to reconcile.
+      expect(readFileSync(target.path, "utf8")).not.toContain(
+        "public-final-ab",
+      );
+      expect(b.read()).toBe(before);
     } finally {
       b.cleanup();
       target.cleanup();

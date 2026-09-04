@@ -6,7 +6,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { AxiError } from "../errors.js";
+import { AxiError, partialMoveError } from "../errors.js";
 import { validateDependencyId, validateId } from "../id.js";
 import type {
   Dep,
@@ -510,30 +510,6 @@ export class MarkdownStore implements Store {
     this.persist(loaded);
   }
 
-  private partialMoveError(
-    id: string,
-    originalError: unknown,
-    rollbackError: unknown,
-  ): AxiError {
-    const originalMessage =
-      originalError instanceof Error
-        ? originalError.message
-        : String(originalError);
-    const rollbackMessage =
-      rollbackError instanceof Error
-        ? rollbackError.message
-        : String(rollbackError);
-    return new AxiError(
-      `Move of "${id}" partially completed; task now exists in both backlogs`,
-      "CONFLICT",
-      [
-        "Remove the duplicate from the destination backlog manually before retrying",
-        `Source removal failed: ${originalMessage}`,
-        `Destination rollback failed: ${rollbackMessage}`,
-      ],
-    );
-  }
-
   private taskFromInput(input: TaskInput): Task {
     const id = validateId(input.id);
     const state: State = input.state ?? "queued";
@@ -902,11 +878,7 @@ export class MarkdownStore implements Store {
         try {
           for (const id of uniqueIds) target.removeCreatedTask(id);
         } catch (rollbackError) {
-          throw this.partialMoveError(
-            uniqueIds.join(", "),
-            error,
-            rollbackError,
-          );
+          throw partialMoveError(uniqueIds.join(", "), error, rollbackError);
         }
         throw error;
       }

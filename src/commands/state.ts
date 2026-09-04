@@ -18,7 +18,7 @@ import {
   readyPublicFollowups,
   readyTasks,
 } from "../derive.js";
-import { AxiError, notFound } from "../errors.js";
+import { AxiError, notFound, partialMoveError } from "../errors.js";
 import { formatCountLine } from "../format.js";
 import { validateDependencyId } from "../id.js";
 import type {
@@ -34,6 +34,7 @@ import { HOLD_KINDS } from "../model.js";
 import {
   PUBLIC_FOLLOWUP_KIND,
   clonePublicFollowup,
+  isPublicFollowupTerminal,
 } from "../public-followup.js";
 import type { Store } from "../store.js";
 import { getSuggestions } from "../suggestions.js";
@@ -695,11 +696,34 @@ async function requireNoSplitDeps(
 }
 
 /**
+ * A live public obligation cannot survive a copy-then-remove move. The source
+ * removal is refused while the obligation is open, and the destination copy is
+ * refused for the same reason, so no rollback can undo it — the only outcome
+ * that keeps the obligation single is refusing before anything is written. The
+ * asymmetry with the atomic path (which relocates a live obligation happily) is
+ * deliberate: it never has a half-applied state to fall into.
+ */
+function requireRelocatableObligation(task: Task): void {
+  if (!task.public_followup || isPublicFollowupTerminal(task.public_followup)) {
+    return;
+  }
+  throw new AxiError(
+    `Task "${task.id}" carries a live public obligation and can only be moved by a backend that supports atomic transfers (capability: collectionTransfer)`,
+    "VALIDATION_ERROR",
+    [
+      `Complete or cancel the obligation first, e.g. \`tasks-axi public-followup record-delivery ${task.id}\` or \`tasks-axi public-followup waive ${task.id}\``,
+    ],
+  );
+}
+
+/**
  * Undo the destination copy a non-atomic transfer already wrote, after the
  * source removal was refused. Compensating here keeps both collections exactly
  * as they were, which the reverse order (remove first) could not: that would
- * trade a duplicate for a lost task. If the compensation itself fails the
- * operator is told about both the refusal and the copy left behind.
+ * trade a duplicate for a lost task. This is the backstop for backend-specific
+ * preconditions the command layer cannot see on the model; if the compensation
+ * itself fails the operator is told about both the refusal and the copy left
+ * behind.
  */
 async function undoStagedCopy(
   target: Store,
@@ -710,21 +734,9 @@ async function undoStagedCopy(
   try {
     await target.remove(id);
   } catch (rollbackError) {
-    throw new AxiError(
-      `Move of "${id}" partially completed; task now exists in both backlogs`,
-      "CONFLICT",
-      [
-        `Remove "${id}" from ${targetPath} manually before retrying`,
-        `Source removal failed: ${describeError(cause)}`,
-        `Destination rollback failed: ${describeError(rollbackError)}`,
-      ],
-    );
+    throw partialMoveError(id, cause, rollbackError, targetPath);
   }
   throw cause;
-}
-
-function describeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function resolveBacklogTarget(to: string): string {
@@ -823,6 +835,7 @@ export async function mvCommand(
     // atomic path performs internally — otherwise the weaker path would quietly
     // accept moves the stronger one refuses.
     await requireNoSplitDeps(store, target, ids, tasks);
+    requireRelocatableObligation(tasks[0]);
     await target.create(taskToInput(tasks[0]));
     try {
       await store.remove(ids[0]);
