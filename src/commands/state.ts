@@ -34,7 +34,6 @@ import { HOLD_KINDS } from "../model.js";
 import {
   PUBLIC_FOLLOWUP_KIND,
   clonePublicFollowup,
-  isPublicFollowupTerminal,
 } from "../public-followup.js";
 import type { Store } from "../store.js";
 import { getSuggestions } from "../suggestions.js";
@@ -696,22 +695,18 @@ async function requireNoSplitDeps(
 }
 
 /**
- * A live public obligation cannot survive a copy-then-remove move. The source
- * removal is refused while the obligation is open, and the destination copy is
- * refused for the same reason, so no rollback can undo it — the only outcome
- * that keeps the obligation single is refusing before anything is written. The
- * asymmetry with the atomic path (which relocates a live obligation happily) is
- * deliberate: it never has a half-applied state to fall into.
+ * Relocating a durable public obligation is only safe on a backend that can
+ * move it atomically, so a copy-then-remove fallback declines outright rather
+ * than half-moving it or failing confusingly mid-write. The atomic path carries
+ * obligations happily because it never has a half-applied state to fall into.
  */
-function requireRelocatableObligation(task: Task): void {
-  if (!task.public_followup || isPublicFollowupTerminal(task.public_followup)) {
-    return;
-  }
+function requireNoPublicObligation(task: Task): void {
+  if (!task.public_followup) return;
   throw new AxiError(
-    `Task "${task.id}" carries a live public obligation and can only be moved by a backend that supports atomic transfers (capability: collectionTransfer)`,
+    `Task "${task.id}" carries a public obligation and can only be moved by a backend that supports atomic transfers (capability: collectionTransfer)`,
     "VALIDATION_ERROR",
     [
-      `Complete or cancel the obligation first, e.g. \`tasks-axi public-followup record-delivery ${task.id}\` or \`tasks-axi public-followup waive ${task.id}\``,
+      `Leave the obligation where it is, or close it out first, e.g. \`tasks-axi public-followup record-delivery ${task.id} --receipt-file <file>\` or \`tasks-axi public-followup waive ${task.id} --reason <text> --approved-by captain\``,
     ],
   );
 }
@@ -826,7 +821,13 @@ export async function mvCommand(
   }
 
   const capabilities = store.capabilities();
-  if (capabilities.collectionTransfer && store.transferMany) {
+  if (capabilities.collectionTransfer) {
+    if (!store.transferMany) {
+      throw new AxiError(
+        `The "${capabilities.backend}" backend declares the collectionTransfer capability but does not implement transferMany`,
+        "UNSUPPORTED",
+      );
+    }
     await store.transferMany(ids, target);
   } else if (ids.length === 1) {
     // Without an atomic transfer the copy and the removal are two writes, so a
@@ -835,7 +836,7 @@ export async function mvCommand(
     // atomic path performs internally — otherwise the weaker path would quietly
     // accept moves the stronger one refuses.
     await requireNoSplitDeps(store, target, ids, tasks);
-    requireRelocatableObligation(tasks[0]);
+    requireNoPublicObligation(tasks[0]);
     await target.create(taskToInput(tasks[0]));
     try {
       await store.remove(ids[0]);

@@ -241,31 +241,46 @@ describe("public-followup commands", () => {
     }
   });
 
-  it("refuses to move a live obligation without an atomic transfer", async () => {
-    const b = makeBacklog(EMPTY);
-    const target = makeBacklog(
-      "# Backlog\n\n## In flight\n\n## Queued\n\n## Done\n",
-    );
-    try {
-      await add(b);
-      const before = b.read();
-      await expect(
-        mvCommand(
-          ["public-final-ab", "--to", target.path],
-          withoutCollectionTransfer(b.ctx),
-        ),
-      ).rejects.toMatchObject({
-        code: "VALIDATION_ERROR",
-        message: expect.stringContaining("live public obligation"),
-      });
-      // Refused before any write: no duplicate obligation to reconcile.
-      expect(readFileSync(target.path, "utf8")).not.toContain(
-        "public-final-ab",
+  it("refuses to move any obligation without an atomic transfer", async () => {
+    for (const finish of [
+      undefined,
+      async (b: TempBacklog) => {
+        await run(b, "waive", [
+          "public-final-ab",
+          "--reason",
+          "No safe historical context remains",
+          "--approved-by",
+          "captain",
+          "--json",
+        ]);
+      },
+    ]) {
+      const b = makeBacklog(EMPTY);
+      const target = makeBacklog(
+        "# Backlog\n\n## In flight\n\n## Queued\n\n## Done\n",
       );
-      expect(b.read()).toBe(before);
-    } finally {
-      b.cleanup();
-      target.cleanup();
+      try {
+        await add(b);
+        await finish?.(b);
+        const before = b.read();
+        await expect(
+          mvCommand(
+            ["public-final-ab", "--to", target.path],
+            withoutCollectionTransfer(b.ctx),
+          ),
+        ).rejects.toMatchObject({
+          code: "VALIDATION_ERROR",
+          message: expect.stringContaining("carries a public obligation"),
+        });
+        // Refused before any write, whatever the delivery state.
+        expect(readFileSync(target.path, "utf8")).not.toContain(
+          "public-final-ab",
+        );
+        expect(b.read()).toBe(before);
+      } finally {
+        b.cleanup();
+        target.cleanup();
+      }
     }
   });
 

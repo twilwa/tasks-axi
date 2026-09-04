@@ -1389,6 +1389,39 @@ describe("state commands", () => {
         }
       });
 
+      it("names the contract violation when the capability lacks its method", async () => {
+        const b = makeBacklog();
+        const target = makeBacklog("# Backlog\n\n## Queued\n\n## Done\n");
+        const before = b.read();
+        const base = withoutCollectionTransfer(b.ctx);
+        const ctx: TasksContext = {
+          ...base,
+          store: {
+            ...base.store,
+            capabilities: () => ({
+              ...base.store.capabilities(),
+              collectionTransfer: true,
+            }),
+          },
+        };
+        try {
+          await expect(
+            mvCommand(["cert-cleanup", "--to", target.path], ctx),
+          ).rejects.toMatchObject({
+            code: "UNSUPPORTED",
+            message: expect.stringContaining("does not implement transferMany"),
+          });
+          // No silent downgrade to the non-atomic path: nothing was written.
+          expect(b.read()).toBe(before);
+          expect(readFileSync(target.path, "utf8")).not.toContain(
+            "cert-cleanup",
+          );
+        } finally {
+          b.cleanup();
+          target.cleanup();
+        }
+      });
+
       it("refuses a multi-task move by naming the missing capability", async () => {
         const src = [
           "# Backlog",
