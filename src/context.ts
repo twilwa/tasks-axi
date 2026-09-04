@@ -34,8 +34,7 @@ export function createStore(config: ResolvedConfig): Store {
     );
   }
 
-  return
-    config.backend === "beads"
+  return config.backend === "beads"
       ? new BeadsStore({
           path: config.path,
           binary: config.beadsBinary,
