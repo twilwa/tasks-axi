@@ -1,6 +1,5 @@
 import { isAbsolute, resolve } from "node:path";
 import { existsSync, statSync } from "node:fs";
-import { MarkdownStore } from "../backends/markdown.js";
 import {
   parseNonNegativeIntegerFlag,
   requireNoUnknownFlags,
@@ -12,7 +11,7 @@ import {
   takeFlag,
 } from "../args.js";
 import { renderMutation, stateLabel, taskToJson } from "../confirm.js";
-import { requireCtx, type TasksContext } from "../context.js";
+import { createStore, requireCtx, type TasksContext } from "../context.js";
 import {
   blockedIds,
   heldTasks,
@@ -642,6 +641,59 @@ export async function readyCommand(
   return renderOutput(blocks);
 }
 
+/**
+ * The backend-neutral form of the markdown backend's internal split-dependency
+ * guard, expressed with core Store verbs so the non-atomic transfer path
+ * enforces the same invariant: no move may leave a dependency edge pointing
+ * across the two collections.
+ */
+async function requireNoSplitDeps(
+  source: Store,
+  target: Store,
+  ids: string[],
+  tasks: Task[],
+): Promise<void> {
+  const movedSet = new Set(ids);
+
+  // (a) An active dependent left behind would point at a now-absent blocker.
+  const { items: remaining } = await source.list({});
+  for (const id of ids) {
+    const stranded = remaining
+      .filter(
+        (task) =>
+          !movedSet.has(task.id) &&
+          task.state !== "done" &&
+          task.deps.some((dep) => dep.type === "blocked-by" && dep.id === id),
+      )
+      .map((task) => task.id);
+    if (stranded.length > 0) {
+      throw new AxiError(
+        `Task "${id}" is still blocking active tasks: ${stranded.join(", ")}`,
+        "VALIDATION_ERROR",
+        [
+          `Move them together, or unblock them first, e.g. \`tasks-axi unblock ${stranded[0]} --by ${id}\``,
+        ],
+      );
+    }
+  }
+
+  // (b) A moved task's own edges must travel with it or already exist there.
+  for (const task of tasks) {
+    for (const dep of task.deps) {
+      if (movedSet.has(dep.id)) continue;
+      if (await target.get(dep.id)) continue;
+      const label = dep.type === "blocked-by" ? "blocker" : "dependency";
+      throw new AxiError(
+        `Cannot move "${task.id}": its ${label} "${dep.id}" would be stranded (not in the moved set and absent from the destination)`,
+        "VALIDATION_ERROR",
+        [
+          `Add "${dep.id}" to the same \`mv\`, or move it to the destination first`,
+        ],
+      );
+    }
+  }
+}
+
 function resolveBacklogTarget(to: string): string {
   const base = isAbsolute(to) ? to : resolve(process.cwd(), to);
   if (existsSync(base) && statSync(base).isDirectory()) {
@@ -714,7 +766,11 @@ export async function mvCommand(
     tasks.push(task);
   }
 
-  const target = new MarkdownStore({ path: targetPath });
+  const target = createStore({
+    backend: config.backend,
+    path: targetPath,
+    doneKeep: config.doneKeep,
+  });
   for (const id of ids) {
     if (await target.get(id)) {
       throw new AxiError(
@@ -724,15 +780,23 @@ export async function mvCommand(
     }
   }
 
-  if (store instanceof MarkdownStore) {
-    await store.moveManyTo(ids, target);
+  const capabilities = store.capabilities();
+  if (capabilities.collectionTransfer && store.transferMany) {
+    await store.transferMany(ids, target);
   } else if (ids.length === 1) {
+    // Without an atomic transfer the copy and the removal are two writes, so a
+    // multi-task move could strand a dependency edge halfway. One task is still
+    // safe to relocate, but only after the same split-dependency check the
+    // atomic path performs internally — otherwise the weaker path would quietly
+    // accept moves the stronger one refuses.
+    await requireNoSplitDeps(store, target, ids, tasks);
     await target.create(taskToInput(tasks[0]));
     await store.remove(ids[0]);
   } else {
     throw new AxiError(
-      "Moving multiple tasks at once requires the markdown backend",
+      `The "${capabilities.backend}" backend cannot move several tasks at once (missing capability: collectionTransfer)`,
       "UNSUPPORTED",
+      [`Move one task at a time: \`tasks-axi mv ${ids[0]} --to ${to}\``],
     );
   }
 

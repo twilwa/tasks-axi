@@ -13,7 +13,36 @@ import {
   unholdCommand,
 } from "../../src/commands/state.js";
 import { listCommand } from "../../src/commands/crud.js";
+import type { TasksContext } from "../../src/context.js";
+import type { Store } from "../../src/store.js";
 import { makeBacklog } from "../helpers.js";
+
+/**
+ * A context whose store keeps every core verb but drops the atomic transfer,
+ * standing in for a backend that cannot move a set of tasks in one transaction.
+ */
+function withoutCollectionTransfer(ctx: TasksContext): TasksContext {
+  const store: Store = {
+    ...ctx.store,
+    capabilities: () => ({
+      ...ctx.store.capabilities(),
+      backend: "stub",
+      collectionTransfer: false,
+    }),
+    create: (input) => ctx.store.create(input),
+    get: (id) => ctx.store.get(id),
+    update: (id, patch) => ctx.store.update(id, patch),
+    remove: (id) => ctx.store.remove(id),
+    list: (query) => ctx.store.list(query),
+    transition: (id, to, opts) => ctx.store.transition(id, to, opts),
+    addDep: (id, dep) => ctx.store.addDep(id, dep),
+    removeDep: (id, dep) => ctx.store.removeDep(id, dep),
+    updatePublicFollowup: (id, mutation) =>
+      ctx.store.updatePublicFollowup(id, mutation),
+  };
+  delete store.transferMany;
+  return { ...ctx, store };
+}
 
 describe("state commands", () => {
   it("rejects malformed primary ids before store lookup", async () => {
@@ -1221,6 +1250,123 @@ describe("state commands", () => {
         b.cleanup();
         target.cleanup();
       }
+    });
+
+    describe("a backend without collectionTransfer", () => {
+      it("still moves a single task through the core verbs", async () => {
+        const b = makeBacklog();
+        const target = makeBacklog("# Backlog\n\n## Queued\n\n## Done\n");
+        try {
+          const ctx = withoutCollectionTransfer(b.ctx);
+          await mvCommand(["cert-cleanup", "--to", target.path], ctx);
+          expect(b.read()).not.toContain("cert-cleanup");
+          expect(readFileSync(target.path, "utf8")).toContain("cert-cleanup");
+        } finally {
+          b.cleanup();
+          target.cleanup();
+        }
+      });
+
+      it("applies the split-dependency guard the atomic path enforces", async () => {
+        const src = [
+          "# Backlog",
+          "",
+          "## In flight",
+          "",
+          "## Queued",
+          "- [ ] root-a - root (repo: alpha)",
+          "- [ ] leaf-b - leaf (repo: alpha) blocked-by: root-a - needs root",
+          "",
+          "## Done",
+          "",
+        ].join("\n");
+        const b = makeBacklog(src);
+        const target = makeBacklog("# Backlog\n\n## Queued\n\n## Done\n");
+        const before = b.read();
+        try {
+          await expect(
+            mvCommand(
+              ["root-a", "--to", target.path],
+              withoutCollectionTransfer(b.ctx),
+            ),
+          ).rejects.toMatchObject({
+            code: "VALIDATION_ERROR",
+            message: expect.stringContaining("still blocking active tasks"),
+          });
+          expect(b.read()).toBe(before);
+          expect(readFileSync(target.path, "utf8")).not.toContain("root-a");
+        } finally {
+          b.cleanup();
+          target.cleanup();
+        }
+      });
+
+      it("refuses to strand a moved task's own blocker", async () => {
+        const src = [
+          "# Backlog",
+          "",
+          "## In flight",
+          "",
+          "## Queued",
+          "- [ ] root-a - root (repo: alpha)",
+          "- [ ] leaf-b - leaf (repo: alpha) blocked-by: root-a - needs root",
+          "",
+          "## Done",
+          "",
+        ].join("\n");
+        const b = makeBacklog(src);
+        const target = makeBacklog("# Backlog\n\n## Queued\n\n## Done\n");
+        try {
+          await expect(
+            mvCommand(
+              ["leaf-b", "--to", target.path],
+              withoutCollectionTransfer(b.ctx),
+            ),
+          ).rejects.toMatchObject({
+            code: "VALIDATION_ERROR",
+            message: expect.stringContaining("would be stranded"),
+          });
+          expect(b.read()).toContain("leaf-b");
+        } finally {
+          b.cleanup();
+          target.cleanup();
+        }
+      });
+
+      it("refuses a multi-task move by naming the missing capability", async () => {
+        const src = [
+          "# Backlog",
+          "",
+          "## In flight",
+          "",
+          "## Queued",
+          "- [ ] pair-a - first (repo: alpha)",
+          "- [ ] pair-b - second (repo: alpha)",
+          "",
+          "## Done",
+          "",
+        ].join("\n");
+        const b = makeBacklog(src);
+        const target = makeBacklog("# Backlog\n\n## Queued\n\n## Done\n");
+        const before = b.read();
+        try {
+          await expect(
+            mvCommand(
+              ["pair-a", "pair-b", "--to", target.path],
+              withoutCollectionTransfer(b.ctx),
+            ),
+          ).rejects.toMatchObject({
+            code: "UNSUPPORTED",
+            message: expect.stringContaining("collectionTransfer"),
+          });
+          // The refusal happens before any write, so neither file changed.
+          expect(b.read()).toBe(before);
+          expect(readFileSync(target.path, "utf8")).not.toContain("pair-a");
+        } finally {
+          b.cleanup();
+          target.cleanup();
+        }
+      });
     });
   });
 });
