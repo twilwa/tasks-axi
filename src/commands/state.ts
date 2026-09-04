@@ -694,6 +694,39 @@ async function requireNoSplitDeps(
   }
 }
 
+/**
+ * Undo the destination copy a non-atomic transfer already wrote, after the
+ * source removal was refused. Compensating here keeps both collections exactly
+ * as they were, which the reverse order (remove first) could not: that would
+ * trade a duplicate for a lost task. If the compensation itself fails the
+ * operator is told about both the refusal and the copy left behind.
+ */
+async function undoStagedCopy(
+  target: Store,
+  id: string,
+  targetPath: string,
+  cause: unknown,
+): Promise<never> {
+  try {
+    await target.remove(id);
+  } catch (rollbackError) {
+    throw new AxiError(
+      `Move of "${id}" partially completed; task now exists in both backlogs`,
+      "CONFLICT",
+      [
+        `Remove "${id}" from ${targetPath} manually before retrying`,
+        `Source removal failed: ${describeError(cause)}`,
+        `Destination rollback failed: ${describeError(rollbackError)}`,
+      ],
+    );
+  }
+  throw cause;
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function resolveBacklogTarget(to: string): string {
   const base = isAbsolute(to) ? to : resolve(process.cwd(), to);
   if (existsSync(base) && statSync(base).isDirectory()) {
@@ -791,7 +824,11 @@ export async function mvCommand(
     // accept moves the stronger one refuses.
     await requireNoSplitDeps(store, target, ids, tasks);
     await target.create(taskToInput(tasks[0]));
-    await store.remove(ids[0]);
+    try {
+      await store.remove(ids[0]);
+    } catch (error) {
+      await undoStagedCopy(target, ids[0], targetPath, error);
+    }
   } else {
     throw new AxiError(
       `The "${capabilities.backend}" backend cannot move several tasks at once (missing capability: collectionTransfer)`,

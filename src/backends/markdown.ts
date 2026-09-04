@@ -822,16 +822,6 @@ export class MarkdownStore implements Store {
   }
 
   /**
-   * Move a connected set of tasks to another backlog in one transaction: either
-   * every task lands in the destination and leaves the source, or none do (no
-   * intermediate state that loses a link is ever written to disk). Each moved
-   * task is re-rendered canonically — identical to the single-id path — so
-   * multi-paragraph bodies and `blocked-by: <id> - <reason>` edges survive
-   * byte-exact. An intra-set dependency edge is preserved because both of its
-   * endpoints travel together; `requireNoSplitDeps` refuses any move that would
-   * strand a link across the two files.
-   */
-  /**
    * `Store.transferMany`. A markdown backlog can only be moved into another
    * markdown backlog, because the all-or-nothing guarantee comes from locking
    * both files at once; any other destination is refused before a write rather
@@ -847,6 +837,16 @@ export class MarkdownStore implements Store {
     return this.moveManyTo(ids, destination);
   }
 
+  /**
+   * Move a connected set of tasks to another backlog in one transaction: either
+   * every task lands in the destination and leaves the source, or none do (no
+   * intermediate state that loses a link is ever written to disk). Each moved
+   * task is re-rendered canonically — identical to the single-id path — so
+   * multi-paragraph bodies and `blocked-by: <id> - <reason>` edges survive
+   * byte-exact. An intra-set dependency edge is preserved because both of its
+   * endpoints travel together; `requireNoSplitDeps` refuses any move that would
+   * strand a link across the two files.
+   */
   async moveManyTo(ids: string[], target: MarkdownStore): Promise<Task[]> {
     const uniqueIds = [...new Set(ids)];
     return withLocks([this.path, target.path], () => {

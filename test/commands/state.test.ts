@@ -13,6 +13,7 @@ import {
   unholdCommand,
 } from "../../src/commands/state.js";
 import { listCommand } from "../../src/commands/crud.js";
+import { AxiError } from "../../src/errors.js";
 import type { TasksContext } from "../../src/context.js";
 import type { Store } from "../../src/store.js";
 import { makeBacklog } from "../helpers.js";
@@ -42,6 +43,18 @@ function withoutCollectionTransfer(ctx: TasksContext): TasksContext {
   };
   delete store.transferMany;
   return { ...ctx, store };
+}
+
+/** The same stub, but whose `remove` refuses the way an active obligation does. */
+function withRefusingRemove(ctx: TasksContext, error: Error): TasksContext {
+  const base = withoutCollectionTransfer(ctx);
+  return {
+    ...base,
+    store: {
+      ...base.store,
+      remove: () => Promise.reject(error),
+    },
+  };
 }
 
 describe("state commands", () => {
@@ -1327,6 +1340,77 @@ describe("state commands", () => {
             message: expect.stringContaining("would be stranded"),
           });
           expect(b.read()).toContain("leaf-b");
+        } finally {
+          b.cleanup();
+          target.cleanup();
+        }
+      });
+
+      it("rolls the destination copy back when the source refuses removal", async () => {
+        const b = makeBacklog();
+        const target = makeBacklog("# Backlog\n\n## Queued\n\n## Done\n");
+        const before = b.read();
+        try {
+          await expect(
+            mvCommand(
+              ["cert-cleanup", "--to", target.path],
+              withRefusingRemove(
+                b.ctx,
+                new AxiError(
+                  "Active public-followup obligations cannot be removed",
+                  "VALIDATION_ERROR",
+                ),
+              ),
+            ),
+          ).rejects.toMatchObject({
+            code: "VALIDATION_ERROR",
+            message: expect.stringContaining(
+              "Active public-followup obligations cannot be removed",
+            ),
+          });
+          // Neither collection changed: the staged copy was compensated away.
+          expect(readFileSync(target.path, "utf8")).not.toContain(
+            "cert-cleanup",
+          );
+          expect(b.read()).toBe(before);
+        } finally {
+          b.cleanup();
+          target.cleanup();
+        }
+      });
+
+      it("names both failures when the rollback cannot run either", async () => {
+        const b = makeBacklog();
+        const target = makeBacklog("# Backlog\n\n## Queued\n\n## Done\n");
+        const base = withoutCollectionTransfer(b.ctx);
+        const ctx: TasksContext = {
+          ...base,
+          store: {
+            ...base.store,
+            remove: () => {
+              // The destination goes away between the copy and the rollback.
+              rmSync(target.dir, { recursive: true, force: true });
+              return Promise.reject(
+                new AxiError(
+                  "Active public-followup obligations cannot be removed",
+                  "VALIDATION_ERROR",
+                ),
+              );
+            },
+          },
+        };
+        try {
+          await expect(
+            mvCommand(["cert-cleanup", "--to", target.path], ctx),
+          ).rejects.toMatchObject({
+            code: "CONFLICT",
+            message: expect.stringContaining("partially completed"),
+            suggestions: expect.arrayContaining([
+              expect.stringContaining(
+                "Active public-followup obligations cannot be removed",
+              ),
+            ]),
+          });
         } finally {
           b.cleanup();
           target.cleanup();
