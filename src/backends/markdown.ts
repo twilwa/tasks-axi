@@ -6,7 +6,12 @@ import {
   unlinkSync,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { AxiError, partialMoveError } from "../errors.js";
+import {
+  AxiError,
+  partialMoveError,
+  stillBlockingError,
+  strandedDepError,
+} from "../errors.js";
 import { validateDependencyId, validateId } from "../id.js";
 import type {
   Dep,
@@ -914,15 +919,7 @@ export class MarkdownStore implements Store {
             task.deps.some((dep) => dep.type === "blocked-by" && dep.id === id),
         )
         .map((task) => task.id);
-      if (stranded.length > 0) {
-        throw new AxiError(
-          `Task "${id}" is still blocking active tasks: ${stranded.join(", ")}`,
-          "VALIDATION_ERROR",
-          [
-            `Move them together, or unblock them first, e.g. \`tasks-axi unblock ${stranded[0]} --by ${id}\``,
-          ],
-        );
-      }
+      if (stranded.length > 0) throw stillBlockingError(id, stranded);
     }
 
     // (b) A moved item's blocker must travel with it or already exist in the
@@ -935,14 +932,7 @@ export class MarkdownStore implements Store {
       for (const dep of found.entry.task.deps) {
         if (movedSet.has(dep.id)) continue;
         if (this.findEntry(targetDoc, dep.id)) continue;
-        const label = dep.type === "blocked-by" ? "blocker" : "dependency";
-        throw new AxiError(
-          `Cannot move "${id}": its ${label} "${dep.id}" would be stranded (not in the moved set and absent from the destination)`,
-          "VALIDATION_ERROR",
-          [
-            `Add "${dep.id}" to the same \`mv\`, or move it to the destination first`,
-          ],
-        );
+        throw strandedDepError(id, dep);
       }
     }
   }

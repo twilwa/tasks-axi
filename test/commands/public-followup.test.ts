@@ -271,7 +271,19 @@ describe("public-followup commands", () => {
         ).rejects.toMatchObject({
           code: "VALIDATION_ERROR",
           message: expect.stringContaining("carries a public obligation"),
+          // The refusal follows from the backend, so the guidance must not
+          // point at obligation transitions that cannot lift it.
+          suggestions: expect.arrayContaining([
+            expect.stringContaining("collectionTransfer"),
+          ]),
         });
+        const refusal = await mvCommand(
+          ["public-final-ab", "--to", target.path],
+          withoutCollectionTransfer(b.ctx),
+        ).catch((error: { suggestions?: string[] }) => error);
+        expect(
+          (refusal as { suggestions?: string[] }).suggestions?.join(" "),
+        ).not.toMatch(/record-delivery|waive/);
         // Refused before any write, whatever the delivery state.
         expect(readFileSync(target.path, "utf8")).not.toContain(
           "public-final-ab",

@@ -18,7 +18,13 @@ import {
   readyPublicFollowups,
   readyTasks,
 } from "../derive.js";
-import { AxiError, notFound, partialMoveError } from "../errors.js";
+import {
+  AxiError,
+  notFound,
+  partialMoveError,
+  stillBlockingError,
+  strandedDepError,
+} from "../errors.js";
 import { formatCountLine } from "../format.js";
 import { validateDependencyId } from "../id.js";
 import type {
@@ -666,15 +672,7 @@ async function requireNoSplitDeps(
           task.deps.some((dep) => dep.type === "blocked-by" && dep.id === id),
       )
       .map((task) => task.id);
-    if (stranded.length > 0) {
-      throw new AxiError(
-        `Task "${id}" is still blocking active tasks: ${stranded.join(", ")}`,
-        "VALIDATION_ERROR",
-        [
-          `Move them together, or unblock them first, e.g. \`tasks-axi unblock ${stranded[0]} --by ${id}\``,
-        ],
-      );
-    }
+    if (stranded.length > 0) throw stillBlockingError(id, stranded);
   }
 
   // (b) A moved task's own edges must travel with it or already exist there.
@@ -682,14 +680,7 @@ async function requireNoSplitDeps(
     for (const dep of task.deps) {
       if (movedSet.has(dep.id)) continue;
       if (await target.get(dep.id)) continue;
-      const label = dep.type === "blocked-by" ? "blocker" : "dependency";
-      throw new AxiError(
-        `Cannot move "${task.id}": its ${label} "${dep.id}" would be stranded (not in the moved set and absent from the destination)`,
-        "VALIDATION_ERROR",
-        [
-          `Add "${dep.id}" to the same \`mv\`, or move it to the destination first`,
-        ],
-      );
+      throw strandedDepError(task.id, dep);
     }
   }
 }
@@ -700,13 +691,14 @@ async function requireNoSplitDeps(
  * than half-moving it or failing confusingly mid-write. The atomic path carries
  * obligations happily because it never has a half-applied state to fall into.
  */
-function requireNoPublicObligation(task: Task): void {
+function requireNoPublicObligation(task: Task, backend: string): void {
   if (!task.public_followup) return;
   throw new AxiError(
-    `Task "${task.id}" carries a public obligation and can only be moved by a backend that supports atomic transfers (capability: collectionTransfer)`,
+    `Task "${task.id}" carries a public obligation, which the "${backend}" backend cannot relocate safely without the atomic collectionTransfer capability. Closing the obligation out does not lift this: the refusal follows from the backend, not from the delivery state`,
     "VALIDATION_ERROR",
     [
-      `Leave the obligation where it is, or close it out first, e.g. \`tasks-axi public-followup record-delivery ${task.id} --receipt-file <file>\` or \`tasks-axi public-followup waive ${task.id} --reason <text> --approved-by captain\``,
+      `Run the move against a backend that supports collectionTransfer`,
+      `Or recreate the obligation in the destination deliberately (\`tasks-axi public-followup add --help\`) and close the original`,
     ],
   );
 }
@@ -836,7 +828,7 @@ export async function mvCommand(
     // atomic path performs internally — otherwise the weaker path would quietly
     // accept moves the stronger one refuses.
     await requireNoSplitDeps(store, target, ids, tasks);
-    requireNoPublicObligation(tasks[0]);
+    requireNoPublicObligation(tasks[0], capabilities.backend);
     await target.create(taskToInput(tasks[0]));
     try {
       await store.remove(ids[0]);

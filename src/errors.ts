@@ -1,4 +1,5 @@
 import { AxiError, exitCodeForError } from "axi-sdk-js";
+import type { Dep } from "./model.js";
 import {
   type SuggestionGlobals,
   withSuggestionGlobals,
@@ -31,6 +32,32 @@ export function notFound(id: string, options: NotFoundOptions = {}): AxiError {
     `Task "${id}" not found in this backlog`,
     "NOT_FOUND",
     suggestions,
+  );
+}
+
+/**
+ * Moving `id` out of a collection would leave active dependents behind, still
+ * blocked by a task that is no longer there. Raised by the markdown backend
+ * (walking its locked document) and by the command-layer fallback (walking core
+ * Store verbs) alike, so the detection may differ but the wording cannot.
+ */
+export function stillBlockingError(id: string, stranded: string[]): AxiError {
+  return new AxiError(
+    `Task "${id}" is still blocking active tasks: ${stranded.join(", ")}`,
+    "VALIDATION_ERROR",
+    [
+      `Move them together, or unblock them first, e.g. \`tasks-axi unblock ${stranded[0]} --by ${id}\``,
+    ],
+  );
+}
+
+/** Moving `id` would leave one of its own edges pointing across collections. */
+export function strandedDepError(id: string, dep: Dep): AxiError {
+  const label = dep.type === "blocked-by" ? "blocker" : "dependency";
+  return new AxiError(
+    `Cannot move "${id}": its ${label} "${dep.id}" would be stranded (not in the moved set and absent from the destination)`,
+    "VALIDATION_ERROR",
+    [`Add "${dep.id}" to the same \`mv\`, or move it to the destination first`],
   );
 }
 
