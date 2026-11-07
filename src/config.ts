@@ -26,6 +26,8 @@ export interface ResolvedConfig {
   beadsBinary?: string;
   beadsPrefix?: string;
   beadsTimeoutMs?: number;
+  beadsMirrorPath?: string;
+  beadsMirrorArchivePath?: string;
 }
 
 export interface ConfigOverrides {
@@ -43,6 +45,8 @@ interface TomlConfig {
     binary?: string;
     prefix?: string;
     timeout_ms?: number;
+    mirror?: string;
+    mirror_archive?: string;
   };
   markdown?: {
     path?: string;
@@ -57,7 +61,7 @@ type ConfigTable = "root" | "markdown" | "beads" | "unsupported";
 
 /**
  * Minimal TOML reader for the tiny config surface we need: a top-level
- * `backend` key, `[beads]` with `path` / `binary` / `prefix` / `timeout_ms`, and `[markdown]` with
+ * `backend` key, `[beads]` connection/mirror settings, and `[markdown]` with
  * `path` / `archive` / `done_keep`.
  * `archive` points at the file that receives pruned tasks.
  * Intentionally not a general TOML parser.
@@ -103,6 +107,10 @@ export function parseConfigToml(src: string): TomlConfig {
         config.beads.binary = requireTomlString(value, source);
       if (key === "prefix")
         config.beads.prefix = requireTomlString(value, source);
+      if (key === "mirror")
+        config.beads.mirror = requireTomlString(value, source);
+      if (key === "mirror_archive")
+        config.beads.mirror_archive = requireTomlString(value, source);
       if (key === "timeout_ms") {
         if (typeof value !== "number")
           throw new AxiError(
@@ -156,7 +164,9 @@ function configKeySource(table: ConfigTable, key: string): string | undefined {
     (key === "path" ||
       key === "binary" ||
       key === "prefix" ||
-      key === "timeout_ms")
+      key === "timeout_ms" ||
+      key === "mirror" ||
+      key === "mirror_archive")
   ) {
     return `beads.${key}`;
   }
@@ -323,6 +333,17 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ResolvedConfig {
         );
       config.beadsTimeoutMs = timeout;
     }
+    const mirror = validatePathValue(
+      projectToml.beads?.mirror ?? homeToml.beads?.mirror,
+      "beads.mirror",
+    );
+    const mirrorArchive = validatePathValue(
+      projectToml.beads?.mirror_archive ?? homeToml.beads?.mirror_archive,
+      "beads.mirror_archive",
+    );
+    if (mirror) config.beadsMirrorPath = resolve(cwd, mirror);
+    if (mirrorArchive)
+      config.beadsMirrorArchivePath = resolve(cwd, mirrorArchive);
     config.beadsPrefix = validatePathValue(
       env.TASKS_AXI_BEADS_PREFIX ??
         projectToml.beads?.prefix ??

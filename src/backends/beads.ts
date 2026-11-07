@@ -29,9 +29,11 @@ import {
   deriveLinks,
   extractTags,
   leadingKind,
+  parseBacklog,
   renderTaskLines,
 } from "./markdown-grammar.js";
-import { atomicWrite, readFileSafe, withLock } from "./lock.js";
+import { atomicWrite, canonicalPath, readFileSafe, withLock } from "./lock.js";
+import { writeMarkdownMirror } from "./markdown-mirror.js";
 
 export interface BeadsStoreOptions {
   /** Explicit .beads workspace directory or .db file; never auto-discovered. */
@@ -41,6 +43,10 @@ export interface BeadsStoreOptions {
   prefix?: string;
   /** Kill an owned br child after this many milliseconds; default 30 seconds. */
   timeoutMs?: number;
+  /** Optional one-way canonical markdown projections; never read as input. */
+  mirrorPath?: string;
+  mirrorArchivePath?: string;
+  doneKeep?: number;
   /** Local YYYY-MM-DD clock, like MarkdownStore. */
   now?: () => string;
 }
@@ -139,6 +145,27 @@ function appendLink(title: string, link: TaskLink): string {
     ? title
     : titleValue(`${title} ${url}`);
 }
+function prepareInput(input: TaskInput): TaskInput {
+  input = {
+    ...input,
+    id: validateId(input.id),
+    title: titleValue(input.title),
+    kind: tagValue(input.kind),
+    repo: tagValue(input.repo),
+    hold: holdValue(input.hold),
+    priority: priorityValue(input.priority),
+  };
+  workerKind(input.kind, input.public_followup);
+  if (input.created !== undefined && input.created !== null)
+    dateValue(input.created);
+  if (input.closed !== undefined) dateValue(input.closed);
+  if (input.state !== undefined && !STATES.includes(input.state))
+    invalid("Invalid task state");
+  for (const link of input.links ?? [])
+    input.title = appendLink(input.title, link);
+  return input;
+}
+
 function workerKind(kind: string | undefined, publicData?: unknown): void {
   if (kind === "public-followup" || publicData !== undefined)
     throw unsupported("public followups", "beads");
@@ -371,6 +398,9 @@ export class BeadsStore implements Store {
   private readonly prefix: string;
   private readonly now: () => string;
   private readonly timeoutMs: number;
+  private readonly mirrorPath?: string;
+  private readonly mirrorArchivePath?: string;
+  private readonly doneKeep: number;
   /** Error translation only, never a task/read cache. */
   private readonly ids = new Map<string, string>();
 
@@ -399,6 +429,78 @@ export class BeadsStore implements Store {
     )
       invalid("beads.timeout_ms must be an integer between 1 and 2147483647");
     this.now = options.now ?? today;
+    if (
+      options.mirrorArchivePath !== undefined &&
+      options.mirrorPath === undefined
+    )
+      invalid("beads.mirror_archive requires beads.mirror");
+    for (const path of [options.mirrorPath, options.mirrorArchivePath]) {
+      if (path !== undefined && !path.trim())
+        invalid("beads mirror paths must not be empty");
+    }
+    this.mirrorPath = options.mirrorPath
+      ? resolve(options.mirrorPath)
+      : undefined;
+    this.mirrorArchivePath = this.mirrorPath
+      ? resolve(
+          options.mirrorArchivePath ??
+            join(dirname(this.mirrorPath), "done-archive.md"),
+        )
+      : undefined;
+    if (this.mirrorPath && this.mirrorArchivePath) {
+      const outputs = [this.mirrorPath, this.mirrorArchivePath].map(
+        canonicalPath,
+      );
+      const protectedPaths = this.writePaths();
+      if (
+        outputs[0] === outputs[1] ||
+        outputs.some((path) => protectedPaths.includes(path))
+      )
+        invalid(
+          "beads mirror paths must be distinct and must not overwrite the database, sidecars, locks or note archive",
+        );
+    }
+    this.doneKeep = options.doneKeep ?? 10;
+    if (!Number.isSafeInteger(this.doneKeep) || this.doneKeep < 0)
+      invalid("markdown.done_keep must be a non-negative integer");
+  }
+
+  private writePaths(): string[] {
+    return [
+      this.path,
+      `${this.path}-wal`,
+      `${this.path}-shm`,
+      `${this.path}-journal`,
+      `${this.path}.lock`,
+      `${this.path}.init.lock`,
+      this.noteArchivePath,
+    ].map(canonicalPath);
+  }
+
+  private async mutate<T>(operation: () => Promise<T>): Promise<T> {
+    return withLock(this.path, async () => {
+      const result = await operation();
+      if (this.mirrorPath && this.mirrorArchivePath) {
+        try {
+          const tasks = (await this.load()).map((item) => item.task);
+          writeMarkdownMirror(
+            tasks,
+            this.mirrorPath,
+            this.mirrorArchivePath,
+            this.doneKeep,
+          );
+        } catch (error) {
+          throw new AxiError(
+            `Beads write succeeded, but markdown mirror refresh failed: ${error instanceof Error ? error.message : String(error)}`,
+            "UNKNOWN",
+            [
+              "The database remains authoritative; fix the mirror path and run tasks-axi render --backend beads",
+            ],
+          );
+        }
+      }
+      return result;
+    });
   }
 
   capabilities(): Capabilities {
@@ -593,6 +695,13 @@ export class BeadsStore implements Store {
     );
   }
 
+  async isEmpty(): Promise<boolean> {
+    const raw = record(await this.call(["list", "--all", "--limit", "0"]));
+    if (!Array.isArray(raw.issues))
+      throw new AxiError("br list returned invalid issues", "UNKNOWN");
+    return raw.issues.every((value) => record(value).status === "tombstone");
+  }
+
   async get(id: string): Promise<Task | null> {
     return (
       (await this.load()).find((item) => item.task.id === id)?.task ?? null
@@ -608,25 +717,49 @@ export class BeadsStore implements Store {
       items = items.slice(0, query.limit);
     return { items, total };
   }
+  validateImport(tasks: Task[], readOnlyPaths: string[] = []): void {
+    const outputs = this.writePaths();
+    for (const path of [this.mirrorPath, this.mirrorArchivePath])
+      if (path) outputs.push(canonicalPath(path));
+    if (readOnlyPaths.map(canonicalPath).some((path) => outputs.includes(path)))
+      invalid(
+        "Migration destination and mirrors must not overwrite a source markdown file",
+      );
+    for (const task of tasks) {
+      const input = prepareInput(task);
+      const normalized: Task = {
+        ...task,
+        ...input,
+        state: task.state,
+        created: input.created ?? undefined,
+        links: deriveLinks(input.title),
+        deps: task.deps.map((dep) => checkedDep(task.id, dep)),
+      };
+      const label = { in_flight: "In flight", queued: "Queued", done: "Done" }[
+        task.state
+      ];
+      const parsed = parseBacklog(
+        `## ${label}\n${renderTaskLines(normalized).join("\n")}\n`,
+      );
+      const entry = parsed.sections[0]?.entries.find(
+        (entry) => entry.kind === "task",
+      );
+      if (
+        entry?.kind !== "task" ||
+        !isDeepStrictEqual(
+          JSON.parse(JSON.stringify(task)),
+          JSON.parse(JSON.stringify(entry.task)),
+        )
+      )
+        invalid(
+          `Source task "${task.id}" cannot be imported without normalizing its fields`,
+        );
+    }
+  }
+
   async create(input: TaskInput): Promise<Task> {
-    input = {
-      ...input,
-      id: validateId(input.id),
-      title: titleValue(input.title),
-      kind: tagValue(input.kind),
-      repo: tagValue(input.repo),
-      hold: holdValue(input.hold),
-      priority: priorityValue(input.priority),
-    };
-    workerKind(input.kind, input.public_followup);
-    if (input.created !== undefined && input.created !== null)
-      dateValue(input.created);
-    if (input.closed !== undefined) dateValue(input.closed);
-    if (input.state !== undefined && !STATES.includes(input.state))
-      invalid("Invalid task state");
-    for (const link of input.links ?? [])
-      input.title = appendLink(input.title, link);
-    return withLock(this.path, async () => {
+    input = prepareInput(input);
+    return this.mutate(async () => {
       const id = validateId(input.id);
       const all = await this.load();
       if (all.some((item) => item.task.id === id))
@@ -772,7 +905,7 @@ export class BeadsStore implements Store {
       priority: priorityValue(patch.priority),
     };
     workerKind(patch.kind);
-    return withLock(this.path, async () => {
+    return this.mutate(async () => {
       const found = this.required(await this.load(), id);
       const task = { ...found.task };
       const changed: TaskUpdateChange[] = [];
@@ -906,7 +1039,7 @@ export class BeadsStore implements Store {
     });
   }
   async remove(id: string): Promise<Task> {
-    return withLock(this.path, async () => {
+    return this.mutate(async () => {
       const all = await this.load();
       const found = this.required(all, id);
       const dependents = all.filter(
@@ -954,7 +1087,7 @@ export class BeadsStore implements Store {
     to: State,
     opts: TransitionOpts = {},
   ): Promise<Task> {
-    return withLock(this.path, async () => {
+    return this.mutate(async () => {
       const all = await this.load();
       const found = this.required(all, id);
       if (!STATES.includes(to)) invalid("Invalid task state");
@@ -1018,7 +1151,7 @@ export class BeadsStore implements Store {
   }
   async addDep(id: string, dep: Dep): Promise<boolean> {
     const checked = checkedDep(id, dep);
-    return withLock(this.path, async () => {
+    return this.mutate(async () => {
       const all = await this.load();
       const found = this.required(all, id);
       if (
@@ -1055,7 +1188,7 @@ export class BeadsStore implements Store {
   }
   async removeDep(id: string, dep: Dep): Promise<boolean> {
     const checked = checkedDep(id, dep);
-    return withLock(this.path, async () => {
+    return this.mutate(async () => {
       const all = await this.load();
       const found = this.required(all, id);
       if (
@@ -1088,6 +1221,12 @@ export class BeadsStore implements Store {
       return true;
     });
   }
+  async render(): Promise<number> {
+    if (!this.mirrorPath)
+      throw unsupported("render without beads.mirror", "beads");
+    return this.mutate(async () => (await this.load()).length);
+  }
+
   async updatePublicFollowup(): Promise<Task> {
     throw unsupported("public followups", "beads");
   }

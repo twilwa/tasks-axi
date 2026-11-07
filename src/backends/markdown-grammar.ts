@@ -377,13 +377,17 @@ export function renderTaskLines(task: Task): string[] {
 // Parse
 // ---------------------------------------------------------------------------
 
-function sectionState(headerLine: string): State | undefined {
+function sectionState(
+  headerLine: string,
+  archived: boolean,
+): State | undefined {
   const m = semanticLine(headerLine).match(/^##\s+(.*?)\s*$/);
   if (!m) return undefined;
   const text = m[1].toLowerCase();
   if (text === "in flight") return "in_flight";
   if (text === "queued") return "queued";
   if (text.startsWith("done")) return "done";
+  if (archived && /^archived \d{4}-\d{2}-\d{2}$/.test(text)) return "done";
   return undefined;
 }
 
@@ -541,7 +545,7 @@ function parseEntries(lines: string[], state: State | undefined): Entry[] {
   return entries;
 }
 
-export function parseBacklog(src: string): BacklogDoc {
+export function parseBacklog(src: string, archived = false): BacklogDoc {
   if (src === "") {
     return { finalNewline: false, preamble: [], sections: [] };
   }
@@ -565,7 +569,11 @@ export function parseBacklog(src: string): BacklogDoc {
   for (const line of lines) {
     if (/^##\s+/.test(semanticLine(line))) {
       closeSection();
-      current = { headerLine: line, state: sectionState(line), entries: [] };
+      current = {
+        headerLine: line,
+        state: sectionState(line, archived),
+        entries: [],
+      };
       continue;
     }
     if (current) {

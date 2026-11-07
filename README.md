@@ -308,9 +308,71 @@ A crash can still leave metadata before its native change, or archived notes bef
 Removing an edge can leave unused reason metadata, which reads ignore. Cross-command changes are not rolled back.
 After a timeout or conflict, reread and retry the same intent.
 
-Closed tasks stay visible. This backend does not prune, render markdown, or support public-followup obligations.
-Migration, markdown mirroring, and moves into beads stores are not included.
-Live tests cover Store conformance and byte-identical TOON for shared markdown/br behavior. They use temporary workspaces and explicit databases, and skip when `br` is unavailable.
+Closed tasks stay in the database. This backend does not prune or support public-followup obligations. Moves into beads stores are not included.
+Live tests cover Store conformance, migration, mirror retention, interruption recovery, and byte-identical TOON for shared markdown/br behavior. They use temporary workspaces and explicit databases, and skip when `br` is unavailable.
+
+#### Migrate markdown to beads
+
+Configure both stores, then run the import. The selected default backend does not matter for this command.
+
+```toml
+[markdown]
+path = "backlog.md"
+archive = "done-archive.md"
+
+[beads]
+path = ".beads/beads.db"
+```
+
+```sh
+tasks-axi migrate --from markdown --to beads
+# Resume an interrupted import without overwriting existing tasks:
+tasks-axi migrate --from markdown --to beads --allow-existing
+```
+
+After verifying the import, set top-level `backend = "beads"` in `.tasks.toml` or use `--backend beads` on subsequent commands.
+Migration reads the backlog and Done archive through the markdown Store. If `markdown.archive` is omitted, it reads `done-archive.md` beside the backlog when present.
+Archive sections headed `## Done` or `## Archived YYYY-MM-DD` contribute Done tasks. Free-form lines remain source text, not tasks.
+The import preserves ids, per-state order, kinds, repos, priorities, structured holds, dependency types and reasons, bodies, links, and day stamps. Neither source file changes.
+It creates every task before adding dependencies, so edges can cross between backlog and archive.
+
+The destination must have no live tasks, including unmanaged native issues, unless `--allow-existing` is explicit.
+With that flag, unrelated destination tasks stay untouched. Matching source ids are skipped, and a matching dependency prefix can be completed.
+Conflicting fields, reasons, or order refuse before this run imports anything. Existing imported rows must form per-state creation-order prefixes, as they do after an interrupted migration.
+Preflight also rejects duplicate ids, missing targets, self-dependencies, cycles, multiple edge types for one pair, public-followup obligations, and fields that would change during normalization.
+For example, beads cannot represent a repo containing commas; the markdown grammar does not canonically retain a `since` stamp on a Done row.
+
+An import is not one database transaction. A failed native command or mirror write can leave earlier rows saved, even if the CLI exits nonzero.
+Rerun the same command with `--allow-existing` to finish; it never creates duplicate ids or replaces divergent records.
+TOON output reports `in_flight`, `queued`, and `done` source counts, including archived tasks, plus created/existing counts and dependencies added. `--json` returns the same summary with `ok: true`.
+Use `--from-file` and `--to-file` for path overrides. Unset `TASKS_AXI_FILE` first, because one file override is ambiguous for two stores.
+
+#### Read-only markdown mirrors
+
+Mirrors are off by default. Enable them explicitly with output paths separate from the migration sources.
+
+```toml
+[markdown]
+done_keep = 10
+
+[beads]
+path = ".beads/beads.db"
+mirror = "mirror/backlog.md"
+mirror_archive = "mirror/done-archive.md" # optional; defaults beside mirror
+```
+
+After each successful tasks-axi beads mutation, including idempotent writes, the adapter rewrites these canonical markdown projections while holding the database's Store lock.
+Reads do not write mirrors. `tasks-axi render --backend beads` rebuilds them without changing native tasks; without `beads.mirror`, render is unsupported.
+Treat both generated files as read-only. Edits are overwritten, not imported. Do not point a markdown writer at them.
+Migration refuses output paths that overlap its sources, including symlink aliases. Mirror outputs also cannot overlap each other, the database, its sidecars or locks, or the note archive.
+
+The active mirror contains all queued and in-flight tasks plus the `markdown.done_keep` newest Done tasks by closed date. Undated Done tasks sort last; ties retain Store order.
+Older Done tasks go into the archive projection, with their bodies and metadata intact. `done_keep = 0` puts every Done task there.
+No mirror operation prunes the database. The archive is a complete projection of the older Done rows, not an append-only log.
+
+Each file is replaced atomically, archive first. The two files are not an atomic pair, so a crash or failed replacement can leave different generations until repair.
+A mirror error makes the command fail and explicitly reports that the beads write succeeded. It does not roll back that write or delete older database history.
+Fix the output path and run `tasks-axi render --backend beads`, or retry the same idempotent write. Native br writers do not refresh mirrors and remain unsupported.
 
 ## Development
 

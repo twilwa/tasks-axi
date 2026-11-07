@@ -55,6 +55,8 @@ import {
 
 export interface MarkdownStoreOptions {
   path: string;
+  /** Read-only archive view: recognize `## Archived YYYY-MM-DD` as Done. */
+  archived?: boolean;
   /** Where pruned Done items are archived (default `<dir>/done-archive.md`). */
   archivePath?: string;
   /** Where superseded task bodies are archived (default `<dir>/note-archive.md`). */
@@ -303,23 +305,28 @@ function taskToInput(task: Task): TaskInput {
 
 export class MarkdownStore implements Store {
   private readonly path: string;
+  private readonly archived: boolean;
   private readonly archivePath: string;
   private readonly noteArchivePath: string;
   private readonly now: () => string;
 
   constructor(options: MarkdownStoreOptions) {
     this.path = options.path;
+    this.archived = options.archived ?? false;
     this.archivePath =
       options.archivePath ?? `${dirname(options.path)}/done-archive.md`;
     this.noteArchivePath =
       options.noteArchivePath ?? `${dirname(options.path)}/note-archive.md`;
-    if (resolve(this.archivePath) === resolve(this.path)) {
+    if (!this.archived && resolve(this.archivePath) === resolve(this.path)) {
       throw new AxiError(
         "Archive path must not be the active backlog path",
         "VALIDATION_ERROR",
       );
     }
-    if (resolve(this.noteArchivePath) === resolve(this.path)) {
+    if (
+      !this.archived &&
+      resolve(this.noteArchivePath) === resolve(this.path)
+    ) {
       throw new AxiError(
         "Note archive path must not be the active backlog path",
         "VALIDATION_ERROR",
@@ -332,7 +339,7 @@ export class MarkdownStore implements Store {
     return {
       backend: "markdown",
       deps: true,
-      prune: true,
+      prune: !this.archived,
       comments: false,
       fullTextSearch: false,
       realtimeSync: false,
@@ -351,10 +358,12 @@ export class MarkdownStore implements Store {
   }
 
   private load(): BacklogDoc {
-    return parseBacklog(this.loadSource() ?? "");
+    return parseBacklog(this.loadSource() ?? "", this.archived);
   }
 
   private loadForUpdate(): LoadedBacklogDoc {
+    if (this.archived)
+      throw new AxiError("Archive view is read-only", "UNSUPPORTED");
     const source = this.loadSource();
     return { doc: parseBacklog(source ?? ""), source };
   }

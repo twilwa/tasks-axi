@@ -16,6 +16,41 @@ type MarkdownInternals = {
 };
 
 describe("MarkdownStore", () => {
+  it("reads dated archive sections only in explicit read-only archive mode", async () => {
+    const b = makeBacklog(
+      "## Archived 2025-01-01\n- [x] archived-d1 - First (done 2025-01-01)\n  Archived notes.\n\n## Archived 2024-01-01\n- [x] archived-d2 - Second\n",
+    );
+    try {
+      const bytes = b.read();
+      expect((await b.store.list({})).total).toBe(0);
+      const archived = new MarkdownStore({ path: b.path, archived: true });
+      expect((await archived.list({})).items.map((task) => task.id)).toEqual([
+        "archived-d1",
+        "archived-d2",
+      ]);
+      expect(await archived.get("archived-d1")).toMatchObject({
+        state: "done",
+        body: "Archived notes.",
+        closed: "2025-01-01",
+      });
+      expect(archived.capabilities().prune).toBe(false);
+      await expect(
+        archived.create({ id: "new-q1", title: "No writes" }),
+      ).rejects.toThrow(/read-only/);
+      await expect(
+        archived.update("archived-d1", { title: "No edits" }),
+      ).rejects.toThrow(/read-only/);
+      await expect(archived.remove("archived-d1")).rejects.toThrow(/read-only/);
+      await expect(
+        archived.transition("archived-d1", "queued"),
+      ).rejects.toThrow(/read-only/);
+      await expect(archived.render()).rejects.toThrow(/read-only/);
+      expect(b.read()).toBe(bytes);
+    } finally {
+      b.cleanup();
+    }
+  });
+
   describe("create / get / list", () => {
     it("creates a queued task and reads it back", async () => {
       const b = makeBacklog();
