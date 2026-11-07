@@ -12,17 +12,19 @@ import { AxiError } from "./errors.js";
  *   ~/.tasks-axi/config.toml > defaults (markdown, first existing
  *   backlog.md/data/backlog.md, otherwise backlog.md).
  *
- * P1 ships only the markdown backend; the Store seam keeps sqlite/remote
- * additions invisible to the CLI layer.
+ * Markdown is the default. Beads requires an explicit workspace/database path;
+ * it never relies on br's parent-directory workspace discovery.
  */
 
 export interface ResolvedConfig {
   backend: string;
-  /** Markdown backlog path (resolved to an absolute path). */
+  /** Markdown backlog or beads workspace/.db file (absolute path). */
   path: string;
   /** Optional archive path for pruned tasks (resolved to an absolute path). */
   archivePath?: string;
   doneKeep: number;
+  beadsBinary?: string;
+  beadsPrefix?: string;
 }
 
 export interface ConfigOverrides {
@@ -35,6 +37,7 @@ export interface ConfigOverrides {
 
 interface TomlConfig {
   backend?: string;
+  beads?: { path?: string; binary?: string; prefix?: string };
   markdown?: {
     path?: string;
     archive?: string;
@@ -44,11 +47,12 @@ interface TomlConfig {
 
 const DEFAULT_KEEP = 10;
 const PATH_CANDIDATES = ["backlog.md", "data/backlog.md"];
-type ConfigTable = "root" | "markdown" | "unsupported";
+type ConfigTable = "root" | "markdown" | "beads" | "unsupported";
 
 /**
  * Minimal TOML reader for the tiny config surface we need: a top-level
- * `backend` key and a `[markdown]` table with `path` / `archive` / `done_keep`.
+ * `backend` key, `[beads]` with `path` / `binary` / `prefix`, and `[markdown]` with
+ * `path` / `archive` / `done_keep`.
  * `archive` points at the file that receives pruned tasks.
  * Intentionally not a general TOML parser.
  */
@@ -62,7 +66,8 @@ export function parseConfigToml(src: string): TomlConfig {
 
     const section = line.match(/^\[([^\]]+)\]$/);
     if (section) {
-      table = section[1].trim() === "markdown" ? "markdown" : "unsupported";
+      const name = section[1].trim();
+      table = name === "markdown" || name === "beads" ? name : "unsupported";
       continue;
     }
 
@@ -83,6 +88,15 @@ export function parseConfigToml(src: string): TomlConfig {
 
     if (table === "root") {
       config.backend = requireTomlString(value, source);
+      continue;
+    }
+    if (table === "beads") {
+      config.beads ??= {};
+      if (key === "path") config.beads.path = requireTomlString(value, source);
+      if (key === "binary")
+        config.beads.binary = requireTomlString(value, source);
+      if (key === "prefix")
+        config.beads.prefix = requireTomlString(value, source);
       continue;
     }
     config.markdown ??= {};
@@ -121,11 +135,14 @@ function stripTomlComment(raw: string): string {
   return raw;
 }
 
-function configKeySource(
-  table: ConfigTable,
-  key: string,
-): string | undefined {
+function configKeySource(table: ConfigTable, key: string): string | undefined {
   if (table === "root" && key === "backend") return "backend";
+  if (
+    table === "beads" &&
+    (key === "path" || key === "binary" || key === "prefix")
+  ) {
+    return `beads.${key}`;
+  }
   if (
     table === "markdown" &&
     (key === "path" || key === "archive" || key === "done_keep")
@@ -161,7 +178,7 @@ function loadToml(path: string): TomlConfig {
   return src ? parseConfigToml(src) : {};
 }
 
-function resolveMarkdownPath(
+function resolveStorePath(
   explicit: string | undefined,
   tomlPath: string | undefined,
   cwd: string,
@@ -208,6 +225,14 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ResolvedConfig {
   const homeToml = loadToml(join(home, ".tasks-axi", "config.toml"));
   const projectToml = loadToml(resolve(cwd, ".tasks.toml"));
 
+  const backend =
+    overrides.backend ??
+    env.TASKS_AXI_BACKEND ??
+    projectToml.backend ??
+    homeToml.backend ??
+    "markdown";
+  const selectedTable = backend === "beads" ? "beads" : "markdown";
+
   const explicitPath =
     overrides.file !== undefined
       ? validatePathValue(overrides.file, "--file")
@@ -217,18 +242,25 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ResolvedConfig {
   const tomlPath =
     explicitPath !== undefined
       ? undefined
-      : projectToml.markdown?.path !== undefined
-        ? validatePathValue(projectToml.markdown.path, "markdown.path")
-        : validatePathValue(homeToml.markdown?.path, "markdown.path");
+      : backend === "beads" && env.TASKS_AXI_BEADS_PATH !== undefined
+        ? validatePathValue(env.TASKS_AXI_BEADS_PATH, "TASKS_AXI_BEADS_PATH")
+        : projectToml[selectedTable]?.path !== undefined
+          ? validatePathValue(
+              projectToml[selectedTable]?.path,
+              `${selectedTable}.path`,
+            )
+          : validatePathValue(
+              homeToml[selectedTable]?.path,
+              `${selectedTable}.path`,
+            );
 
-  const backend =
-    overrides.backend ??
-    env.TASKS_AXI_BACKEND ??
-    projectToml.backend ??
-    homeToml.backend ??
-    "markdown";
-
-  const path = resolveMarkdownPath(explicitPath, tomlPath, cwd);
+  if (backend === "beads" && (explicitPath ?? tomlPath) === undefined) {
+    throw new AxiError(
+      "beads.path is required: select an explicit .beads directory or .db file",
+      "VALIDATION_ERROR",
+    );
+  }
+  const path = resolveStorePath(explicitPath, tomlPath, cwd);
 
   const archive =
     projectToml.markdown?.archive !== undefined
@@ -241,6 +273,24 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ResolvedConfig {
   );
 
   const config: ResolvedConfig = { backend, path, doneKeep };
+  if (backend === "beads") {
+    const binary =
+      env.TASKS_AXI_BEADS_BINARY ??
+      projectToml.beads?.binary ??
+      homeToml.beads?.binary ??
+      "br";
+    validatePathValue(binary, "beads.binary");
+    config.beadsBinary =
+      binary.includes("/") || binary.includes("\\")
+        ? resolve(cwd, binary)
+        : binary;
+    config.beadsPrefix = validatePathValue(
+      env.TASKS_AXI_BEADS_PREFIX ??
+        projectToml.beads?.prefix ??
+        homeToml.beads?.prefix,
+      "beads.prefix",
+    );
+  }
   if (archive) {
     config.archivePath = isAbsolute(archive) ? archive : resolve(cwd, archive);
   }
