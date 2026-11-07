@@ -12,6 +12,7 @@ import {
 } from "../args.js";
 import { renderMutation, stateLabel, taskToJson } from "../confirm.js";
 import { createStore, requireCtx, type TasksContext } from "../context.js";
+import { resolveConfig } from "../config.js";
 import {
   blockedIds,
   heldTasks,
@@ -810,10 +811,10 @@ export async function mvCommand(
     if (!(await store.get(id)) && !capabilities.collectionTransfer)
       throw notFound(id, { globals: context?.suggestionGlobals });
   }
+  // Source resolution only loads settings for its active backend. Resolve the
+  // destination's settings with normal precedence and its explicit address.
   const target = createStore({
-    ...config,
-    backend: toBackend,
-    path: targetPath,
+    ...resolveConfig({ backend: toBackend, file: targetPath }),
     archivePath: undefined,
   });
   if (capabilities.collectionTransfer) {

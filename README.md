@@ -379,7 +379,8 @@ Fix the output path and run `tasks-axi render --backend beads`, or retry the sam
 
 `mv` supports markdown to beads, beads to markdown, and beads to beads through `Store.transferMany`.
 `--backend` and `--file` select the source. `--to` names the destination path; `--to-backend markdown|beads` selects its backend and defaults to the source backend.
-A beads destination directory selects `<directory>/beads.db`, just like the source configuration. Destination beads stores reuse the configured binary, prefix, and subprocess timeout.
+A beads destination directory selects `<directory>/beads.db`, just like the source configuration.
+Destination beads settings use the usual environment > current project's `.tasks.toml` > user configuration precedence, even when the source is markdown. Project-configured executables remain limited to bare `br` or `bd`; custom paths require environment or user configuration.
 
 ```sh
 # Markdown to beads
