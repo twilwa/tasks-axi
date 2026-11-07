@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { BeadsStore } from "../../src/backends/beads.js";
+import { MarkdownStore } from "../../src/backends/markdown.js";
 import type { Store } from "../../src/store.js";
 import { spawnSync } from "node:child_process";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -496,6 +497,123 @@ describe.skipIf(!hasBr)("markdown/beads collection transfers", () => {
       workspace.cleanup();
     }
   });
+
+  it.each(["markdown", "beads"])(
+    "refuses a mirror overlapping the peer authoritative file with a %s source",
+    async (from) => {
+      const markdown = makeBacklog("# Backlog\n");
+      const workspace = makeBeadsWorkspace();
+      const plain = new BeadsStore({ path: workspace.path });
+      const mirrored = new BeadsStore({
+        path: workspace.path,
+        mirrorPath: markdown.path,
+      });
+      const source = from === "markdown" ? markdown.store : mirrored;
+      const target = from === "markdown" ? mirrored : markdown.store;
+      try {
+        await markdown.store.create({
+          id: "kept",
+          title: "Keep markdown task",
+          created: null,
+        });
+        await (from === "markdown" ? markdown.store : plain).create({
+          id: "root",
+          title: "Root",
+          created: null,
+        });
+        const before = markdown.read();
+        const nativeBefore = (await plain.list({})).items;
+        await expect(
+          source.transferMany!(["root"], target),
+        ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+        expect(markdown.read()).toBe(before);
+        expect((await plain.list({})).items).toEqual(nativeBefore);
+      } finally {
+        markdown.cleanup();
+        workspace.cleanup();
+      }
+    },
+    30_000,
+  );
+
+  it("refreshes both beads mirrors and repairs them on a completed transfer retry", async () => {
+    const left = makeBeadsWorkspace();
+    const right = makeBeadsWorkspace();
+    const sourceMirror = join(left.dir, "mirror", "backlog.md");
+    const targetMirror = join(right.dir, "mirror", "backlog.md");
+    const mirrorPaths = [
+      sourceMirror,
+      join(left.dir, "mirror", "done-archive.md"),
+      targetMirror,
+      join(right.dir, "mirror", "done-archive.md"),
+    ];
+    const source = new BeadsStore({
+      path: left.path,
+      mirrorPath: sourceMirror,
+      doneKeep: 0,
+    });
+    const target = new BeadsStore({
+      path: right.path,
+      mirrorPath: targetMirror,
+      doneKeep: 0,
+    });
+    try {
+      await source.create({ id: "root", title: "Root", created: null });
+      await source.create({
+        id: "kept",
+        title: "Keep at source",
+        created: null,
+      });
+      await source.create({
+        id: "closed",
+        title: "Finished",
+        state: "done",
+        closed: "2026-01-01",
+        body: "Result retained.",
+      });
+      await source.transferMany(["closed", "root"], target);
+      expect(
+        (await new MarkdownStore({ path: sourceMirror }).list({})).items.map(
+          (task) => task.id,
+        ),
+      ).toEqual(["kept"]);
+      expect(
+        (await new MarkdownStore({ path: targetMirror }).list({})).items.map(
+          (task) => task.id,
+        ),
+      ).toEqual(["root"]);
+      expect(
+        await new MarkdownStore({ path: mirrorPaths[3], archived: true }).get(
+          "closed",
+        ),
+      ).toMatchObject({
+        title: "Finished",
+        state: "done",
+        closed: "2026-01-01",
+        body: "Result retained.",
+      });
+      expect(
+        (
+          await new MarkdownStore({
+            path: mirrorPaths[1],
+            archived: true,
+          }).list({})
+        ).total,
+      ).toBe(0);
+      const expected = mirrorPaths.map((path) => readFileSync(path, "utf8"));
+      for (const path of mirrorPaths)
+        writeFileSync(path, "# Stale projection\n");
+      await source.transferMany(["closed", "root"], target);
+      expect(mirrorPaths.map((path) => readFileSync(path, "utf8"))).toEqual(
+        expected,
+      );
+      expect((await source.list({})).total).toBe(1);
+      expect((await target.list({})).total).toBe(2);
+    } finally {
+      left.cleanup();
+      right.cleanup();
+    }
+  }, 30_000);
 
   it("moves markdown to beads without changing worker fields", async () => {
     const markdown = makeBacklog("# Backlog\n");

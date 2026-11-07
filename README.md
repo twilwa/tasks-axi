@@ -363,6 +363,7 @@ mirror_archive = "mirror/done-archive.md" # optional; defaults beside mirror
 ```
 
 After each successful tasks-axi beads mutation, including idempotent writes, the adapter rewrites these canonical markdown projections while holding the database's Store lock.
+Mirrors belong to the configured beads database, whether it is a move's source or destination; a different `--file` or `mv --to` database does not inherit them.
 Reads do not write mirrors. `tasks-axi render --backend beads` rebuilds them without changing native tasks; without `beads.mirror`, render is unsupported.
 Treat both generated files as read-only. Edits are overwritten, not imported. Do not point a markdown writer at them.
 Migration refuses output paths that overlap its sources, including symlink aliases. Mirror outputs also cannot overlap each other, the database, its sidecars or locks, or the note archive.
@@ -372,7 +373,7 @@ Older Done tasks go into the archive projection, with their bodies and metadata 
 No mirror operation prunes the database. The archive is a complete projection of the older Done rows, not an append-only log.
 
 Each file is replaced atomically, archive first. The two files are not an atomic pair, so a crash or failed replacement can leave different generations until repair.
-A mirror error makes the command fail and explicitly reports that the beads write succeeded. It does not roll back that write or delete older database history.
+A mirror error makes the command fail and explicitly reports that the beads write succeeded. Single-store commands do not roll back that write or delete older database history; `mv` follows the compensation contract below.
 Fix the output path and run `tasks-axi render --backend beads`, or retry the same idempotent write. Native br writers do not refresh mirrors and remain unsupported.
 
 ### Moving tasks between collections
@@ -397,6 +398,7 @@ Beads-to-beads also preserves the Store's `meta` bag. A move to markdown refuses
 Transfers involving beads refuse public-followup obligations, including terminal ones. They also refuse cyclic dependency sets that cannot be created in dependency order.
 
 Beads moves copy the entire destination graph before removing any source task. They hold both advisory locks and attempt rollback on a write failure, restoring missing source tasks before deleting newly staged destination copies.
+Configured mirrors refresh under those locks, including on completed retries, and mirror outputs that overlap the peer's authoritative file are refused before writing.
 This is not a cross-database transaction. A crash or failed rollback can leave transient duplicates, but never removes a task's only copy.
 Rerun the same `mv` with the same ids and destination to finish. An identical destination copy is reused; an id already absent from the source but present in the destination counts as already moved. Different destination content is a `CONFLICT`, with neither copy overwritten.
 If a killed process left lockfiles, remove only those named locks after confirming no tasks-axi process is running, then rerun. Do not delete destination tasks to clear a collision unless you have verified another complete copy exists.

@@ -15,7 +15,10 @@ import { parseBacklog, renderTaskLines } from "./markdown-grammar.js";
 
 // Only the two local adapters opt into this protocol. Their ordinary mutations
 // reuse locks owned by this transfer's async chain, never a process-global flag.
-const paths = new WeakMap<Store, string>();
+const collections = new WeakMap<
+  Store,
+  { path: string; refresh?: () => Promise<unknown> }
+>();
 const ownedLocks = new AsyncLocalStorage<ReadonlySet<string>>();
 const removal = new AsyncLocalStorage<{ store: Store; expected: Task }>();
 
@@ -37,8 +40,12 @@ function removeTransferredTask(store: Store, expected: Task): Promise<Task> {
   return removal.run({ store, expected }, () => store.remove(expected.id));
 }
 
-export function registerTransferStore(store: Store, path: string): void {
-  paths.set(store, resolve(path));
+export function registerTransferStore(
+  store: Store,
+  path: string,
+  refresh?: () => Promise<unknown>,
+): void {
+  collections.set(store, { path: resolve(path), refresh });
 }
 
 export function withCollectionLock<T>(
@@ -104,19 +111,25 @@ export async function transferCollection(
   ids: string[],
   target: Store,
 ): Promise<Task[]> {
-  const sourcePath = paths.get(source);
-  const targetPath = paths.get(target);
-  if (!sourcePath || !targetPath)
+  const sourceCollection = collections.get(source);
+  const targetCollection = collections.get(target);
+  if (!sourceCollection || !targetCollection)
     throw new AxiError(
       `Cannot transfer into the "${target.capabilities().backend}" backend`,
       "UNSUPPORTED",
     );
+  const sourcePath = sourceCollection.path;
+  const targetPath = targetCollection.path;
   if (sourcePath === targetPath)
     throw new AxiError(
       "--to resolves to the current collection",
       "VALIDATION_ERROR",
     );
   const uniqueIds = [...new Set(ids.map((id) => validateId(id)))];
+  // Validate output paths only: beads-to-beads can retain metadata that the
+  // markdown import row validator intentionally refuses.
+  source.validateImport?.([], [targetPath]);
+  target.validateImport?.([], [sourcePath]);
   return withLocks([sourcePath, targetPath], () =>
     ownedLocks.run(new Set([sourcePath, targetPath]), async () => {
       const remaining = (await source.list({})).items;
@@ -231,6 +244,10 @@ export async function transferCollection(
         }
         throw error;
       }
+      // Even a completed retry is a mutation: repair derived projections under
+      // both locks. A refresh failure must not undo an already completed move.
+      await sourceCollection.refresh?.();
+      await targetCollection.refresh?.();
       return tasks;
     }),
   );

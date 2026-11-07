@@ -5,16 +5,19 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { BeadsStore } from "../../src/backends/beads.js";
+import { MarkdownStore } from "../../src/backends/markdown.js";
 import { mvCommand } from "../../src/commands/state.js";
-import type { TasksContext } from "../../src/context.js";
+import { resolveTasksContext, type TasksContext } from "../../src/context.js";
 import { hasBr, makeBeadsWorkspace, recordBr } from "../beads-helpers.js";
 import { makeBacklog } from "../helpers.js";
 
-function runMarkdownMove(
+function runMoveToBeads(
   source: string,
   target: string,
   home: string,
   env: NodeJS.ProcessEnv = {},
+  backend = "markdown",
+  cwd = dirname(source),
 ) {
   return spawnSync(
     process.execPath,
@@ -25,7 +28,7 @@ function runMarkdownMove(
       "mv",
       "root",
       "--backend",
-      "markdown",
+      backend,
       "--file",
       source,
       "--to",
@@ -35,7 +38,7 @@ function runMarkdownMove(
       "--json",
     ],
     {
-      cwd: dirname(source),
+      cwd,
       env: {
         ...Object.fromEntries(
           Object.entries(process.env).filter(
@@ -91,7 +94,7 @@ describe.skipIf(!hasBr)("mv between markdown and beads collections", () => {
         await markdown.store.create({ id: "root", title: "Root" });
         const before = markdown.read();
         writeFileSync(stall, "");
-        const timedOut = runMarkdownMove(markdown.path, target, home, env);
+        const timedOut = runMoveToBeads(markdown.path, target, home, env);
         expect(timedOut.error).toBeUndefined();
         expect(timedOut.status).toBe(1);
         expect(timedOut.stdout + timedOut.stderr).toContain(
@@ -109,7 +112,7 @@ describe.skipIf(!hasBr)("mv between markdown and beads collections", () => {
             "--json",
           ]),
         );
-        const retry = runMarkdownMove(markdown.path, target, home, {
+        const retry = runMoveToBeads(markdown.path, target, home, {
           ...env,
           TASKS_AXI_BEADS_TIMEOUT_MS: "5000",
         });
@@ -150,7 +153,7 @@ describe.skipIf(!hasBr)("mv between markdown and beads collections", () => {
       await markdown.store.create({ id: "root", title: "Root" });
       const before = markdown.read();
       writeFileSync(join(markdown.dir, ".tasks.toml"), projectConfig(0));
-      const invalid = runMarkdownMove(markdown.path, target, home);
+      const invalid = runMoveToBeads(markdown.path, target, home);
       expect(invalid.error).toBeUndefined();
       expect(invalid.status).toBe(2);
       expect(invalid.stdout + invalid.stderr).toContain(
@@ -159,7 +162,7 @@ describe.skipIf(!hasBr)("mv between markdown and beads collections", () => {
       expect(markdown.read()).toBe(before);
       expect(existsSync(target)).toBe(false);
       writeFileSync(join(markdown.dir, ".tasks.toml"), projectConfig(5000));
-      const moved = runMarkdownMove(markdown.path, target, home);
+      const moved = runMoveToBeads(markdown.path, target, home);
       expect(moved.error).toBeUndefined();
       expect(moved.status).toBe(0);
       expect(JSON.parse(moved.stdout)).toMatchObject({
@@ -199,7 +202,7 @@ describe.skipIf(!hasBr)("mv between markdown and beads collections", () => {
     try {
       await markdown.store.create({ id: "root", title: "Root" });
       const before = markdown.read();
-      const refused = runMarkdownMove(markdown.path, target, home);
+      const refused = runMoveToBeads(markdown.path, target, home);
       expect(refused.error).toBeUndefined();
       expect(refused.status).toBe(2);
       expect(refused.stdout + refused.stderr).toContain(
@@ -212,6 +215,89 @@ describe.skipIf(!hasBr)("mv between markdown and beads collections", () => {
       markdown.cleanup();
     }
   }, 30_000);
+
+  it.each(["source", "destination"])(
+    "keeps the mirror with its configured database when it is the move's %s",
+    async (role) => {
+      const configured = makeBeadsWorkspace();
+      const peer = makeBeadsWorkspace();
+      const home = join(configured.dir, "home");
+      const mirror = join(configured.dir, "mirror", "backlog.md");
+      mkdirSync(home);
+      writeFileSync(
+        join(configured.dir, ".tasks.toml"),
+        'backend = "beads"\n[beads]\npath = ".beads"\nmirror = "mirror/backlog.md"\n',
+      );
+      const owner = new BeadsStore({ path: configured.path });
+      const other = new BeadsStore({ path: peer.path });
+      const source = role === "source" ? owner : other;
+      const target = role === "source" ? other : owner;
+      const sourcePath = role === "source" ? configured.path : peer.path;
+      const targetPath = role === "source" ? peer.path : configured.path;
+      try {
+        await owner.create({
+          id: "kept",
+          title: "Configured database task",
+          created: null,
+        });
+        await other.create({ id: "peer", title: "Peer task", created: null });
+        await source.create({ id: "root", title: "Moved task", created: null });
+        const overridden = resolveTasksContext({
+          backend: "beads",
+          file: peer.path,
+          cwd: configured.dir,
+          home,
+          env: {},
+        });
+        await expect(overridden.store.render!()).rejects.toMatchObject({
+          code: "UNSUPPORTED",
+        });
+        expect(existsSync(mirror)).toBe(false);
+        const moved = runMoveToBeads(
+          sourcePath,
+          targetPath,
+          home,
+          {},
+          "beads",
+          configured.dir,
+        );
+        expect(moved.error).toBeUndefined();
+        expect(moved.status).toBe(0);
+        expect(JSON.parse(moved.stdout)).toMatchObject({
+          ok: true,
+          action: "mv",
+          id: "root",
+        });
+        expect(
+          await new BeadsStore({ path: sourcePath }).get("root"),
+        ).toBeNull();
+        expect(await target.get("root")).toMatchObject({ title: "Moved task" });
+        expect(
+          (await new MarkdownStore({ path: mirror }).list({})).items.map(
+            (task) => task.id,
+          ),
+        ).toEqual(role === "source" ? ["kept"] : ["kept", "root"]);
+        const expected = readFileSync(mirror, "utf8");
+        writeFileSync(mirror, "# Stale projection\n");
+        const retried = runMoveToBeads(
+          sourcePath,
+          targetPath,
+          home,
+          {},
+          "beads",
+          configured.dir,
+        );
+        expect(retried.error).toBeUndefined();
+        expect(retried.status).toBe(0);
+        expect(readFileSync(mirror, "utf8")).toBe(expected);
+        expect(existsSync(join(peer.dir, "mirror"))).toBe(false);
+      } finally {
+        configured.cleanup();
+        peer.cleanup();
+      }
+    },
+    30_000,
+  );
 
   for (const [from, to] of [
     ["markdown", "beads"],

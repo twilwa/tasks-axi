@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
-import { readFileSafe } from "./backends/lock.js";
+import { extname, isAbsolute, join, resolve } from "node:path";
+import { canonicalPath, readFileSafe } from "./backends/lock.js";
 import { AxiError } from "./errors.js";
 
 /**
@@ -220,6 +220,13 @@ function resolveStorePath(
   return resolve(cwd, PATH_CANDIDATES[0]);
 }
 
+function beadsDatabasePath(path: string, cwd: string): string {
+  const absolute = resolve(cwd, path);
+  return canonicalPath(
+    extname(absolute) === ".db" ? absolute : join(absolute, "beads.db"),
+  );
+}
+
 function validatePathValue(
   value: string | undefined,
   source: string,
@@ -341,9 +348,22 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ResolvedConfig {
       projectToml.beads?.mirror_archive ?? homeToml.beads?.mirror_archive,
       "beads.mirror_archive",
     );
-    if (mirror) config.beadsMirrorPath = resolve(cwd, mirror);
-    if (mirrorArchive)
-      config.beadsMirrorArchivePath = resolve(cwd, mirrorArchive);
+    const configuredDatabase =
+      env.TASKS_AXI_BEADS_PATH ??
+      projectToml.beads?.path ??
+      homeToml.beads?.path;
+    // Mirrors belong to the configured database, not a peer selected by --file
+    // or mv --to. Directory/file spellings and symlink aliases share ownership.
+    if (
+      (mirror || mirrorArchive) &&
+      configuredDatabase &&
+      beadsDatabasePath(path, cwd) ===
+        beadsDatabasePath(configuredDatabase, cwd)
+    ) {
+      if (mirror) config.beadsMirrorPath = resolve(cwd, mirror);
+      if (mirrorArchive)
+        config.beadsMirrorArchivePath = resolve(cwd, mirrorArchive);
+    }
     config.beadsPrefix = validatePathValue(
       env.TASKS_AXI_BEADS_PREFIX ??
         projectToml.beads?.prefix ??

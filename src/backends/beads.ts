@@ -469,7 +469,11 @@ export class BeadsStore implements Store {
     this.doneKeep = options.doneKeep ?? 10;
     if (!Number.isSafeInteger(this.doneKeep) || this.doneKeep < 0)
       invalid("markdown.done_keep must be a non-negative integer");
-    registerTransferStore(this, this.path);
+    registerTransferStore(
+      this,
+      this.path,
+      this.mirrorPath ? () => this.mutate(async () => undefined) : undefined,
+    );
   }
 
   private writePaths(): string[] {
