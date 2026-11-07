@@ -40,6 +40,7 @@ export function resolveTasksContext(
           path: config.path,
           binary: config.beadsBinary,
           prefix: config.beadsPrefix,
+          timeoutMs: config.beadsTimeoutMs,
         })
       : new MarkdownStore({
           path: config.path,

@@ -268,11 +268,14 @@ backend = "beads"
 
 [beads]
 path = ".beads"              # required; or ".beads/beads.db"
-binary = "br"                # optional
+binary = "br"                # optional; project config allows only br or bd
 prefix = "tasks"             # optional; only used for a new database
+timeout_ms = 30000           # optional; kills the owned child at the deadline
 ```
 
-`TASKS_AXI_BEADS_PATH`, `TASKS_AXI_BEADS_BINARY`, and `TASKS_AXI_BEADS_PREFIX` override the matching TOML values.
+`TASKS_AXI_BEADS_PATH`, `TASKS_AXI_BEADS_BINARY`, `TASKS_AXI_BEADS_PREFIX`, and `TASKS_AXI_BEADS_TIMEOUT_MS` override the matching TOML values.
+Project configuration can select only the bare executable names `br` or `bd` on PATH.
+Custom executable paths or other programs require trusted home configuration or `TASKS_AXI_BEADS_BINARY`.
 `--file` and `TASKS_AXI_FILE` take precedence over the beads path setting. Relative paths resolve from the current directory.
 The directory form selects `<path>/beads.db`. Every `br` call passes that explicit database file through `--db`.
 First use initializes only the selected database if it does not exist.
@@ -281,18 +284,33 @@ Task ids remain caller-supplied slugs. Native ids are hidden behind `external_re
 The adapter releases that reference before deletion, allowing an id to be reused.
 It only lists tasks it manages, not unrelated native issues.
 
-Bodies stay in native descriptions, with superseded bodies saved through native comments when `--archive-body` is supplied.
+Bodies stay in native descriptions. With `--archive-body`, superseded bodies go into native comments and dated blocks in `note-archive.md` beside the selected database.
 Versioned `agent_context` JSON holds kind, repo, holds, dependency reasons, day stamps, and list order.
-Kind/repo labels and `hold:captain` are native mirrors capped at 50 characters. `hold.until` also sets native defer.
+Only explicit kinds are stored; title-inferred kinds are recomputed on reads and title changes.
+Beads create results include inferred kinds immediately; Markdown currently infers them only on reread.
+Kind/repo labels and `hold:captain` are native mirrors capped at 50 characters. Kind and repo values cannot contain commas.
+The adapter removes only labels it recorded as its own; unrelated native labels survive updates.
+`hold.until` also sets native defer.
 Use tasks-axi to change these adapter-owned fields. Priority, description, and state use native fields;
 `open`, `in_progress`, and `closed` map to queued, in flight, and done, while native blocked/deferred states read as queued.
+The implicit native priority 2 is omitted unless tasks-axi set a priority; other native priorities remain visible.
 Readiness still comes from tasks-axi's dependency graph and hold gates.
+Relationships to unmanaged native issues remain in br but are omitted from this graph. Use managed tasks for blockers that must gate tasks-axi dispatch.
 A native task pair can have only one dependency; conflicting pairs are rejected before creation.
 Create, update, transition, and dependency writes reread the persisted task before reporting success.
+Graph hydration uses bounded batches. Missing records or changed task timestamps cause a retryable `CONFLICT`.
+Writers outside this adapter are unsupported. Separate br reads do not provide a database-wide snapshot.
+
+Writes that span commands are not transactions. Interrupted removal keeps a recovery identity, so the same `rm` can finish and the caller id stays reserved until then.
+Close retries retain the first closed date and do not duplicate notes. Creating an already-Done task uses one native create.
+Dependency reasons are saved before edges, so a retry can finish an absent edge without losing its reason.
+A crash can still leave metadata before its native change, or archived notes before body replacement. Archive retries reuse identical comments and blocks.
+Removing an edge can leave unused reason metadata, which reads ignore. Cross-command changes are not rolled back.
+After a timeout or conflict, reread and retry the same intent.
 
 Closed tasks stay visible. This backend does not prune, render markdown, or support public-followup obligations.
 Migration, markdown mirroring, and moves into beads stores are not included.
-The live tests use temporary workspaces and explicit databases, and skip when `br` is unavailable.
+Live tests cover Store conformance and byte-identical TOON for shared markdown/br behavior. They use temporary workspaces and explicit databases, and skip when `br` is unavailable.
 
 ## Development
 

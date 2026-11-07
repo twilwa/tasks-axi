@@ -169,6 +169,9 @@ describe.skipIf(!hasBr)("markdown / br TOON parity", () => {
     await same(addCommand, [
       "older",
       "SHIP investigate",
+      // Markdown infers title kinds only on reread; compare explicit creation here.
+      "--kind",
+      "ship",
       "--body",
       "First line\n\nLast line",
     ]);

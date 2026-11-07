@@ -21,12 +21,12 @@ describe("beads database addressing", () => {
     );
     writeFileSync(
       join(dir, ".tasks.toml"),
-      'backend = "beads"\n[beads]\npath = ".beads/beads.db"\nbinary = "project-br"\nprefix = "work"\n',
+      'backend = "beads"\n[beads]\npath = ".beads/beads.db"\nbinary = "bd"\nprefix = "work"\n',
     );
     expect(resolveConfig({ cwd: dir, home, env: {} })).toMatchObject({
       backend: "beads",
       path: join(dir, ".beads/beads.db"),
-      beadsBinary: "project-br",
+      beadsBinary: "bd",
       beadsPrefix: "work",
     });
     expect(
@@ -119,6 +119,57 @@ describe("beads database addressing", () => {
         },
       }).beadsBinary,
     ).toBe(join(dir, "tools", "br"));
+  });
+
+  it.each(["./bin/br", "/bin/sh", "node", "../br"])(
+    "rejects untrusted project executable %j but permits trusted overrides",
+    (binary) => {
+      writeFileSync(
+        join(dir, ".tasks.toml"),
+        `backend = "beads"\n[beads]\npath = "selected.db"\nbinary = "${binary}"\n`,
+      );
+      expect(() => resolveConfig({ cwd: dir, home, env: {} })).toThrow(
+        /project.*beads.binary.*br or bd/,
+      );
+      expect(
+        resolveConfig({
+          cwd: dir,
+          home,
+          env: { TASKS_AXI_BEADS_BINARY: "./trusted-br" },
+        }).beadsBinary,
+      ).toBe(join(dir, "trusted-br"));
+      writeFileSync(join(dir, ".tasks.toml"), 'backend = "beads"\n');
+      writeFileSync(
+        join(home, ".tasks-axi", "config.toml"),
+        '[beads]\npath = "selected.db"\nbinary = "./trusted-home-br"\n',
+      );
+      expect(resolveConfig({ cwd: dir, home, env: {} }).beadsBinary).toBe(
+        join(dir, "trusted-home-br"),
+      );
+    },
+  );
+
+  it("configures a bounded br timeout from TOML or environment", () => {
+    writeFileSync(
+      join(dir, ".tasks.toml"),
+      'backend = "beads"\n[beads]\npath = "selected.db"\ntimeout_ms = 750\n',
+    );
+    expect(resolveConfig({ cwd: dir, home, env: {} }).beadsTimeoutMs).toBe(750);
+    expect(
+      resolveConfig({
+        cwd: dir,
+        home,
+        env: { TASKS_AXI_BEADS_TIMEOUT_MS: "500" },
+      }).beadsTimeoutMs,
+    ).toBe(500);
+    for (const value of ["", "0", "-1", "1.5", "not-a-number", "2147483648"])
+      expect(() =>
+        resolveConfig({
+          cwd: dir,
+          home,
+          env: { TASKS_AXI_BEADS_TIMEOUT_MS: value },
+        }),
+      ).toThrow(/beads.timeout_ms/);
   });
 
   it("requires an explicit database instead of discovering a parent workspace", () => {

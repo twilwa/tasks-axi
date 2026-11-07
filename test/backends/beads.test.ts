@@ -1,10 +1,11 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { BeadsStore } from "../../src/backends/beads.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { resolveTasksContext } from "../../src/context.js";
 import type { Store } from "../../src/store.js";
-import { hasBr, makeBeadsWorkspace } from "../beads-helpers.js";
+import { hasBr, makeBeadsWorkspace, recordBr } from "../beads-helpers.js";
 
 let workspace: ReturnType<typeof makeBeadsWorkspace>;
 let store: Store;
@@ -21,7 +22,12 @@ describe.skipIf(!hasBr)("beads_rust Store conformance", () => {
   });
   afterEach(() => workspace?.cleanup());
 
-  it("does not truncate large reads, applies query limits after total, and sees native state changes", async () => {
+  it("does not truncate large reads, bounds show arguments, applies limits after total, and sees native state changes", async () => {
+    const recorder = recordBr(workspace.dir, workspace.path, {
+      before:
+        "if (args[2] === 'show' && args.slice(3, -1).length > 64) process.exit(26);",
+    });
+    store = new BeadsStore({ path: workspace.path, binary: recorder.binary });
     const metadata = (order: number) =>
       JSON.stringify({
         tasks_axi: {
@@ -34,7 +40,7 @@ describe.skipIf(!hasBr)("beads_rust Store conformance", () => {
         },
       });
     const body = "Detailed notes\n".repeat(80_000);
-    for (let i = 0; i < 52; i++)
+    for (let i = 0; i < 70; i++)
       workspace.br(
         [
           "create",
@@ -55,10 +61,17 @@ describe.skipIf(!hasBr)("beads_rust Store conformance", () => {
       kind: "task",
       limit: 2,
     });
-    expect(total).toBe(52);
+    expect(total).toBe(70);
+    const shows = readFileSync(recorder.log, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[])
+      .filter((args) => args[2] === "show");
+    expect(shows).toHaveLength(2);
+    expect(shows.every((args) => args.slice(3, -1).length <= 64)).toBe(true);
     expect(items.map((item) => item.id)).toEqual(["item-0", "item-1"]);
     expect(items[0].body).toBe(body);
-    expect((await store.list({ limit: 0 })).total).toBe(52);
+    expect((await store.list({ limit: 0 })).total).toBe(70);
     expect((await store.list({ repo: "elsewhere" })).items).toEqual([]);
     const raw = workspace.br(["list", "--all", "--limit", "0"]) as {
       issues: Record<string, unknown>[];
@@ -101,6 +114,73 @@ describe.skipIf(!hasBr)("beads_rust Store conformance", () => {
     ).toMatchObject({ reason: { code: "CONFLICT" } });
     expect((await other.list({})).total).toBe(2);
   }, 30_000);
+
+  it("projects native non-default priorities when no tasks-axi priority was supplied", async () => {
+    await store.create({ id: "native-priority", title: "Priority" });
+    expect((await store.get("native-priority"))?.priority).toBeUndefined();
+    const raw = workspace.br(["list", "--all", "--limit", "0"]) as {
+      issues: { id: string }[];
+    };
+    workspace.br(["update", raw.issues[0].id, "--priority", "0"]);
+    expect((await store.get("native-priority"))?.priority).toBe(0);
+    expect((await store.list({})).items[0].priority).toBe(0);
+    await store.update("native-priority", { body: "Unrelated patch" });
+    expect((await store.get("native-priority"))?.priority).toBe(0);
+  }, 30_000);
+
+  it("filters unmanaged dependency targets without breaking managed reads or writes", async () => {
+    await store.create({ id: "managed", title: "Managed" });
+    const native = workspace.br(["list", "--all", "--limit", "0"]) as {
+      issues: { id: string }[];
+    };
+    const foreign = workspace.br(["create", "--title", "Unmanaged issue"]) as {
+      id: string;
+    };
+    workspace.br([
+      "dep",
+      "add",
+      native.issues[0].id,
+      foreign.id,
+      "--type",
+      "blocks",
+    ]);
+    expect(await store.get("managed")).toMatchObject({
+      id: "managed",
+      deps: [],
+    });
+    expect((await store.list({})).total).toBe(1);
+    expect(
+      (await store.update("managed", { body: "Current notes" })).task.body,
+    ).toBe("Current notes");
+  }, 30_000);
+
+  it.skipIf(process.platform === "win32")(
+    "rejects a managed record that changes between listing and graph hydration",
+    async () => {
+      await store.create({ id: "changed", title: "Changed" });
+      const marker = join(workspace.dir, "change-during-show");
+      writeFileSync(marker, "");
+      const recorder = recordBr(workspace.dir, workspace.path, {
+        before: `if (args[2] === 'show' && fs.existsSync(${JSON.stringify(marker)})) {
+        fs.unlinkSync(${JSON.stringify(marker)});
+        const changed = spawnSync('br', ['--db', args[1], 'update', args[3], '--status', 'in_progress', '--json']);
+        if (changed.status !== 0) process.exit(changed.status ?? 1);
+      }`,
+      });
+      const recorded = new BeadsStore({
+        path: workspace.path,
+        binary: recorder.binary,
+      });
+      await expect(recorded.list({})).rejects.toMatchObject({
+        code: "CONFLICT",
+        message: expect.stringMatching(/changed while reading; retry/),
+      });
+      expect(await recorded.get("changed")).toMatchObject({
+        state: "in_flight",
+      });
+    },
+    30_000,
+  );
 
   it("rejects corrupt adapter data without exposing unrelated native issues", async () => {
     workspace.br(["create", "--title", "Unmanaged native work"]);
@@ -209,7 +289,18 @@ describe.skipIf(!hasBr)("beads_rust Store conformance", () => {
         },
       },
     });
-    workspace.br(["update", String(native.id), "--add-label", "unrelated"]);
+    workspace.br([
+      "update",
+      String(native.id),
+      "--add-label",
+      "unrelated",
+      "--add-label",
+      "kind:independent",
+      "--add-label",
+      "repo:independent",
+      "--add-label",
+      "kind:scout",
+    ]);
     await store.update("metadata", {
       body: "Short",
       archiveBody: true,
@@ -221,23 +312,251 @@ describe.skipIf(!hasBr)("beads_rust Store conformance", () => {
       text: string;
     }[];
     expect(comments.map((comment) => comment.text)).toEqual([body]);
+    const archived = readFileSync(
+      join(workspace.dir, ".beads", "note-archive.md"),
+      "utf8",
+    );
+    expect(archived).toContain("## Archived ");
+    expect(archived).toContain("metadata - Metadata");
+    expect(archived).toContain("  Original notes");
+    expect(archived).toContain("  details details");
     const [updated] = workspace.br(["show", String(native.id)]) as Record<
       string,
       unknown
     >[];
     expect(updated.description).toBe("Short");
     expect(updated.labels).toEqual(
-      expect.arrayContaining(["kind:scout", "repo:new-repo", "unrelated"]),
+      expect.arrayContaining([
+        "kind:scout",
+        "repo:new-repo",
+        "unrelated",
+        "kind:independent",
+        "repo:independent",
+      ]),
     );
     expect(updated.labels).not.toContain("hold:captain");
     expect(updated.defer_until).toBeUndefined();
+    await store.update("metadata", { kind: "docs" });
+    const [relabeled] = workspace.br(["show", String(native.id)]) as Record<
+      string,
+      unknown
+    >[];
+    expect(relabeled.labels).toEqual(
+      expect.arrayContaining([
+        "kind:docs",
+        "kind:scout",
+        "kind:independent",
+        "repo:independent",
+      ]),
+    );
     expect(await store.get("metadata")).toMatchObject({
-      kind: "scout",
+      kind: "docs",
       repo: "new-repo",
       body: "Short",
       meta: { source: "example" },
     });
   }, 30_000);
+
+  it.skipIf(process.platform === "win32")(
+    "reuses body archives when a replacement fails and is retried",
+    async () => {
+      const fault = join(workspace.dir, "body-fault");
+      const recorder = recordBr(workspace.dir, workspace.path, {
+        before: `if (fs.existsSync(${JSON.stringify(fault)}) && args[2] === 'update' && args.includes('--description-file')) process.exit(27);`,
+      });
+      const recorded = new BeadsStore({
+        path: workspace.path,
+        binary: recorder.binary,
+      });
+      const body = "Original notes that must survive\nSecond line";
+      await recorded.create({
+        id: "archive-retry",
+        title: "Archive retry",
+        body,
+      });
+      const patch = { body: "Short", archiveBody: true };
+      writeFileSync(fault, "");
+      for (let attempt = 0; attempt < 2; attempt++)
+        await expect(
+          recorded.update("archive-retry", patch),
+        ).rejects.toMatchObject({ code: "UNKNOWN" });
+      unlinkSync(fault);
+      await recorded.update("archive-retry", patch);
+      expect((await recorded.get("archive-retry"))?.body).toBe("Short");
+      const native = workspace.br(["list", "--all", "--limit", "0"]) as {
+        issues: { id: string }[];
+      };
+      const comments = workspace.br([
+        "comments",
+        "list",
+        native.issues[0].id,
+      ]) as { text: string }[];
+      expect(comments.map((comment) => comment.text)).toEqual([body]);
+      const archive = readFileSync(
+        join(workspace.dir, ".beads", "note-archive.md"),
+        "utf8",
+      );
+      expect(archive.match(/^## Archived /gm)).toHaveLength(1);
+      expect(archive).toContain(
+        "  Original notes that must survive\n  Second line",
+      );
+    },
+    60_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "keeps interrupted deletions addressable and lets the same remove retry finish",
+    async () => {
+      const fault = join(workspace.dir, "delete-fault");
+      const recorder = recordBr(workspace.dir, workspace.path, {
+        before: `if (fs.existsSync(${JSON.stringify(fault)}) && fs.readFileSync(${JSON.stringify(fault)}, 'utf8') === 'both' && (args[2] === 'delete' || (args[2] === 'update' && args.includes('--external-ref') && args[args.indexOf('--external-ref') + 1] !== ''))) process.exit(27);`,
+        after: `if (result.status === 0 && fs.existsSync(${JSON.stringify(fault)}) && fs.readFileSync(${JSON.stringify(fault)}, 'utf8') === 'interrupted' && args[2] === 'update' && args.includes('--external-ref') && args[args.indexOf('--external-ref') + 1] === '') process.exit(27);`,
+      });
+      const recorded = new BeadsStore({
+        path: workspace.path,
+        binary: recorder.binary,
+      });
+      for (const mode of ["interrupted", "both"]) {
+        const id = `retry-delete-${mode}`;
+        await recorded.create({ id, title: "Original" });
+        writeFileSync(fault, mode);
+        await expect(recorded.remove(id)).rejects.toMatchObject({
+          code: "UNKNOWN",
+        });
+        expect(await recorded.get(id)).toMatchObject({ id, title: "Original" });
+        await expect(
+          recorded.create({ id, title: "Too early" }),
+        ).rejects.toMatchObject({ code: "CONFLICT" });
+        unlinkSync(fault);
+        await recorded.remove(id);
+        expect(await recorded.get(id)).toBeNull();
+        expect(
+          await recorded.create({ id, title: "Replacement" }),
+        ).toMatchObject({ id, title: "Replacement" });
+      }
+    },
+    60_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "retries dependency writes without losing reasons after a subprocess failure",
+    async () => {
+      const fault = join(workspace.dir, "dependency-fault");
+      const recorder = recordBr(workspace.dir, workspace.path, {
+        before: `if (fs.existsSync(${JSON.stringify(fault)})) {
+        const mode = fs.readFileSync(${JSON.stringify(fault)}, 'utf8');
+        if (mode === 'context' && args[2] === 'update' && args.includes('--agent-context')) process.exit(27);
+        if (mode === 'edge' && args[2] === 'dep' && args[3] === 'add') process.exit(27);
+      }`,
+        after: `if (result.status === 0 && fs.existsSync(${JSON.stringify(fault)}) && fs.readFileSync(${JSON.stringify(fault)}, 'utf8') === 'reply' && args[2] === 'dep' && args[3] === 'add') process.exit(27);`,
+      });
+      const recorded = new BeadsStore({
+        path: workspace.path,
+        binary: recorder.binary,
+      });
+      await recorded.create({ id: "blocker", title: "Blocker" });
+      await recorded.create({ id: "dependent", title: "Dependent" });
+      const dep = {
+        type: "blocked-by" as const,
+        id: "blocker",
+        reason: "Needs prerequisite",
+      };
+      for (const mode of ["context", "edge", "reply"]) {
+        writeFileSync(fault, mode);
+        await expect(recorded.addDep("dependent", dep)).rejects.toMatchObject({
+          code: "UNKNOWN",
+        });
+        unlinkSync(fault);
+        await recorded.addDep("dependent", dep);
+        expect((await recorded.get("dependent"))?.deps).toEqual([dep]);
+        await recorded.removeDep("dependent", dep);
+      }
+    },
+    60_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "creates Done atomically and converges a failed close without duplicate notes or date drift",
+    async () => {
+      const failClose = join(workspace.dir, "fail-close");
+      const recorder = recordBr(workspace.dir, workspace.path, {
+        before: `if (fs.existsSync(${JSON.stringify(failClose)}) && args[2] === 'close') process.exit(27);`,
+      });
+      const recorded = new BeadsStore({
+        path: workspace.path,
+        binary: recorder.binary,
+      });
+      writeFileSync(failClose, "");
+      await expect(
+        recorded.create({
+          id: "already-done",
+          title: "Historical work",
+          state: "done",
+          closed: "2026-01-02",
+        }),
+      ).resolves.toMatchObject({ state: "done", closed: "2026-01-02" });
+      await recorded.create({
+        id: "retry-close",
+        title: "Deliver",
+        body: "Initial",
+      });
+      await expect(
+        recorded.transition("retry-close", "done", {
+          date: "2026-02-03",
+          note: "Delivered",
+        }),
+      ).rejects.toMatchObject({ code: "UNKNOWN" });
+      expect(await recorded.get("retry-close")).toMatchObject({
+        state: "queued",
+        body: "Initial\nDelivered",
+      });
+      unlinkSync(failClose);
+      const closed = await recorded.transition("retry-close", "done", {
+        date: "2026-02-04",
+        note: "Delivered",
+      });
+      expect(closed).toMatchObject({
+        state: "done",
+        body: "Initial\nDelivered",
+        closed: "2026-02-03",
+      });
+      expect(await recorded.get("retry-close")).toMatchObject({
+        state: "done",
+        body: "Initial\nDelivered",
+        closed: "2026-02-03",
+      });
+    },
+    30_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "terminates only its stalled child at the configured subprocess deadline",
+    async () => {
+      const pidFile = join(workspace.dir, "child.pid");
+      const woke = join(workspace.dir, "woke");
+      const recorder = recordBr(workspace.dir, workspace.path, {
+        before: `fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2000); fs.writeFileSync(${JSON.stringify(woke)}, 'finished');`,
+      });
+      const selected = resolveTasksContext({
+        backend: "beads",
+        file: workspace.path,
+        cwd: workspace.dir,
+        home: workspace.dir,
+        env: {
+          TASKS_AXI_BEADS_BINARY: recorder.binary,
+          TASKS_AXI_BEADS_TIMEOUT_MS: "500",
+        },
+      }).store;
+      await expect(selected.list({})).rejects.toMatchObject({
+        code: "UNKNOWN",
+        message: expect.stringMatching(/timed out.*500/),
+      });
+      expect(existsSync(woke)).toBe(false);
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      expect(() => process.kill(pid, 0)).toThrow(); // signal 0 probes only this test's recorded child
+    },
+    10_000,
+  );
 
   it.skipIf(process.platform === "win32")(
     "pins all commands to the selected DB and hydrates the graph with one batched show",
@@ -326,9 +645,9 @@ process.exit(result.status ?? 1);\n`,
       expect(
         final.find((args) => args.includes("--description-file")),
       ).toContain("--force");
-      expect(final.find((args) => args[2] === "comments")).toEqual(
-        expect.arrayContaining(["add", "-f", "-"]),
-      );
+      expect(
+        final.find((args) => args[2] === "comments" && args[3] === "add"),
+      ).toEqual(expect.arrayContaining(["add", "-f", "-"]));
       const deletion = final.findIndex((args) => args[2] === "delete");
       expect(final[deletion]).toContain("--force");
       expect(final[deletion - 1]).toEqual(
@@ -349,6 +668,8 @@ process.exit(result.status ?? 1);\n`,
       { title: "\nInvalid" },
       { title: "   " },
       { kind: "bad(kind)" },
+      { kind: "ship,bug" },
+      { repo: "repo,extra" },
       { priority: 8 },
       { created: "yesterday" },
       { created: "" },
@@ -370,6 +691,11 @@ process.exit(result.status ?? 1);\n`,
     ).rejects.toMatchObject({ code: "UNSUPPORTED" });
     await store.create({ id: "valid", title: "Valid" });
     await expect(store.update("valid", { title: "" })).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+    });
+    await expect(
+      store.update("valid", { repo: "repo,extra" }),
+    ).rejects.toMatchObject({
       code: "VALIDATION_ERROR",
     });
     await expect(
@@ -425,7 +751,54 @@ process.exit(result.status ?? 1);\n`,
     expect((await selected.list({})).total).toBe(1);
     expect(existsSync(join(path, "beads.db"))).toBe(true);
     expect(existsSync(join(path, ".beads"))).toBe(false);
+    const native = JSON.parse(
+      execFileSync(
+        "br",
+        ["--db", join(path, "beads.db"), "list", "--all", "--json"],
+        {
+          cwd: workspace.dir,
+          encoding: "utf8",
+        },
+      ),
+    ) as { issues: { id: string }[] };
+    expect(native.issues[0].id).toMatch(/^lane-/);
     expect((await store.list({})).total).toBe(0);
+  }, 30_000);
+
+  it("returns current inferred kinds and retains creation dates across reopen", async () => {
+    const created = await store.create({
+      id: "inferred",
+      title: "SCOUT investigate",
+      created: "2026-01-02",
+    });
+    expect(created.kind).toBe("scout");
+    expect(created).toEqual(await store.get("inferred"));
+    const renamed = await store.update("inferred", { title: "SHIP deliver" });
+    expect(renamed.task.kind).toBe("ship");
+    expect((await store.list({ kind: "ship" })).total).toBe(1);
+    expect((await store.update("inferred", { kind: "" })).task.kind).toBe(
+      "ship",
+    );
+    await store.update("inferred", { kind: "docs" });
+    expect(
+      (await store.update("inferred", { title: "SCOUT again" })).task.kind,
+    ).toBe("docs");
+    expect((await store.update("inferred", { kind: "" })).task.kind).toBe(
+      "scout",
+    );
+    expect((await store.get("inferred"))?.kind).toBe("scout");
+    await store.transition("inferred", "done", { date: "2026-02-03" });
+    expect((await store.get("inferred"))?.created).toBeUndefined();
+    expect(
+      (await store.transition("inferred", "queued", { date: "2026-03-04" }))
+        .created,
+    ).toBe("2026-01-02");
+    await store.transition("inferred", "done", { date: "2026-04-05" });
+    expect(
+      (await store.transition("inferred", "in_flight", { date: "2026-05-06" }))
+        .created,
+    ).toBe("2026-01-02");
+    expect((await store.get("inferred"))?.created).toBe("2026-01-02");
   }, 30_000);
 
   it("creates and retrieves bare caller ids without putting adapter metadata in the body", async () => {

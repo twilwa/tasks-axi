@@ -25,6 +25,7 @@ export interface ResolvedConfig {
   doneKeep: number;
   beadsBinary?: string;
   beadsPrefix?: string;
+  beadsTimeoutMs?: number;
 }
 
 export interface ConfigOverrides {
@@ -37,7 +38,12 @@ export interface ConfigOverrides {
 
 interface TomlConfig {
   backend?: string;
-  beads?: { path?: string; binary?: string; prefix?: string };
+  beads?: {
+    path?: string;
+    binary?: string;
+    prefix?: string;
+    timeout_ms?: number;
+  };
   markdown?: {
     path?: string;
     archive?: string;
@@ -51,7 +57,7 @@ type ConfigTable = "root" | "markdown" | "beads" | "unsupported";
 
 /**
  * Minimal TOML reader for the tiny config surface we need: a top-level
- * `backend` key, `[beads]` with `path` / `binary` / `prefix`, and `[markdown]` with
+ * `backend` key, `[beads]` with `path` / `binary` / `prefix` / `timeout_ms`, and `[markdown]` with
  * `path` / `archive` / `done_keep`.
  * `archive` points at the file that receives pruned tasks.
  * Intentionally not a general TOML parser.
@@ -97,6 +103,14 @@ export function parseConfigToml(src: string): TomlConfig {
         config.beads.binary = requireTomlString(value, source);
       if (key === "prefix")
         config.beads.prefix = requireTomlString(value, source);
+      if (key === "timeout_ms") {
+        if (typeof value !== "number")
+          throw new AxiError(
+            "beads.timeout_ms must be an integer",
+            "VALIDATION_ERROR",
+          );
+        config.beads.timeout_ms = value;
+      }
       continue;
     }
     config.markdown ??= {};
@@ -139,7 +153,10 @@ function configKeySource(table: ConfigTable, key: string): string | undefined {
   if (table === "root" && key === "backend") return "backend";
   if (
     table === "beads" &&
-    (key === "path" || key === "binary" || key === "prefix")
+    (key === "path" ||
+      key === "binary" ||
+      key === "prefix" ||
+      key === "timeout_ms")
   ) {
     return `beads.${key}`;
   }
@@ -274,6 +291,16 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ResolvedConfig {
 
   const config: ResolvedConfig = { backend, path, doneKeep };
   if (backend === "beads") {
+    if (
+      env.TASKS_AXI_BEADS_BINARY === undefined &&
+      projectToml.beads?.binary !== undefined &&
+      !["br", "bd"].includes(projectToml.beads.binary)
+    ) {
+      throw new AxiError(
+        "project beads.binary must be the PATH name br or bd; use environment or home config for a trusted custom executable",
+        "VALIDATION_ERROR",
+      );
+    }
     const binary =
       env.TASKS_AXI_BEADS_BINARY ??
       projectToml.beads?.binary ??
@@ -284,6 +311,18 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ResolvedConfig {
       binary.includes("/") || binary.includes("\\")
         ? resolve(cwd, binary)
         : binary;
+    const timeout =
+      env.TASKS_AXI_BEADS_TIMEOUT_MS !== undefined
+        ? Number(env.TASKS_AXI_BEADS_TIMEOUT_MS)
+        : (projectToml.beads?.timeout_ms ?? homeToml.beads?.timeout_ms);
+    if (timeout !== undefined) {
+      if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 2147483647)
+        throw new AxiError(
+          "beads.timeout_ms must be an integer between 1 and 2147483647",
+          "VALIDATION_ERROR",
+        );
+      config.beadsTimeoutMs = timeout;
+    }
     config.beadsPrefix = validatePathValue(
       env.TASKS_AXI_BEADS_PREFIX ??
         projectToml.beads?.prefix ??

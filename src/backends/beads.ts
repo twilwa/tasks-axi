@@ -25,8 +25,13 @@ import type {
 } from "../model.js";
 import { HOLD_KINDS, STATES } from "../model.js";
 import type { Capabilities, Store } from "../store.js";
-import { deriveLinks, extractTags, leadingKind } from "./markdown-grammar.js";
-import { withLock } from "./lock.js";
+import {
+  deriveLinks,
+  extractTags,
+  leadingKind,
+  renderTaskLines,
+} from "./markdown-grammar.js";
+import { atomicWrite, readFileSafe, withLock } from "./lock.js";
 
 export interface BeadsStoreOptions {
   /** Explicit .beads workspace directory or .db file; never auto-discovered. */
@@ -34,6 +39,8 @@ export interface BeadsStoreOptions {
   binary?: string;
   /** Only used when initializing a new explicit database. */
   prefix?: string;
+  /** Kill an owned br child after this many milliseconds; default 30 seconds. */
+  timeoutMs?: number;
   /** Local YYYY-MM-DD clock, like MarkdownStore. */
   now?: () => string;
 }
@@ -49,6 +56,10 @@ interface AdapterData {
   meta?: Record<string, unknown>;
   deps?: Dep[];
   hold?: Hold;
+  /** Exact native labels added by this adapter, not every kind:/repo: label. */
+  mirrors?: string[];
+  /** Durable caller identity while external_ref is released for native delete. */
+  pendingDelete?: string;
 }
 type Bead = Record<string, unknown>;
 interface LoadedTask {
@@ -82,8 +93,10 @@ function titleValue(value: string): string {
 }
 function tagValue(value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
-  if (/[()\r\n]/.test(value))
-    invalid("Task kind/repo must be a single line without parentheses");
+  if (/[(),\r\n]/.test(value))
+    invalid(
+      "Task kind/repo must be a single line without parentheses or commas",
+    );
   return value.trim() || undefined;
 }
 function dateValue(value: string): string {
@@ -158,13 +171,16 @@ function checkedDep(id: string, dep: Dep): Dep {
     ...(dep.reason?.trim() ? { reason: dep.reason.trim() } : {}),
   };
 }
+function nativeData(bead: Bead): Bead {
+  const context =
+    typeof bead.agent_context === "string"
+      ? (JSON.parse(bead.agent_context) as unknown)
+      : bead.agent_context;
+  return record(record(context).tasks_axi);
+}
 function adapterData(bead: Bead, id: string): AdapterData {
   try {
-    const context =
-      typeof bead.agent_context === "string"
-        ? (JSON.parse(bead.agent_context) as unknown)
-        : bead.agent_context;
-    const data = record(record(context).tasks_axi);
+    const data = nativeData(bead);
     if (
       data.version !== 1 ||
       typeof data.prioritySet !== "boolean" ||
@@ -172,6 +188,8 @@ function adapterData(bead: Bead, id: string): AdapterData {
       !Number.isFinite(data.order)
     )
       throw new Error("Invalid schema");
+    if (data.pendingDelete !== undefined && data.pendingDelete !== id)
+      throw new Error("Invalid pending deletion identity");
     for (const key of ["kind", "repo"] as const) {
       const value = data[key];
       if (
@@ -204,6 +222,12 @@ function adapterData(bead: Bead, id: string): AdapterData {
         throw new Error("Invalid hold");
       holdValue(hold as unknown as Hold);
     }
+    if (
+      data.mirrors !== undefined &&
+      (!Array.isArray(data.mirrors) ||
+        !data.mirrors.every((label) => typeof label === "string"))
+    )
+      throw new Error("Invalid mirrors");
     if (data.deps !== undefined) {
       if (!Array.isArray(data.deps)) throw new Error("Invalid deps");
       for (const dep of data.deps) {
@@ -234,24 +258,28 @@ function mirrorLabels(task: Pick<Task, "kind" | "repo" | "hold">): string[] {
     .filter((label): label is string => label !== undefined)
     .map((label) => Array.from(label).slice(0, 50).join(""));
 }
-function mirrorArgs(bead: Bead, task: Task): string[] {
+function mirrorArgs(
+  bead: Bead,
+  owned: string[],
+  task: Task,
+): { args: string[]; owned: string[] } {
   const before = Array.isArray(bead.labels)
     ? bead.labels.filter((label): label is string => typeof label === "string")
     : [];
   const after = mirrorLabels(task);
   const args: string[] = [];
-  for (const label of before) {
-    if (
-      (label.startsWith("kind:") ||
-        label.startsWith("repo:") ||
-        label === "hold:captain") &&
-      !after.includes(label)
-    )
+  for (const label of owned) {
+    if (before.includes(label) && !after.includes(label))
       args.push("--remove-label", label);
   }
   for (const label of after)
     if (!before.includes(label)) args.push("--add-label", label);
-  return args;
+  return {
+    args,
+    owned: after.filter(
+      (label) => owned.includes(label) || !before.includes(label),
+    ),
+  };
 }
 function stateOf(value: unknown): State {
   return value === "in_progress"
@@ -285,6 +313,7 @@ function runBr(
   binary: string,
   args: string[],
   cwd: string,
+  timeoutMs: number,
   input?: string,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -293,11 +322,32 @@ function runBr(
     const stderr: Buffer[] = [];
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
     child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
-    child.on("error", reject);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.stdout.destroy();
+      child.stderr.destroy();
+      child.stdin.destroy();
+      child.kill("SIGKILL"); // Only the ChildProcess we spawned, never a process-group/PID search.
+    }, timeoutMs);
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
     child.stdin.on("error", (error: NodeJS.ErrnoException) => {
       if (error.code !== "EPIPE") reject(error);
     });
     child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      if (timedOut) {
+        reject(
+          new BrFailure(
+            "TIMEOUT",
+            `br timed out after ${timeoutMs}ms; reread before retrying`,
+          ),
+        );
+        return;
+      }
       const out = Buffer.concat(stdout).toString("utf8");
       if (code === 0) resolve(out);
       else
@@ -316,9 +366,11 @@ function runBr(
 export class BeadsStore implements Store {
   private readonly path: string;
   private readonly binary: string;
+  private readonly noteArchivePath: string;
   private readonly cwd: string;
   private readonly prefix: string;
   private readonly now: () => string;
+  private readonly timeoutMs: number;
   /** Error translation only, never a task/read cache. */
   private readonly ids = new Map<string, string>();
 
@@ -336,8 +388,16 @@ export class BeadsStore implements Store {
       basename(dirname(this.path)) === ".beads"
         ? dirname(dirname(this.path))
         : dirname(this.path);
+    this.noteArchivePath = join(dirname(this.path), "note-archive.md");
     this.binary = options.binary ?? "br";
     this.prefix = options.prefix ?? "tasks";
+    this.timeoutMs = options.timeoutMs ?? 30_000;
+    if (
+      !Number.isSafeInteger(this.timeoutMs) ||
+      this.timeoutMs < 1 ||
+      this.timeoutMs > 2147483647
+    )
+      invalid("beads.timeout_ms must be an integer between 1 and 2147483647");
     this.now = options.now ?? today;
   }
 
@@ -365,6 +425,7 @@ export class BeadsStore implements Store {
             this.binary,
             ["--db", this.path, "init", "--prefix", this.prefix, "--json"],
             this.cwd,
+            this.timeoutMs,
           );
         });
       }
@@ -373,6 +434,7 @@ export class BeadsStore implements Store {
         this.binary,
         ["--db", this.path, ...args, "--json"],
         this.cwd,
+        this.timeoutMs,
         input,
       );
       return JSON.parse(out || "null") as unknown;
@@ -405,9 +467,20 @@ export class BeadsStore implements Store {
     for (const value of raw.issues) {
       const bead = record(value);
       const ref = text(bead.external_ref);
-      if (!ref?.startsWith("tasks-axi:") || bead.status === "tombstone")
-        continue;
-      const id = validateId(ref.slice("tasks-axi:".length));
+      if (bead.status === "tombstone") continue;
+      let callerId = ref?.startsWith("tasks-axi:")
+        ? ref.slice("tasks-axi:".length)
+        : undefined;
+      if (callerId === undefined && ref === undefined) {
+        // A failed/interrupted delete must remain addressable, not look absent.
+        try {
+          callerId = text(nativeData(bead).pendingDelete);
+        } catch {
+          continue;
+        }
+      }
+      if (callerId === undefined) continue;
+      const id = validateId(callerId);
       if (typeof bead.id !== "string") invalid(`Invalid native id for "${id}"`);
       this.ids.set(bead.id, id);
       const data = adapterData(bead, id);
@@ -428,7 +501,11 @@ export class BeadsStore implements Store {
       if (text(bead.description)) task.body = text(bead.description);
       // Match markdown's read projection: Done renders only its closed stamp.
       if (data.created && task.state !== "done") task.created = data.created;
-      if (data.prioritySet && typeof bead.priority === "number")
+      // Hide only br's implicit default, never a non-default native priority.
+      if (
+        (data.prioritySet || bead.priority !== 2) &&
+        typeof bead.priority === "number"
+      )
         task.priority = bead.priority;
       if (task.state === "done" && data.closed) task.closed = data.closed;
       result.push({ bead, data, task });
@@ -440,13 +517,29 @@ export class BeadsStore implements Store {
       );
     }
     if (result.length) {
-      // list omits edge data. Exactly one batched show hydrates the entire graph.
-      const shown = await this.call([
-        "show",
-        ...result.map((item) => String(item.bead.id)),
-      ]);
-      if (!Array.isArray(shown))
-        throw new AxiError("br show returned invalid issues", "UNKNOWN");
+      // Bound both ID count and UTF-8 bytes, well below platform argv limits.
+      const batches: string[][] = [];
+      let batch: string[] = [];
+      let bytes = 0;
+      for (const item of result) {
+        const id = String(item.bead.id);
+        const size = Buffer.byteLength(id) + 1;
+        if (batch.length && (batch.length >= 64 || bytes + size > 8192)) {
+          batches.push(batch);
+          batch = [];
+          bytes = 0;
+        }
+        batch.push(id);
+        bytes += size;
+      }
+      if (batch.length) batches.push(batch);
+      const shown: unknown[] = [];
+      for (const ids of batches) {
+        const details = await this.call(["show", ...ids]);
+        if (!Array.isArray(details))
+          throw new AxiError("br show returned invalid issues", "UNKNOWN");
+        shown.push(...details);
+      }
       const shownIds = new Set(shown.map((item) => record(item).id));
       if (result.some((item) => !shownIds.has(item.bead.id)))
         throw new AxiError(
@@ -458,6 +551,11 @@ export class BeadsStore implements Store {
         const detail = record(value);
         const loaded = byNative.get(detail.id);
         if (!loaded) continue;
+        if (loaded.bead.updated_at !== detail.updated_at)
+          throw new AxiError(
+            "Beads task changed while reading; retry",
+            "CONFLICT",
+          );
         const deps: Dep[] = [];
         for (const value of Array.isArray(detail.dependencies)
           ? detail.dependencies
@@ -468,11 +566,9 @@ export class BeadsStore implements Store {
           );
           if (!type) continue;
           const target = byNative.get(edge.id);
-          if (!target)
-            throw new AxiError(
-              `Task "${loaded.task.id}" has a dependency outside tasks-axi`,
-              "VALIDATION_ERROR",
-            );
+          // The Store graph contains caller-owned tasks only. Native-only
+          // relationships are left untouched, but cannot expose native ids here.
+          if (!target) continue;
           const saved = loaded.data.deps?.find(
             (dep) => dep.type === type && dep.id === target.task.id,
           );
@@ -552,7 +648,7 @@ export class BeadsStore implements Store {
         .map((item) => item.data.order);
       const data: AdapterData = {
         version: 1,
-        kind: input.kind ?? leadingKind(input.title),
+        kind: input.kind,
         repo: input.repo,
         created:
           input.created !== undefined
@@ -570,7 +666,9 @@ export class BeadsStore implements Store {
             ? Math.min(0, ...positions) - 1
             : Math.max(0, ...positions) + 1,
       };
-      const mirrors = mirrorLabels({ ...input, kind: data.kind });
+      const kind = input.kind ?? leadingKind(input.title);
+      const mirrors = mirrorLabels({ ...input, kind });
+      data.mirrors = mirrors;
       await this.call(
         [
           "create",
@@ -586,7 +684,11 @@ export class BeadsStore implements Store {
           "--type",
           "task",
           "--status",
-          state === "in_flight" ? "in_progress" : "open",
+          state === "done"
+            ? "closed"
+            : state === "in_flight"
+              ? "in_progress"
+              : "open",
           "--description-file",
           "-",
           "--priority",
@@ -596,12 +698,6 @@ export class BeadsStore implements Store {
         ],
         input.body ?? "",
       );
-      const nativeId = this.required(await this.load(), id).bead.id;
-      if (state === "done") {
-        if (typeof nativeId !== "string")
-          throw new AxiError(`br create did not persist "${id}"`, "UNKNOWN");
-        await this.call(["close", nativeId, "--force"]);
-      }
       const task: Task = {
         id,
         title: input.title,
@@ -609,7 +705,7 @@ export class BeadsStore implements Store {
         links: deriveLinks(input.title),
         deps,
       };
-      if (input.kind) task.kind = input.kind;
+      if (kind) task.kind = kind;
       if (input.repo) task.repo = input.repo;
       if (input.body) task.body = input.body;
       if (input.hold) task.hold = input.hold;
@@ -705,13 +801,15 @@ export class BeadsStore implements Store {
         task.repo = patch.repo.trim() || undefined;
         mark("repo");
       }
+      const explicitKind =
+        patch.kind !== undefined ? patch.kind || undefined : found.data.kind;
       if (
         patch.kind !== undefined &&
-        task.kind !== (patch.kind.trim() || undefined)
-      ) {
-        task.kind = patch.kind.trim() || undefined;
+        (found.data.kind !== explicitKind ||
+          task.kind !== (explicitKind ?? leadingKind(task.title)))
+      )
         mark("kind");
-      }
+      task.kind = explicitKind ?? leadingKind(task.title);
       if (
         patch.hold !== undefined &&
         JSON.stringify(task.hold) !== JSON.stringify(patch.hold ?? undefined)
@@ -738,13 +836,19 @@ export class BeadsStore implements Store {
         }
       }
       if (!changed.length) return { task: found.task, changed };
+      const mirrors = mirrorArgs(
+        found.bead,
+        found.data.mirrors ?? mirrorLabels(found.task),
+        task,
+      );
       const data: AdapterData = {
         ...found.data,
-        kind: task.kind,
+        mirrors: mirrors.owned,
+        kind: explicitKind,
         repo: task.repo,
         meta: task.meta,
         hold: task.hold,
-        prioritySet: task.priority !== undefined,
+        prioritySet: found.data.prioritySet || patch.priority !== undefined,
       };
       const args = [
         "update",
@@ -760,7 +864,7 @@ export class BeadsStore implements Store {
         args.push("--priority", String(task.priority));
       if (changed.includes("hold"))
         args.push("--defer", task.hold?.until ?? "");
-      args.push(...mirrorArgs(found.bead, task));
+      args.push(...mirrors.args);
       // Archive before replacement: a failed replacement cannot lose the prior notes.
       if (
         patch.archiveBody &&
@@ -768,10 +872,27 @@ export class BeadsStore implements Store {
         oldBody !== (patch.body || undefined) &&
         oldBody !== undefined
       ) {
-        await this.call(
-          ["comments", "add", String(found.bead.id), "-f", "-"],
-          oldBody,
-        );
+        const comments = await this.call([
+          "comments",
+          "list",
+          String(found.bead.id),
+        ]);
+        if (!Array.isArray(comments))
+          throw new AxiError("br comments returned invalid records", "UNKNOWN");
+        if (!comments.some((comment) => record(comment).text === oldBody))
+          await this.call(
+            ["comments", "add", String(found.bead.id), "-f", "-"],
+            oldBody,
+          );
+        await withLock(this.noteArchivePath, () => {
+          const existing = readFileSafe(this.noteArchivePath) ?? "";
+          const lines = renderTaskLines(found.task).join("\n");
+          if (!existing.includes(`\n${lines}\n`))
+            atomicWrite(
+              this.noteArchivePath,
+              `${existing}\n## Archived ${this.now()}\n${lines}\n`,
+            );
+        });
         mark("archive");
       }
       await this.call(
@@ -800,13 +921,16 @@ export class BeadsStore implements Store {
           `Task "${id}" is still blocking active tasks: ${dependents.map((item) => item.task.id).join(", ")}`,
           "VALIDATION_ERROR",
         );
-      // Tombstones retain unique external_ref values unless explicitly released.
+      // Release uniqueness and record recovery identity in the SAME native write.
+      // Even if deletion and compensation both fail, load() can find this task.
       await this.call([
         "update",
         String(found.bead.id),
         "--force",
         "--external-ref",
         "",
+        "--agent-context",
+        this.context(found.bead, { ...found.data, pendingDelete: id }),
       ]);
       try {
         await this.call(["delete", String(found.bead.id), "--force"]);
@@ -817,6 +941,8 @@ export class BeadsStore implements Store {
           "--force",
           "--external-ref",
           `tasks-axi:${id}`,
+          "--agent-context",
+          this.context(found.bead, { ...found.data, pendingDelete: undefined }),
         ]);
         throw error;
       }
@@ -844,10 +970,11 @@ export class BeadsStore implements Store {
       const data: AdapterData = {
         ...found.data,
         created:
-          to === "in_flight"
-            ? (found.task.created ?? date)
-            : (found.task.created ?? null),
-        closed: to === "done" ? date : undefined,
+          found.data.created ??
+          (to === "in_flight" || (found.task.state === "done" && to !== "done")
+            ? date
+            : null),
+        closed: to === "done" ? (found.data.closed ?? date) : undefined,
         order:
           to === "queued"
             ? Math.max(0, ...positions) + 1
@@ -864,11 +991,13 @@ export class BeadsStore implements Store {
       ];
       if (to !== "done")
         args.push("--status", to === "in_flight" ? "in_progress" : "open");
-      const body = opts.note
-        ? found.task.body
-          ? `${found.task.body}\n${opts.note}`
-          : opts.note
-        : undefined;
+      const body =
+        opts.note &&
+        !`\n${found.task.body ?? ""}\n`.includes(`\n${opts.note}\n`)
+          ? found.task.body
+            ? `${found.task.body}\n${opts.note}`
+            : opts.note
+          : undefined;
       if (body !== undefined) args.push("--description-file", "-");
       await this.call(args, body);
       if (to === "done")
@@ -901,14 +1030,9 @@ export class BeadsStore implements Store {
       const target = this.dependency(all, checked.id);
       if (found.task.deps.some((edge) => edge.id === checked.id))
         invalid("Beads supports only one dependency per task pair");
-      await this.call([
-        "dep",
-        "add",
-        String(found.bead.id),
-        String(target.bead.id),
-        "--type",
-        DEP_TYPES[checked.type],
-      ]);
+      // Persist the reason before adding the edge. A retry can finish an
+      // absent native edge; it must never mistake an edge with a lost reason
+      // for a complete operation. Unattached metadata is invisible to reads.
       const data = { ...found.data, deps: [...found.task.deps, checked] };
       await this.call([
         "update",
@@ -916,6 +1040,14 @@ export class BeadsStore implements Store {
         "--force",
         "--agent-context",
         this.context(found.bead, data),
+      ]);
+      await this.call([
+        "dep",
+        "add",
+        String(found.bead.id),
+        String(target.bead.id),
+        "--type",
+        DEP_TYPES[checked.type],
       ]);
       await this.verifyTask({ ...found.task, deps: data.deps });
       return true;
