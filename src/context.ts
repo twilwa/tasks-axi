@@ -35,19 +35,19 @@ export function createStore(config: ResolvedConfig): Store {
   }
 
   return config.backend === "beads"
-      ? new BeadsStore({
-          path: config.path,
-          binary: config.beadsBinary,
-          prefix: config.beadsPrefix,
-          timeoutMs: config.beadsTimeoutMs,
-          mirrorPath: config.beadsMirrorPath,
-          mirrorArchivePath: config.beadsMirrorArchivePath,
-          doneKeep: config.doneKeep,
-        })
-      : new MarkdownStore({
-          path: config.path,
-          ...(config.archivePath ? { archivePath: config.archivePath } : {}),
-        });
+    ? new BeadsStore({
+        path: config.path,
+        binary: config.beadsBinary,
+        prefix: config.beadsPrefix,
+        timeoutMs: config.beadsTimeoutMs,
+        mirrorPath: config.beadsMirrorPath,
+        mirrorArchivePath: config.beadsMirrorArchivePath,
+        doneKeep: config.doneKeep,
+      })
+    : new MarkdownStore({
+        path: config.path,
+        ...(config.archivePath ? { archivePath: config.archivePath } : {}),
+      });
 }
 
 export function resolveTasksContext(

@@ -27,7 +27,7 @@ export interface Capabilities {
   customStates: boolean;
   /** Does the server assign its own ids (remote trackers)? */
   serverMintsIds: boolean;
-  /** Can it move a connected set of tasks into another collection atomically? */
+  /** Can it move a connected set while preserving dependencies and safe recovery? */
   collectionTransfer: boolean;
   /** Supports the durable, receipt-gated public-followup state machine. */
   publicFollowups: boolean;
@@ -84,11 +84,14 @@ export interface Store {
   ): Promise<Task>;
 
   /**
-   * Move a connected set of tasks into `destination` in one transaction, gated
-   * on the `collectionTransfer` capability: either every task lands in the
-   * destination and leaves this store, or none do. Backends that cannot honour
-   * that all-or-nothing guarantee omit it, and the command layer falls back to
-   * a single-task copy-then-remove rather than risking a half-applied move.
+   * Move a connected set into `destination`, gated on `collectionTransfer`.
+   * The adapter owns collision, dependency and obligation validation. Markdown
+   * retains its two-file transaction; transfers involving beads copy the whole
+   * destination graph first, then remove the source with best-effort rollback.
+   * Those transfers can leave crash duplicates, never missing tasks, and retry
+   * the same intent by recognizing identical destination copies. Adapters that
+   * cannot preserve this contract omit it; the CLI offers only a single-id
+   * copy-then-remove fallback.
    */
   transferMany?(ids: string[], destination: Store): Promise<Task[]>;
 

@@ -45,7 +45,13 @@ import type {
   PruneResult,
   Store,
 } from "../store.js";
-import { atomicWrite, readFileSafe, withLock, withLocks } from "./lock.js";
+import { atomicWrite, readFileSafe, withLocks } from "./lock.js";
+import {
+  assertTransferRemoval,
+  registerTransferStore,
+  transferCollection,
+  withCollectionLock as withLock,
+} from "./collection-transfer.js";
 import {
   type BacklogDoc,
   type Entry,
@@ -338,6 +344,7 @@ export class MarkdownStore implements Store {
       );
     }
     this.now = options.now ?? today;
+    registerTransferStore(this, this.path);
   }
 
   capabilities(): Capabilities {
@@ -779,6 +786,7 @@ export class MarkdownStore implements Store {
       const found = this.findEntry(doc, id);
       if (!found) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
       const task = found.entry.task;
+      assertTransferRemoval(this, task);
       if (
         isPublicFollowupTask(task) &&
         task.public_followup &&
@@ -802,20 +810,11 @@ export class MarkdownStore implements Store {
     return moved;
   }
 
-  /**
-   * `Store.transferMany`. A markdown backlog can only be moved into another
-   * markdown backlog, because the all-or-nothing guarantee comes from locking
-   * both files at once; any other destination is refused before a write rather
-   * than degraded into a copy-then-remove that could strand a dependency edge.
-   */
+  /** Keep the upstream two-file markdown path; br uses recoverable copy-first transfer. */
   async transferMany(ids: string[], destination: Store): Promise<Task[]> {
-    if (!(destination instanceof MarkdownStore)) {
-      throw new AxiError(
-        `The markdown backend can only transfer tasks into another markdown backlog, not "${destination.capabilities().backend}"`,
-        "UNSUPPORTED",
-      );
-    }
-    return this.moveManyTo(ids, destination);
+    return destination instanceof MarkdownStore
+      ? this.moveManyTo(ids, destination)
+      : transferCollection(this, ids, destination);
   }
 
   /**

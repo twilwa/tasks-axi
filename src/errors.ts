@@ -72,16 +72,21 @@ export function partialMoveError(
   originalError: unknown,
   rollbackError: unknown,
   destination?: string,
+  recoverable = false,
 ): AxiError {
   return new AxiError(
-    `Move of "${id}" partially completed; task now exists in both backlogs`,
+    recoverable
+      ? `Move of "${id}" partially completed; copies retained for recovery`
+      : `Move of "${id}" partially completed; task now exists in both backlogs`,
     "CONFLICT",
     [
-      destination
-        ? `Remove "${id}" from ${destination} manually before retrying`
-        : "Remove the duplicate from the destination backlog manually before retrying",
-      `Source removal failed: ${describeError(originalError)}`,
-      `Destination rollback failed: ${describeError(rollbackError)}`,
+      recoverable
+        ? "Rerun the same mv to finish; do not delete destination copies that may be the only surviving tasks"
+        : destination
+          ? `Remove "${id}" from ${destination} manually before retrying`
+          : "Remove the duplicate from the destination backlog manually before retrying",
+      `${recoverable ? "Transfer" : "Source removal"} failed: ${describeError(originalError)}`,
+      `${recoverable ? "Recovery" : "Destination rollback"} failed: ${describeError(rollbackError)}`,
     ],
   );
 }

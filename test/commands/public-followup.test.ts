@@ -1,5 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { hasBr, makeBeadsWorkspace } from "../beads-helpers.js";
+import { BeadsStore } from "../../src/backends/beads.js";
 import { describe, expect, it } from "vitest";
 import {
   parseBacklog,
@@ -24,6 +26,48 @@ import {
   withoutCollectionTransfer,
   type TempBacklog,
 } from "../helpers.js";
+
+describe.skipIf(!hasBr)("public obligation beads transfer refusal", () => {
+  for (const terminal of [false, true]) {
+    it(`refuses the whole transfer set, including a ${terminal ? "terminal" : "active"} obligation`, async () => {
+      const b = makeBacklog(EMPTY);
+      const workspace = makeBeadsWorkspace();
+      try {
+        await add(b);
+        if (terminal)
+          await run(b, "waive", [
+            "public-final-ab",
+            "--approved-by",
+            "captain",
+            "--reason",
+            "Cancelled",
+            "--json",
+          ]);
+        const before = b.read();
+        await expect(
+          mvCommand(
+            [
+              "ordinary-q1",
+              "public-final-ab",
+              "--to",
+              workspace.path,
+              "--to-backend",
+              "beads",
+            ],
+            b.ctx,
+          ),
+        ).rejects.toMatchObject({ code: "UNSUPPORTED" });
+        expect(b.read()).toBe(before);
+        expect(
+          (await new BeadsStore({ path: workspace.path }).list({})).total,
+        ).toBe(0);
+      } finally {
+        b.cleanup();
+        workspace.cleanup();
+      }
+    }, 30_000);
+  }
+});
 
 const EMPTY =
   "# Backlog\n\n## In flight\n\n## Queued\n- [ ] ordinary-q1 - ordinary work\n\n## Done\n";

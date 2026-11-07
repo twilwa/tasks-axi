@@ -105,18 +105,24 @@ Public-followup obligations are never dispatchable and appear only in the separa
 ready_public_followups group; use tasks-axi public-followup ready for their full payloads.
 Held work is excluded by default; --include-held shows it in a separate held group.`;
 
-export const MV_HELP = `usage: tasks-axi mv <id> [<id>...] --to <path-or-dir>
-Move one or more tasks to another backlog file in a single atomic transaction.
+export const MV_HELP = `usage: tasks-axi mv <id> [<id>...] --to <path-or-dir> [--to-backend markdown|beads]
+Move a connected set to another collection. Markdown-to-markdown keeps its two-file
+transaction. Beads transfers copy the whole graph first, then remove the source;
+rerun the same command after an interruption to finish identical destination copies.
 Pass a whole connected set (a blocker and its dependents) to move it together;
 their blocked-by links and reason strings are preserved byte-exact.
 Duplicate ids are ignored after their first occurrence.
 Refuses if a moved item's dependency or active dependent would be stranded in the other
-file - include the whole set, or move the missing endpoint there first.
+collection - include the whole set, or move the missing endpoint there first.
+Differing destination content is a collision. Beads transfers refuse public obligations
+and fields the destination cannot preserve.
 flags:
+  --to-backend markdown|beads   destination backend (default: source backend)
   --json   print the result as a JSON object
 examples:
   tasks-axi mv hibit-cert-cleanup --to ../homemux/data/backlog.md
-  tasks-axi mv blocker-b1 dependent-d2 --to ../homemux/data/backlog.md`;
+  tasks-axi mv blocker-b1 dependent-d2 --to ../homemux/.beads --to-backend beads
+  tasks-axi mv blocker-b1 dependent-d2 --backend beads --file .beads --to backlog.md --to-backend markdown`;
 
 export async function startCommand(
   rawArgs: string[],
@@ -769,6 +775,11 @@ export async function mvCommand(
 
   const json = takeBoolFlag(args, "--json");
   const to = requireNonEmptySingleLineFlagValue("--to", takeFlag(args, "--to"));
+  const toBackend =
+    requireNonEmptySingleLineFlagValue(
+      "--to-backend",
+      takeFlag(args, "--to-backend"),
+    ) ?? config.backend;
   if (to === undefined) {
     throw new AxiError("--to <path-or-dir> is required", "VALIDATION_ERROR", [
       "Name the destination backlog, e.g. `--to ../other/data/backlog.md`",
@@ -783,7 +794,8 @@ export async function mvCommand(
   }
   const ids = [...new Set(positionals.map((p) => requireId(p, "id")))];
 
-  const targetPath = resolveBacklogTarget(to);
+  const targetPath =
+    toBackend === "markdown" ? resolveBacklogTarget(to) : resolve(to);
   if (resolve(targetPath) === resolve(config.path)) {
     throw new AxiError(
       "--to resolves to the current backlog",
@@ -791,28 +803,19 @@ export async function mvCommand(
     );
   }
 
-  const tasks: Task[] = [];
-  for (const id of ids) {
-    const task = await store.get(id);
-    if (!task) throw notFound(id, { globals: context?.suggestionGlobals });
-    tasks.push(task);
-  }
-
-  const target = createStore({
-    backend: config.backend,
-    path: targetPath,
-    doneKeep: config.doneKeep,
-  });
-  for (const id of ids) {
-    if (await target.get(id)) {
-      throw new AxiError(
-        `Task "${id}" already exists in the destination backlog`,
-        "CONFLICT",
-      );
-    }
-  }
-
   const capabilities = store.capabilities();
+  // Preserve early id validation and suggestions, but let transferMany recognize
+  // a retry whose source ids have already reached the destination.
+  for (const id of ids) {
+    if (!(await store.get(id)) && !capabilities.collectionTransfer)
+      throw notFound(id, { globals: context?.suggestionGlobals });
+  }
+  const target = createStore({
+    ...config,
+    backend: toBackend,
+    path: targetPath,
+    archivePath: undefined,
+  });
   if (capabilities.collectionTransfer) {
     if (!store.transferMany) {
       throw new AxiError(
@@ -827,9 +830,16 @@ export async function mvCommand(
     // safe to relocate, but only after the same split-dependency check the
     // atomic path performs internally — otherwise the weaker path would quietly
     // accept moves the stronger one refuses.
-    await requireNoSplitDeps(store, target, ids, tasks);
-    requireNoPublicObligation(tasks[0], capabilities.backend);
-    await target.create(taskToInput(tasks[0]));
+    const task = await store.get(ids[0]);
+    if (!task) throw notFound(ids[0], { globals: context?.suggestionGlobals });
+    if (await target.get(ids[0]))
+      throw new AxiError(
+        `Task "${ids[0]}" already exists in the destination backlog`,
+        "CONFLICT",
+      );
+    await requireNoSplitDeps(store, target, ids, [task]);
+    requireNoPublicObligation(task, capabilities.backend);
+    await target.create(taskToInput(task));
     try {
       await store.remove(ids[0]);
     } catch (error) {
