@@ -199,7 +199,8 @@ Targeted task mutations re-render only the affected task; every other line, incl
 An item's body includes every following indented or blank line, so multi-paragraph notes and indented Markdown content move intact with the task.
 Trailing separator blanks remain with the item's raw source for byte-exact preservation without becoming part of its structured body.
 Maintenance commands are explicit exceptions: `render` normalizes every recognized task, `prune` trims the chosen section into the archive, and `mv` writes both source and destination backlogs.
-`mv <id> [<id>...] --to <path-or-dir>` moves one or more tasks as one atomic cross-file transaction.
+Between markdown backlogs, `mv <id> [<id>...] --to <path-or-dir>` moves one or more tasks as one atomic cross-file transaction.
+For moves involving beads, see [moving tasks between collections](#moving-tasks-between-collections) for destination selection and crash recovery.
 To move a dependency-connected set, include every linked blocker and active dependent in the same command, unless the other endpoint already exists in the destination backlog.
 The command refuses a move that would strand a dependency across the two files, while preserving intra-set `blocked-by` links and their reason strings.
 Moved tasks are re-rendered canonically, so their multi-paragraph bodies remain intact but a trailing blank separator before the next item or section is dropped.
@@ -308,8 +309,8 @@ A crash can still leave metadata before its native change, or archived notes bef
 Removing an edge can leave unused reason metadata, which reads ignore. Cross-command changes are not rolled back.
 After a timeout or conflict, reread and retry the same intent.
 
-Closed tasks stay in the database. This backend does not prune or support public-followup obligations. Moves into beads stores are not included.
-Live tests cover Store conformance, migration, mirror retention, interruption recovery, and byte-identical TOON for shared markdown/br behavior. They use temporary workspaces and explicit databases, and skip when `br` is unavailable.
+Closed tasks stay in the database. This backend does not prune or support public-followup obligations.
+Live tests cover Store conformance, migration, collection transfers, mirror retention, interruption recovery, and byte-identical TOON for shared markdown/br behavior. They use temporary workspaces and explicit databases, and skip when `br` is unavailable.
 
 #### Migrate markdown to beads
 
@@ -362,6 +363,7 @@ mirror_archive = "mirror/done-archive.md" # optional; defaults beside mirror
 ```
 
 After each successful tasks-axi beads mutation, including idempotent writes, the adapter rewrites these canonical markdown projections while holding the database's Store lock.
+Mirrors belong to the configured beads database, whether it is a move's source or destination; a different `--file` or `mv --to` database does not inherit them.
 Reads do not write mirrors. `tasks-axi render --backend beads` rebuilds them without changing native tasks; without `beads.mirror`, render is unsupported.
 Treat both generated files as read-only. Edits are overwritten, not imported. Do not point a markdown writer at them.
 Migration refuses output paths that overlap its sources, including symlink aliases. Mirror outputs also cannot overlap each other, the database, its sidecars or locks, or the note archive.
@@ -371,8 +373,35 @@ Older Done tasks go into the archive projection, with their bodies and metadata 
 No mirror operation prunes the database. The archive is a complete projection of the older Done rows, not an append-only log.
 
 Each file is replaced atomically, archive first. The two files are not an atomic pair, so a crash or failed replacement can leave different generations until repair.
-A mirror error makes the command fail and explicitly reports that the beads write succeeded. It does not roll back that write or delete older database history.
+A mirror error makes the command fail and explicitly reports that the beads write succeeded. Single-store commands do not roll back that write or delete older database history; `mv` follows the compensation contract below.
 Fix the output path and run `tasks-axi render --backend beads`, or retry the same idempotent write. Native br writers do not refresh mirrors and remain unsupported.
+
+### Moving tasks between collections
+
+`mv` supports markdown to beads, beads to markdown, and beads to beads through `Store.transferMany`.
+`--backend` and `--file` select the source. `--to` names the destination path; `--to-backend markdown|beads` selects its backend and defaults to the source backend.
+A beads destination directory selects `<directory>/beads.db`, just like the source configuration.
+Destination beads settings use the usual environment > current project's `.tasks.toml` > user configuration precedence, even when the source is markdown. Project-configured executables remain limited to bare `br` or `bd`; custom paths require environment or user configuration.
+
+```sh
+# Markdown to beads
+tasks-axi mv blocker-b1 dependent-d2 --file backlog.md --backend markdown --to ../other/.beads --to-backend beads --json
+# Beads to markdown
+tasks-axi mv blocker-b1 dependent-d2 --file .beads --backend beads --to ../other/backlog.md --to-backend markdown --json
+# Beads to beads, with the default destination backend
+tasks-axi mv blocker-b1 dependent-d2 --file .beads --backend beads --to ../other/.beads --json
+```
+
+Include every dependency endpoint that is not already in the destination, and every active dependent blocked by a moved task.
+The transfer checks all ids and collisions before writing. Caller ids keep their `external_ref` mapping; state, kind, repo, priority, holds including `until`, dependency reasons, bodies, and exposed created/closed dates survive.
+Beads-to-beads also preserves the Store's `meta` bag. A move to markdown refuses fields its grammar cannot preserve, such as arbitrary `meta`, rather than dropping them.
+Transfers involving beads refuse public-followup obligations, including terminal ones. They also refuse cyclic dependency sets that cannot be created in dependency order.
+
+Beads moves copy the entire destination graph before removing any source task. They hold both advisory locks and attempt rollback on a write failure, restoring missing source tasks before deleting newly staged destination copies.
+Configured mirrors refresh under those locks, including on completed retries, and mirror outputs that overlap the peer's authoritative file are refused before writing.
+This is not a cross-database transaction. A crash or failed rollback can leave transient duplicates, but never removes a task's only copy.
+Rerun the same `mv` with the same ids and destination to finish. An identical destination copy is reused; an id already absent from the source but present in the destination counts as already moved. Different destination content is a `CONFLICT`, with neither copy overwritten.
+If a killed process left lockfiles, remove only those named locks after confirming no tasks-axi process is running, then rerun. Do not delete destination tasks to clear a collision unless you have verified another complete copy exists.
 
 ## Development
 

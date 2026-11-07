@@ -1,5 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { hasBr, makeBeadsWorkspace } from "../beads-helpers.js";
+import { BeadsStore } from "../../src/backends/beads.js";
 import { describe, expect, it } from "vitest";
 import {
   parseBacklog,
@@ -19,7 +21,53 @@ import {
   clonePublicFollowup,
   encodePublicFollowup,
 } from "../../src/public-followup.js";
-import { makeBacklog, type TempBacklog } from "../helpers.js";
+import {
+  makeBacklog,
+  withoutCollectionTransfer,
+  type TempBacklog,
+} from "../helpers.js";
+
+describe.skipIf(!hasBr)("public obligation beads transfer refusal", () => {
+  for (const terminal of [false, true]) {
+    it(`refuses the whole transfer set, including a ${terminal ? "terminal" : "active"} obligation`, async () => {
+      const b = makeBacklog(EMPTY);
+      const workspace = makeBeadsWorkspace();
+      try {
+        await add(b);
+        if (terminal)
+          await run(b, "waive", [
+            "public-final-ab",
+            "--approved-by",
+            "captain",
+            "--reason",
+            "Cancelled",
+            "--json",
+          ]);
+        const before = b.read();
+        await expect(
+          mvCommand(
+            [
+              "ordinary-q1",
+              "public-final-ab",
+              "--to",
+              workspace.path,
+              "--to-backend",
+              "beads",
+            ],
+            b.ctx,
+          ),
+        ).rejects.toMatchObject({ code: "UNSUPPORTED" });
+        expect(b.read()).toBe(before);
+        expect(
+          (await new BeadsStore({ path: workspace.path }).list({})).total,
+        ).toBe(0);
+      } finally {
+        b.cleanup();
+        workspace.cleanup();
+      }
+    }, 30_000);
+  }
+});
 
 const EMPTY =
   "# Backlog\n\n## In flight\n\n## Queued\n- [ ] ordinary-q1 - ordinary work\n\n## Done\n";
@@ -234,6 +282,61 @@ describe("public-followup commands", () => {
     } finally {
       b.cleanup();
       target.cleanup();
+    }
+  });
+
+  it("refuses to move any obligation without an atomic transfer", async () => {
+    for (const finish of [
+      undefined,
+      async (b: TempBacklog) => {
+        await run(b, "waive", [
+          "public-final-ab",
+          "--reason",
+          "No safe historical context remains",
+          "--approved-by",
+          "captain",
+          "--json",
+        ]);
+      },
+    ]) {
+      const b = makeBacklog(EMPTY);
+      const target = makeBacklog(
+        "# Backlog\n\n## In flight\n\n## Queued\n\n## Done\n",
+      );
+      try {
+        await add(b);
+        await finish?.(b);
+        const before = b.read();
+        await expect(
+          mvCommand(
+            ["public-final-ab", "--to", target.path],
+            withoutCollectionTransfer(b.ctx),
+          ),
+        ).rejects.toMatchObject({
+          code: "VALIDATION_ERROR",
+          message: expect.stringContaining("carries a public obligation"),
+          // The refusal follows from the backend, so the guidance must not
+          // point at obligation transitions that cannot lift it.
+          suggestions: expect.arrayContaining([
+            expect.stringContaining("collectionTransfer"),
+          ]),
+        });
+        const refusal = await mvCommand(
+          ["public-final-ab", "--to", target.path],
+          withoutCollectionTransfer(b.ctx),
+        ).catch((error: { suggestions?: string[] }) => error);
+        expect(
+          (refusal as { suggestions?: string[] }).suggestions?.join(" "),
+        ).not.toMatch(/record-delivery|waive/);
+        // Refused before any write, whatever the delivery state.
+        expect(readFileSync(target.path, "utf8")).not.toContain(
+          "public-final-ab",
+        );
+        expect(b.read()).toBe(before);
+      } finally {
+        b.cleanup();
+        target.cleanup();
+      }
     }
   });
 

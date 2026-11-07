@@ -27,6 +27,8 @@ export interface Capabilities {
   customStates: boolean;
   /** Does the server assign its own ids (remote trackers)? */
   serverMintsIds: boolean;
+  /** Can it move a connected set while preserving dependencies and safe recovery? */
+  collectionTransfer: boolean;
   /** Supports the durable, receipt-gated public-followup state machine. */
   publicFollowups: boolean;
 }
@@ -50,8 +52,8 @@ export interface PruneResult {
  * backend gets them for free.
  *
  * The core contract is create/get/update/remove/list/transition/addDep/
- * removeDep/updatePublicFollowup. `prune` and `render` are optional and
- * capability-gated.
+ * removeDep/updatePublicFollowup. `transferMany`, `prune` and `render` are
+ * optional and capability-gated.
  */
 export interface Store {
   capabilities(): Capabilities;
@@ -80,6 +82,18 @@ export interface Store {
     id: string,
     mutation: PublicFollowupMutation,
   ): Promise<Task>;
+
+  /**
+   * Move a connected set into `destination`, gated on `collectionTransfer`.
+   * The adapter owns collision, dependency and obligation validation. Markdown
+   * retains its two-file transaction; transfers involving beads copy the whole
+   * destination graph first, then remove the source with best-effort rollback.
+   * Those transfers can leave crash duplicates, never missing tasks, and retry
+   * the same intent by recognizing identical destination copies. Adapters that
+   * cannot preserve this contract omit it; the CLI offers only a single-id
+   * copy-then-remove fallback.
+   */
+  transferMany?(ids: string[], destination: Store): Promise<Task[]>;
 
   // maintenance (optional, capability-gated)
   prune?(options: PruneOptions): Promise<PruneResult>;

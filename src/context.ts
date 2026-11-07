@@ -20,12 +20,12 @@ export interface TasksContext {
   suggestionGlobals?: SuggestionGlobals;
 }
 
-export function resolveTasksContext(
-  overrides: ConfigOverrides = {},
-  suggestionGlobals?: SuggestionGlobals,
-): TasksContext {
-  const config = resolveConfig(overrides);
-
+/**
+ * Build the Store a resolved config selects. Command code calls this instead of
+ * constructing a backend directly, so a command that needs a second store (mv's
+ * destination backlog) stays as backend-agnostic as the rest of the CLI layer.
+ */
+export function createStore(config: ResolvedConfig): Store {
   if (config.backend !== "markdown" && config.backend !== "beads") {
     throw new AxiError(
       `Unsupported backend "${config.backend}" — choose markdown or beads`,
@@ -34,21 +34,28 @@ export function resolveTasksContext(
     );
   }
 
-  const store: Store =
-    config.backend === "beads"
-      ? new BeadsStore({
-          path: config.path,
-          binary: config.beadsBinary,
-          prefix: config.beadsPrefix,
-          timeoutMs: config.beadsTimeoutMs,
-          mirrorPath: config.beadsMirrorPath,
-          mirrorArchivePath: config.beadsMirrorArchivePath,
-          doneKeep: config.doneKeep,
-        })
-      : new MarkdownStore({
-          path: config.path,
-          ...(config.archivePath ? { archivePath: config.archivePath } : {}),
-        });
+  return config.backend === "beads"
+    ? new BeadsStore({
+        path: config.path,
+        binary: config.beadsBinary,
+        prefix: config.beadsPrefix,
+        timeoutMs: config.beadsTimeoutMs,
+        mirrorPath: config.beadsMirrorPath,
+        mirrorArchivePath: config.beadsMirrorArchivePath,
+        doneKeep: config.doneKeep,
+      })
+    : new MarkdownStore({
+        path: config.path,
+        ...(config.archivePath ? { archivePath: config.archivePath } : {}),
+      });
+}
+
+export function resolveTasksContext(
+  overrides: ConfigOverrides = {},
+  suggestionGlobals?: SuggestionGlobals,
+): TasksContext {
+  const config = resolveConfig(overrides);
+  const store = createStore(config);
   return {
     store,
     config,

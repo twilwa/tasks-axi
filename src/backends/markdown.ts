@@ -6,7 +6,12 @@ import {
   unlinkSync,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { AxiError } from "../errors.js";
+import {
+  AxiError,
+  partialMoveError,
+  stillBlockingError,
+  strandedDepError,
+} from "../errors.js";
 import { validateDependencyId, validateId } from "../id.js";
 import type {
   Dep,
@@ -40,7 +45,13 @@ import type {
   PruneResult,
   Store,
 } from "../store.js";
-import { atomicWrite, readFileSafe, withLock, withLocks } from "./lock.js";
+import { atomicWrite, readFileSafe, withLocks } from "./lock.js";
+import {
+  assertTransferRemoval,
+  registerTransferStore,
+  transferCollection,
+  withCollectionLock as withLock,
+} from "./collection-transfer.js";
 import {
   type BacklogDoc,
   type Entry,
@@ -333,6 +344,7 @@ export class MarkdownStore implements Store {
       );
     }
     this.now = options.now ?? today;
+    registerTransferStore(this, this.path);
   }
 
   capabilities(): Capabilities {
@@ -345,6 +357,7 @@ export class MarkdownStore implements Store {
       realtimeSync: false,
       customStates: true,
       serverMintsIds: false,
+      collectionTransfer: true,
       publicFollowups: true,
     };
   }
@@ -507,30 +520,6 @@ export class MarkdownStore implements Store {
     if (!found) return;
     found.section.entries.splice(found.index, 1);
     this.persist(loaded);
-  }
-
-  private partialMoveError(
-    id: string,
-    originalError: unknown,
-    rollbackError: unknown,
-  ): AxiError {
-    const originalMessage =
-      originalError instanceof Error
-        ? originalError.message
-        : String(originalError);
-    const rollbackMessage =
-      rollbackError instanceof Error
-        ? rollbackError.message
-        : String(rollbackError);
-    return new AxiError(
-      `Move of "${id}" partially completed; task now exists in both backlogs`,
-      "CONFLICT",
-      [
-        "Remove the duplicate from the destination backlog manually before retrying",
-        `Source removal failed: ${originalMessage}`,
-        `Destination rollback failed: ${rollbackMessage}`,
-      ],
-    );
   }
 
   private taskFromInput(input: TaskInput): Task {
@@ -797,6 +786,7 @@ export class MarkdownStore implements Store {
       const found = this.findEntry(doc, id);
       if (!found) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
       const task = found.entry.task;
+      assertTransferRemoval(this, task);
       if (
         isPublicFollowupTask(task) &&
         task.public_followup &&
@@ -818,6 +808,13 @@ export class MarkdownStore implements Store {
   async moveTo(id: string, target: MarkdownStore): Promise<Task> {
     const [moved] = await this.moveManyTo([id], target);
     return moved;
+  }
+
+  /** Keep the upstream two-file markdown path; br uses recoverable copy-first transfer. */
+  async transferMany(ids: string[], destination: Store): Promise<Task[]> {
+    return destination instanceof MarkdownStore
+      ? this.moveManyTo(ids, destination)
+      : transferCollection(this, ids, destination);
   }
 
   /**
@@ -885,11 +882,7 @@ export class MarkdownStore implements Store {
         try {
           for (const id of uniqueIds) target.removeCreatedTask(id);
         } catch (rollbackError) {
-          throw this.partialMoveError(
-            uniqueIds.join(", "),
-            error,
-            rollbackError,
-          );
+          throw partialMoveError(uniqueIds.join(", "), error, rollbackError);
         }
         throw error;
       }
@@ -925,15 +918,7 @@ export class MarkdownStore implements Store {
             task.deps.some((dep) => dep.type === "blocked-by" && dep.id === id),
         )
         .map((task) => task.id);
-      if (stranded.length > 0) {
-        throw new AxiError(
-          `Task "${id}" is still blocking active tasks: ${stranded.join(", ")}`,
-          "VALIDATION_ERROR",
-          [
-            `Move them together, or unblock them first, e.g. \`tasks-axi unblock ${stranded[0]} --by ${id}\``,
-          ],
-        );
-      }
+      if (stranded.length > 0) throw stillBlockingError(id, stranded);
     }
 
     // (b) A moved item's blocker must travel with it or already exist in the
@@ -946,14 +931,7 @@ export class MarkdownStore implements Store {
       for (const dep of found.entry.task.deps) {
         if (movedSet.has(dep.id)) continue;
         if (this.findEntry(targetDoc, dep.id)) continue;
-        const label = dep.type === "blocked-by" ? "blocker" : "dependency";
-        throw new AxiError(
-          `Cannot move "${id}": its ${label} "${dep.id}" would be stranded (not in the moved set and absent from the destination)`,
-          "VALIDATION_ERROR",
-          [
-            `Add "${dep.id}" to the same \`mv\`, or move it to the destination first`,
-          ],
-        );
+        throw strandedDepError(id, dep);
       }
     }
   }
