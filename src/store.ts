@@ -55,6 +55,10 @@ export interface PruneResult {
  */
 export interface Store {
   capabilities(): Capabilities;
+  /** True only if the destination has no live records, including unmanaged ones. */
+  isEmpty?(): Promise<boolean>;
+  /** Read-only preflight: reject lossy rows or writes overlapping import sources. */
+  validateImport?(tasks: Task[], readOnlyPaths?: string[]): void;
 
   // CRUD
   create(input: TaskInput): Promise<Task>;

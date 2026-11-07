@@ -172,6 +172,37 @@ describe("beads database addressing", () => {
       ).toThrow(/beads.timeout_ms/);
   });
 
+  it("resolves opt-in mirror paths with project-over-home precedence and shared Done retention", () => {
+    writeFileSync(
+      join(home, ".tasks-axi", "config.toml"),
+      '[beads]\nmirror = "home-mirror/backlog.md"\nmirror_archive = "home-mirror/archive.md"\n',
+    );
+    writeFileSync(
+      join(dir, ".tasks.toml"),
+      'backend = "beads"\n[markdown]\ndone_keep = 0\n[beads]\npath = "selected.db"\nmirror = "project-mirror/backlog.md"\n',
+    );
+    expect(resolveConfig({ cwd: dir, home, env: {} })).toMatchObject({
+      doneKeep: 0,
+      beadsMirrorPath: join(dir, "project-mirror/backlog.md"),
+      beadsMirrorArchivePath: join(dir, "home-mirror/archive.md"),
+    });
+  });
+
+  it.each(["mirror", "mirror_archive"])(
+    "rejects empty or non-string beads.%s",
+    (key) => {
+      for (const value of ['""', '"   "', "42"]) {
+        writeFileSync(
+          join(dir, ".tasks.toml"),
+          `backend = "beads"\n[beads]\npath = "selected.db"\n${key} = ${value}\n`,
+        );
+        expect(() => resolveConfig({ cwd: dir, home, env: {} })).toThrow(
+          new RegExp(`beads.${key}`),
+        );
+      }
+    },
+  );
+
   it("requires an explicit database instead of discovering a parent workspace", () => {
     expect(() =>
       resolveConfig({ cwd: dir, home, env: {}, backend: "beads" }),

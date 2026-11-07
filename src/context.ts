@@ -41,6 +41,9 @@ export function resolveTasksContext(
           binary: config.beadsBinary,
           prefix: config.beadsPrefix,
           timeoutMs: config.beadsTimeoutMs,
+          mirrorPath: config.beadsMirrorPath,
+          mirrorArchivePath: config.beadsMirrorArchivePath,
+          doneKeep: config.doneKeep,
         })
       : new MarkdownStore({
           path: config.path,

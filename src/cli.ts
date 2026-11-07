@@ -43,6 +43,7 @@ import {
   renderCommand,
 } from "./commands/maintain.js";
 import { homeCommand } from "./commands/home.js";
+import { MIGRATE_HELP, migrateCommand } from "./commands/migrate.js";
 import {
   PUBLIC_FOLLOWUP_HELP,
   publicFollowupCommand,
@@ -63,8 +64,8 @@ type MainOptions = {
 };
 
 export const TOP_HELP = `usage: tasks-axi [command] [args] [flags]
-commands[19]:
-  (none)=dashboard, add, list, show, start, done, reopen, update, rm, block, unblock, hold, unhold, ready, public-followup, mv, prune, render, setup
+commands[20]:
+  (none)=dashboard, add, list, show, start, done, reopen, update, rm, block, unblock, hold, unhold, ready, public-followup, mv, prune, render, migrate, setup
 flags[4]:
   --backend <name> (after command), --file <path> (after command), --json (mutations: machine-readable result), --help, -v/-V/--version
 examples:
@@ -106,6 +107,7 @@ const COMMANDS: Record<string, CommandFn> = {
   mv: withContext(mvCommand),
   prune: withContext(pruneCommand),
   render: withContext(renderCommand),
+  migrate: (args) => migrateCommand(args),
   setup: (args) => setupCommand(args),
 };
 
@@ -132,6 +134,7 @@ const COMMAND_HELP: Record<string, string> = {
   mv: MV_HELP,
   prune: PRUNE_HELP,
   render: RENDER_HELP,
+  migrate: MIGRATE_HELP,
   setup: SETUP_HELP,
 };
 

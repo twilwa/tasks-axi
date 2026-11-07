@@ -4,13 +4,14 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { AxiError } from "../errors.js";
 
 /**
@@ -76,13 +77,9 @@ function releaseLock(lockPath: string, token: string): void {
 function lockedError(lockPath: string, staleMs: number): AxiError {
   try {
     if (Date.now() - statSync(lockPath).mtimeMs > staleMs) {
-      return new AxiError(
-        `backlog lock looks stale: ${lockPath}`,
-        "LOCKED",
-        [
-          `If no tasks-axi process is running, remove ${lockPath} and retry`,
-        ],
-      );
+      return new AxiError(`backlog lock looks stale: ${lockPath}`, "LOCKED", [
+        `If no tasks-axi process is running, remove ${lockPath} and retry`,
+      ]);
     }
   } catch (error) {
     if (errno(error) !== "ENOENT") throw error;
@@ -101,6 +98,21 @@ export function readFileSafe(path: string): string | undefined {
   } catch (error) {
     if (errno(error) === "ENOENT") return undefined;
     throw error;
+  }
+}
+
+/** Resolve existing symlink ancestors too, including when the leaf is new. */
+export function canonicalPath(path: string): string {
+  const absolute = resolve(path);
+  try {
+    return realpathSync(absolute);
+  } catch (error) {
+    if (
+      !["ENOENT", "ENOTDIR"].includes(errno(error)) ||
+      dirname(absolute) === absolute
+    )
+      throw error;
+    return join(canonicalPath(dirname(absolute)), basename(absolute));
   }
 }
 
