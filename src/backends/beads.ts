@@ -32,7 +32,12 @@ import {
   parseBacklog,
   renderTaskLines,
 } from "./markdown-grammar.js";
-import { atomicWrite, canonicalPath, readFileSafe } from "./lock.js";
+import {
+  atomicWrite,
+  canonicalPath,
+  type LockOptions,
+  readFileSafe,
+} from "./lock.js";
 import { writeMarkdownMirror } from "./markdown-mirror.js";
 import {
   assertTransferRemoval,
@@ -49,6 +54,8 @@ export interface BeadsStoreOptions {
   prefix?: string;
   /** Kill an owned br child after this many milliseconds; default 30 seconds. */
   timeoutMs?: number;
+  /** Wait this long for the backlog lock; default 120 seconds. */
+  lockTimeoutMs?: number;
   /** Optional one-way canonical markdown projections; never read as input. */
   mirrorPath?: string;
   mirrorArchivePath?: string;
@@ -314,6 +321,8 @@ function mirrorArgs(
     ),
   };
 }
+const DEFAULT_LOCK_TIMEOUT_MS = 120_000;
+
 function stateOf(value: unknown): State {
   return value === "in_progress"
     ? "in_flight"
@@ -404,6 +413,7 @@ export class BeadsStore implements Store {
   private readonly prefix: string;
   private readonly now: () => string;
   private readonly timeoutMs: number;
+  private readonly lockOptions: LockOptions;
   private readonly mirrorPath?: string;
   private readonly mirrorArchivePath?: string;
   private readonly doneKeep: number;
@@ -434,6 +444,18 @@ export class BeadsStore implements Store {
       this.timeoutMs > 2147483647
     )
       invalid("beads.timeout_ms must be an integer between 1 and 2147483647");
+    const lockTimeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
+    if (
+      !Number.isSafeInteger(lockTimeoutMs) ||
+      lockTimeoutMs < 1 ||
+      lockTimeoutMs > 2147483647
+    )
+      invalid(
+        "beads.lock_timeout_ms must be an integer between 1 and 2147483647",
+      );
+    // Writers queue behind each other, so wait long enough for several
+    // complete writes; an abandoned lock is recovered instead of waited out.
+    this.lockOptions = { timeoutMs: lockTimeoutMs, recover: {} };
     this.now = options.now ?? today;
     if (
       options.mirrorArchivePath !== undefined &&
@@ -473,6 +495,7 @@ export class BeadsStore implements Store {
       this,
       this.path,
       this.mirrorPath ? () => this.mutate(async () => undefined) : undefined,
+      this.lockOptions,
     );
   }
 
@@ -483,35 +506,40 @@ export class BeadsStore implements Store {
       `${this.path}-shm`,
       `${this.path}-journal`,
       `${this.path}.lock`,
+      `${this.path}.lock.guard`,
       `${this.path}.init.lock`,
       this.noteArchivePath,
     ].map(canonicalPath);
   }
 
   private async mutate<T>(operation: () => Promise<T>): Promise<T> {
-    return withLock(this.path, async () => {
-      const result = await operation();
-      if (this.mirrorPath && this.mirrorArchivePath) {
-        try {
-          const tasks = (await this.load()).map((item) => item.task);
-          writeMarkdownMirror(
-            tasks,
-            this.mirrorPath,
-            this.mirrorArchivePath,
-            this.doneKeep,
-          );
-        } catch (error) {
-          throw new AxiError(
-            `Beads write succeeded, but markdown mirror refresh failed: ${error instanceof Error ? error.message : String(error)}`,
-            "UNKNOWN",
-            [
-              "The database remains authoritative; fix the mirror path and run tasks-axi render --backend beads",
-            ],
-          );
+    return withLock(
+      this.path,
+      async () => {
+        const result = await operation();
+        if (this.mirrorPath && this.mirrorArchivePath) {
+          try {
+            const tasks = (await this.load()).map((item) => item.task);
+            writeMarkdownMirror(
+              tasks,
+              this.mirrorPath,
+              this.mirrorArchivePath,
+              this.doneKeep,
+            );
+          } catch (error) {
+            throw new AxiError(
+              `Beads write succeeded, but markdown mirror refresh failed: ${error instanceof Error ? error.message : String(error)}`,
+              "UNKNOWN",
+              [
+                "The database remains authoritative; fix the mirror path and run tasks-axi render --backend beads",
+              ],
+            );
+          }
         }
-      }
-      return result;
-    });
+        return result;
+      },
+      this.lockOptions,
+    );
   }
 
   capabilities(): Capabilities {
@@ -536,16 +564,20 @@ export class BeadsStore implements Store {
   private async call(args: string[], input?: string): Promise<unknown> {
     try {
       if (!existsSync(this.path)) {
-        await withLock(`${this.path}.init`, async () => {
-          if (existsSync(this.path)) return;
-          mkdirSync(dirname(this.path), { recursive: true });
-          await runBr(
-            this.binary,
-            ["--db", this.path, "init", "--prefix", this.prefix, "--json"],
-            this.cwd,
-            this.timeoutMs,
-          );
-        });
+        await withLock(
+          `${this.path}.init`,
+          async () => {
+            if (existsSync(this.path)) return;
+            mkdirSync(dirname(this.path), { recursive: true });
+            await runBr(
+              this.binary,
+              ["--db", this.path, "init", "--prefix", this.prefix, "--json"],
+              this.cwd,
+              this.timeoutMs,
+            );
+          },
+          this.lockOptions,
+        );
       }
       // Every subprocess, reads included, is pinned to this exact database.
       const out = await runBr(
@@ -1033,15 +1065,19 @@ export class BeadsStore implements Store {
             ["comments", "add", String(found.bead.id), "-f", "-"],
             oldBody,
           );
-        await withLock(this.noteArchivePath, () => {
-          const existing = readFileSafe(this.noteArchivePath) ?? "";
-          const lines = renderTaskLines(found.task).join("\n");
-          if (!existing.includes(`\n${lines}\n`))
-            atomicWrite(
-              this.noteArchivePath,
-              `${existing}\n## Archived ${this.now()}\n${lines}\n`,
-            );
-        });
+        await withLock(
+          this.noteArchivePath,
+          () => {
+            const existing = readFileSafe(this.noteArchivePath) ?? "";
+            const lines = renderTaskLines(found.task).join("\n");
+            if (!existing.includes(`\n${lines}\n`))
+              atomicWrite(
+                this.noteArchivePath,
+                `${existing}\n## Archived ${this.now()}\n${lines}\n`,
+              );
+          },
+          this.lockOptions,
+        );
         mark("archive");
       }
       await this.call(

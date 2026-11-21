@@ -172,6 +172,31 @@ describe("beads database addressing", () => {
       ).toThrow(/beads.timeout_ms/);
   });
 
+  it("configures a bounded beads lock wait from TOML or environment", () => {
+    writeFileSync(
+      join(dir, ".tasks.toml"),
+      'backend = "beads"\n[beads]\npath = "selected.db"\nlock_timeout_ms = 9000\n',
+    );
+    expect(resolveConfig({ cwd: dir, home, env: {} }).beadsLockTimeoutMs).toBe(
+      9000,
+    );
+    expect(
+      resolveConfig({
+        cwd: dir,
+        home,
+        env: { TASKS_AXI_BEADS_LOCK_TIMEOUT_MS: "4000" },
+      }).beadsLockTimeoutMs,
+    ).toBe(4000);
+    for (const value of ["", "0", "-1", "1.5", "soon", "2147483648"])
+      expect(() =>
+        resolveConfig({
+          cwd: dir,
+          home,
+          env: { TASKS_AXI_BEADS_LOCK_TIMEOUT_MS: value },
+        }),
+      ).toThrow(/beads.lock_timeout_ms/);
+  });
+
   it("resolves opt-in mirror paths with project-over-home precedence and shared Done retention", () => {
     writeFileSync(
       join(home, ".tasks-axi", "config.toml"),

@@ -26,6 +26,8 @@ export interface ResolvedConfig {
   beadsBinary?: string;
   beadsPrefix?: string;
   beadsTimeoutMs?: number;
+  /** How long a beads writer waits for the backlog lock. */
+  beadsLockTimeoutMs?: number;
   beadsMirrorPath?: string;
   beadsMirrorArchivePath?: string;
 }
@@ -45,6 +47,7 @@ interface TomlConfig {
     binary?: string;
     prefix?: string;
     timeout_ms?: number;
+    lock_timeout_ms?: number;
     mirror?: string;
     mirror_archive?: string;
   };
@@ -119,6 +122,14 @@ export function parseConfigToml(src: string): TomlConfig {
           );
         config.beads.timeout_ms = value;
       }
+      if (key === "lock_timeout_ms") {
+        if (typeof value !== "number")
+          throw new AxiError(
+            "beads.lock_timeout_ms must be an integer",
+            "VALIDATION_ERROR",
+          );
+        config.beads.lock_timeout_ms = value;
+      }
       continue;
     }
     config.markdown ??= {};
@@ -165,6 +176,7 @@ function configKeySource(table: ConfigTable, key: string): string | undefined {
       key === "binary" ||
       key === "prefix" ||
       key === "timeout_ms" ||
+      key === "lock_timeout_ms" ||
       key === "mirror" ||
       key === "mirror_archive")
   ) {
@@ -339,6 +351,24 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ResolvedConfig {
           "VALIDATION_ERROR",
         );
       config.beadsTimeoutMs = timeout;
+    }
+    const lockTimeout =
+      env.TASKS_AXI_BEADS_LOCK_TIMEOUT_MS !== undefined
+        ? Number(env.TASKS_AXI_BEADS_LOCK_TIMEOUT_MS)
+        : (projectToml.beads?.lock_timeout_ms ??
+          homeToml.beads?.lock_timeout_ms);
+    if (lockTimeout !== undefined) {
+      if (
+        !Number.isSafeInteger(lockTimeout) ||
+        lockTimeout < 1 ||
+        lockTimeout > 2147483647 ||
+        env.TASKS_AXI_BEADS_LOCK_TIMEOUT_MS === ""
+      )
+        throw new AxiError(
+          "beads.lock_timeout_ms must be an integer between 1 and 2147483647",
+          "VALIDATION_ERROR",
+        );
+      config.beadsLockTimeoutMs = lockTimeout;
     }
     const mirror = validatePathValue(
       projectToml.beads?.mirror ?? homeToml.beads?.mirror,

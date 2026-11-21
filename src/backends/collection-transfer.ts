@@ -10,14 +10,14 @@ import {
 import { validateId } from "../id.js";
 import type { Task, TaskInput } from "../model.js";
 import type { Store } from "../store.js";
-import { withLock, withLocks } from "./lock.js";
+import { type LockOptions, withLock, withLocks } from "./lock.js";
 import { parseBacklog, renderTaskLines } from "./markdown-grammar.js";
 
 // Only the two local adapters opt into this protocol. Their ordinary mutations
 // reuse locks owned by this transfer's async chain, never a process-global flag.
 const collections = new WeakMap<
   Store,
-  { path: string; refresh?: () => Promise<unknown> }
+  { path: string; refresh?: () => Promise<unknown>; lock?: LockOptions }
 >();
 const ownedLocks = new AsyncLocalStorage<ReadonlySet<string>>();
 const removal = new AsyncLocalStorage<{ store: Store; expected: Task }>();
@@ -44,17 +44,19 @@ export function registerTransferStore(
   store: Store,
   path: string,
   refresh?: () => Promise<unknown>,
+  lock?: LockOptions,
 ): void {
-  collections.set(store, { path: resolve(path), refresh });
+  collections.set(store, { path: resolve(path), refresh, lock });
 }
 
 export function withCollectionLock<T>(
   path: string,
   fn: () => T | Promise<T>,
+  options?: LockOptions,
 ): Promise<T> {
   return ownedLocks.getStore()?.has(resolve(path))
     ? Promise.resolve().then(fn)
-    : withLock(path, fn);
+    : withLock(path, fn, options);
 }
 
 function transferInput(task: Task): TaskInput {
@@ -130,125 +132,138 @@ export async function transferCollection(
   // markdown import row validator intentionally refuses.
   source.validateImport?.([], [targetPath]);
   target.validateImport?.([], [sourcePath]);
-  return withLocks([sourcePath, targetPath], () =>
-    ownedLocks.run(new Set([sourcePath, targetPath]), async () => {
-      const remaining = (await source.list({})).items;
-      const destination = (await target.list({})).items;
-      const moved = new Set(uniqueIds);
-      const tasks: Task[] = [];
-      for (const id of uniqueIds) {
-        const original = remaining.find((task) => task.id === id);
-        const existing = destination.find((task) => task.id === id);
-        const task = original ?? existing;
-        if (!task) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
-        if (original && existing && !sameContent(original, existing))
-          throw new AxiError(
-            `Task "${id}" already exists in the destination backlog with different content`,
-            "CONFLICT",
-          );
-        if (task.public_followup || task.kind === "public-followup")
-          throw new AxiError(
-            `Task "${id}" carries a public obligation; beads transfers cannot relocate public obligations`,
-            "UNSUPPORTED",
-          );
-        const stranded = remaining.filter(
-          (item) =>
-            !moved.has(item.id) &&
-            item.state !== "done" &&
-            item.deps.some((dep) => dep.type === "blocked-by" && dep.id === id),
-        );
-        if (stranded.length)
-          throw stillBlockingError(
-            id,
-            stranded.map((task) => task.id),
-          );
-        for (const dep of task.deps) {
-          if (
-            !moved.has(dep.id) &&
-            !destination.some((task) => task.id === dep.id)
-          )
-            throw strandedDepError(id, dep);
-        }
-        if (target.capabilities().backend === "markdown") {
-          const heading = {
-            queued: "Queued",
-            in_flight: "In flight",
-            done: "Done",
-          }[task.state];
-          const doc = parseBacklog(
-            `## ${heading}\n${renderTaskLines(task).join("\n")}\n`,
-          );
-          const entry = doc.sections[0]?.entries.find(
-            (entry) => entry.kind === "task",
-          );
-          if (!entry || entry.kind !== "task" || !sameContent(task, entry.task))
+  const lockOptions = new Map([
+    [sourcePath, sourceCollection.lock],
+    [targetPath, targetCollection.lock],
+  ]);
+  return withLocks(
+    [sourcePath, targetPath],
+    () =>
+      ownedLocks.run(new Set([sourcePath, targetPath]), async () => {
+        const remaining = (await source.list({})).items;
+        const destination = (await target.list({})).items;
+        const moved = new Set(uniqueIds);
+        const tasks: Task[] = [];
+        for (const id of uniqueIds) {
+          const original = remaining.find((task) => task.id === id);
+          const existing = destination.find((task) => task.id === id);
+          const task = original ?? existing;
+          if (!task) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
+          if (original && existing && !sameContent(original, existing))
             throw new AxiError(
-              `Markdown cannot preserve every field of task "${id}"`,
-              "VALIDATION_ERROR",
-            );
-        }
-        tasks.push(task);
-      }
-      const ordered = dependencyOrder(tasks);
-      const copied: Task[] = [];
-      try {
-        // Build the entire destination graph before removing any source task.
-        for (const task of ordered) {
-          if (destination.some((item) => item.id === task.id)) continue;
-          copied.push(task);
-          await target.create(transferInput(task));
-          const persisted = await target.get(task.id);
-          if (!persisted || !sameContent(task, persisted))
-            throw new AxiError(
-              `Destination did not preserve task "${task.id}"`,
+              `Task "${id}" already exists in the destination backlog with different content`,
               "CONFLICT",
             );
-        }
-        // A markdown destination may have been hand-edited while later tasks
-        // were staged. Recheck the complete graph before removing any source.
-        const landed = (await target.list({})).items;
-        for (const task of tasks) {
-          const persisted = landed.find((item) => item.id === task.id);
-          if (!persisted || !sameContent(task, persisted))
+          if (task.public_followup || task.kind === "public-followup")
             throw new AxiError(
-              `Destination task "${task.id}" changed during transfer`,
-              "CONFLICT",
+              `Task "${id}" carries a public obligation; beads transfers cannot relocate public obligations`,
+              "UNSUPPORTED",
             );
-        }
-        for (const task of [...ordered].reverse()) {
-          if (remaining.some((item) => item.id === task.id))
-            await removeTransferredTask(source, task);
-        }
-      } catch (error) {
-        try {
-          // Restore deleted source tasks first; never remove their last copy.
-          for (const task of ordered) {
+          const stranded = remaining.filter(
+            (item) =>
+              !moved.has(item.id) &&
+              item.state !== "done" &&
+              item.deps.some(
+                (dep) => dep.type === "blocked-by" && dep.id === id,
+              ),
+          );
+          if (stranded.length)
+            throw stillBlockingError(
+              id,
+              stranded.map((task) => task.id),
+            );
+          for (const dep of task.deps) {
             if (
-              remaining.some((item) => item.id === task.id) &&
-              !(await source.get(task.id))
+              !moved.has(dep.id) &&
+              !destination.some((task) => task.id === dep.id)
             )
-              await source.create(transferInput(task));
+              throw strandedDepError(id, dep);
           }
-          for (const task of [...copied].reverse()) {
-            if (await target.get(task.id))
-              await removeTransferredTask(target, task);
+          if (target.capabilities().backend === "markdown") {
+            const heading = {
+              queued: "Queued",
+              in_flight: "In flight",
+              done: "Done",
+            }[task.state];
+            const doc = parseBacklog(
+              `## ${heading}\n${renderTaskLines(task).join("\n")}\n`,
+            );
+            const entry = doc.sections[0]?.entries.find(
+              (entry) => entry.kind === "task",
+            );
+            if (
+              !entry ||
+              entry.kind !== "task" ||
+              !sameContent(task, entry.task)
+            )
+              throw new AxiError(
+                `Markdown cannot preserve every field of task "${id}"`,
+                "VALIDATION_ERROR",
+              );
           }
-        } catch (rollbackError) {
-          throw partialMoveError(
-            uniqueIds.join(", "),
-            error,
-            rollbackError,
-            targetPath,
-            true,
-          );
+          tasks.push(task);
         }
-        throw error;
-      }
-      // Even a completed retry is a mutation: repair derived projections under
-      // both locks. A refresh failure must not undo an already completed move.
-      await sourceCollection.refresh?.();
-      await targetCollection.refresh?.();
-      return tasks;
-    }),
+        const ordered = dependencyOrder(tasks);
+        const copied: Task[] = [];
+        try {
+          // Build the entire destination graph before removing any source task.
+          for (const task of ordered) {
+            if (destination.some((item) => item.id === task.id)) continue;
+            copied.push(task);
+            await target.create(transferInput(task));
+            const persisted = await target.get(task.id);
+            if (!persisted || !sameContent(task, persisted))
+              throw new AxiError(
+                `Destination did not preserve task "${task.id}"`,
+                "CONFLICT",
+              );
+          }
+          // A markdown destination may have been hand-edited while later tasks
+          // were staged. Recheck the complete graph before removing any source.
+          const landed = (await target.list({})).items;
+          for (const task of tasks) {
+            const persisted = landed.find((item) => item.id === task.id);
+            if (!persisted || !sameContent(task, persisted))
+              throw new AxiError(
+                `Destination task "${task.id}" changed during transfer`,
+                "CONFLICT",
+              );
+          }
+          for (const task of [...ordered].reverse()) {
+            if (remaining.some((item) => item.id === task.id))
+              await removeTransferredTask(source, task);
+          }
+        } catch (error) {
+          try {
+            // Restore deleted source tasks first; never remove their last copy.
+            for (const task of ordered) {
+              if (
+                remaining.some((item) => item.id === task.id) &&
+                !(await source.get(task.id))
+              )
+                await source.create(transferInput(task));
+            }
+            for (const task of [...copied].reverse()) {
+              if (await target.get(task.id))
+                await removeTransferredTask(target, task);
+            }
+          } catch (rollbackError) {
+            throw partialMoveError(
+              uniqueIds.join(", "),
+              error,
+              rollbackError,
+              targetPath,
+              true,
+            );
+          }
+          throw error;
+        }
+        // Even a completed retry is a mutation: repair derived projections under
+        // both locks. A refresh failure must not undo an already completed move.
+        await sourceCollection.refresh?.();
+        await targetCollection.refresh?.();
+        return tasks;
+      }),
+    (path) => lockOptions.get(resolve(path)),
   );
 }

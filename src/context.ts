@@ -40,6 +40,7 @@ export function createStore(config: ResolvedConfig): Store {
         binary: config.beadsBinary,
         prefix: config.beadsPrefix,
         timeoutMs: config.beadsTimeoutMs,
+        lockTimeoutMs: config.beadsLockTimeoutMs,
         mirrorPath: config.beadsMirrorPath,
         mirrorArchivePath: config.beadsMirrorArchivePath,
         doneKeep: config.doneKeep,
