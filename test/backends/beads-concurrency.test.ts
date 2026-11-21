@@ -57,6 +57,64 @@ describe.skipIf(!hasBr)("beads concurrency and write cost", () => {
     ).resolves.toMatchObject({ id: "after-crash" });
   }, 60_000);
 
+  it("leaves the mirror exactly as a full re-render after every kind of write", async () => {
+    const store = mirrored();
+    const files = () =>
+      ["backlog.md", "done-archive.md"]
+        .map((name) => readFileSync(join(workspace.dir, name), "utf8"))
+        .join("\n----\n");
+    const fresh = async () => {
+      await mirrored().render();
+      return files();
+    };
+    const writes: [string, () => Promise<unknown>][] = [
+      ["create", () => store.create({ id: "a", title: "A", body: "Body" })],
+      [
+        "create linked",
+        () =>
+          store.create({
+            id: "b",
+            title: "B",
+            deps: [{ type: "blocked-by", id: "a" }],
+          }),
+      ],
+      ["start", () => store.transition("b", "in_flight")],
+      [
+        "update",
+        () => store.update("a", { body: "New", priority: 1, repo: "r" }),
+      ],
+      [
+        "hold",
+        () =>
+          store.update("a", { hold: { reason: "waiting", kind: "external" } }),
+      ],
+      [
+        "add dep",
+        () => store.addDep("a", { type: "discovered-from", id: "c" }),
+      ],
+      [
+        "remove dep",
+        () => store.removeDep("b", { type: "blocked-by", id: "a" }),
+      ],
+      [
+        "done",
+        () =>
+          store.transition("a", "done", {
+            pr: "https://github.com/o/r/pull/1",
+          }),
+      ],
+      ["reopen", () => store.transition("a", "queued")],
+      ["remove", () => store.remove("c")],
+      ["idempotent update", () => store.update("b", {})],
+    ];
+    await store.create({ id: "c", title: "C" });
+    for (const [name, write] of writes) {
+      await write();
+      const after = files();
+      expect({ name, mirror: after }).toEqual({ name, mirror: await fresh() });
+    }
+  }, 120_000);
+
   it("keeps the number of br calls per write independent of backlog size", async () => {
     const callsFor = async (rows: number) => {
       workspace.cleanup();
