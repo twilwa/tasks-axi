@@ -340,7 +340,8 @@ describe.skipIf(!hasBr)("markdown/beads collection transfers", () => {
     const markdown = makeBacklog("# Backlog\n");
     const workspace = makeBeadsWorkspace();
     const target = new BeadsStore({ path: workspace.path });
-    const other = new BeadsStore({ path: workspace.path });
+    // A short wait: the held lock must refuse, not queue behind the test.
+    const other = new BeadsStore({ path: workspace.path, lockTimeoutMs: 300 });
     let started!: () => void;
     let finish!: () => void;
     const copying = new Promise<void>((resolve) => {
