@@ -48,6 +48,8 @@ const seedCli = resolve(flag("--seed-cli")[0] ?? cli);
 const reps = Number(flag("--reps")[0] ?? 3);
 const parallel = Number(flag("--parallel")[0] ?? 8);
 const seeded = flag("--workspace")[0];
+// Fresh ids per run, so a copied workspace never turns a write into a no-op.
+const runTag = Date.now().toString(36);
 
 /** One trivial br call against the workspace database: the per-call floor. */
 function brFloorMs(dir: string): number {
@@ -271,7 +273,7 @@ async function writes(
     show: [],
   };
   for (let i = 0; i < reps; i++) {
-    const id = "bench-" + i;
+    const id = "bench-" + runTag + "-" + i;
     timings.add.push(
       check(
         "add",
@@ -293,7 +295,7 @@ async function writes(
   const start = performance.now();
   const runs = await Promise.all(
     Array.from({ length: parallel }, (_, i) =>
-      run(["add", "par-" + i, "parallel row " + i], dir, home),
+      run(["add", "par-" + runTag + "-" + i, "parallel row " + i], dir, home),
     ),
   );
   result.parallel = {
