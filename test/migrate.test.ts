@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { decode } from "@toon-format/toon";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
@@ -408,7 +409,7 @@ describe.skipIf(!hasBr)("markdown to beads migration", () => {
   }, 30_000);
 
   it("resumes a killed migration with --allow-existing, without hand cleanup, reporting time per row", async () => {
-    const root = new URL("..", import.meta.url).pathname;
+    const root = fileURLToPath(new URL("..", import.meta.url));
     const env = Object.fromEntries(
       Object.entries(process.env).filter(
         ([key]) => !key.startsWith("TASKS_AXI_"),
@@ -463,10 +464,12 @@ describe.skipIf(!hasBr)("markdown to beads migration", () => {
     expect(output).toMatchObject({ ok: true, existing: expect.any(Number) });
     expect(output.created).toBe(total - (output.existing as number));
     expect(output.elapsed_ms).toEqual(expect.any(Number));
-    expect(output.ms_per_row).toBeCloseTo(
-      (output.elapsed_ms as number) / total,
-      0,
-    );
+    // Both figures are rounded from the same unrounded elapsed time.
+    expect(
+      Math.abs(
+        (output.ms_per_row as number) - (output.elapsed_ms as number) / total,
+      ),
+    ).toBeLessThanOrEqual(1);
     expect(existsSync(ws.path + ".lock")).toBe(false);
     expect(
       (await resolveTasksContext({ backend: "beads" }).store.list({})).total,

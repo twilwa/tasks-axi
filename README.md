@@ -310,6 +310,7 @@ Writers wait for the database's `<db>.lock` for up to `lock_timeout_ms` (default
 The holder refreshes the lock's modification time every few seconds. A waiter takes over a lock automatically when its owner process on the same host has died, or when nobody has refreshed it for 60 seconds (an owner on another host, or a frozen process), so an interrupted write never needs hand cleanup.
 Takeover and release run inside a short exclusive `<db>.lock.guard`, so two writers never hold the lock at once. The one gap is an owner frozen past the 60-second expiry that then resumes; tasks-axi cannot pause a br call it already started.
 Killing tasks-axi does not kill a `br` call it already started; that call can still commit after the next writer takes the lock, so the mirror may miss that one change until the following write or `render`.
+Every writer to a database must run a tasks-axi version with this recovery: an older writer's lock is never refreshed, so it expires after 60 seconds even while that writer is still working.
 Markdown backlogs keep their 2.5-second wait and never remove a lock automatically.
 
 Writes that span commands are not transactions. Interrupted removal keeps a recovery identity, so the same `rm` can finish and the caller id stays reserved until then.
