@@ -272,9 +272,10 @@ path = ".beads"              # required; or ".beads/beads.db"
 binary = "br"                # optional; project config allows only br or bd
 prefix = "tasks"             # optional; only used for a new database
 timeout_ms = 30000           # optional; kills the owned child at the deadline
+lock_timeout_ms = 120000     # optional; how long a writer waits for the backlog lock
 ```
 
-`TASKS_AXI_BEADS_PATH`, `TASKS_AXI_BEADS_BINARY`, `TASKS_AXI_BEADS_PREFIX`, and `TASKS_AXI_BEADS_TIMEOUT_MS` override the matching TOML values.
+`TASKS_AXI_BEADS_PATH`, `TASKS_AXI_BEADS_BINARY`, `TASKS_AXI_BEADS_PREFIX`, `TASKS_AXI_BEADS_TIMEOUT_MS`, and `TASKS_AXI_BEADS_LOCK_TIMEOUT_MS` override the matching TOML values.
 Project configuration can select only the bare executable names `br` or `bd` on PATH.
 Custom executable paths or other programs require trusted home configuration or `TASKS_AXI_BEADS_BINARY`.
 `--file` and `TASKS_AXI_FILE` take precedence over the beads path setting. Relative paths resolve from the current directory.
@@ -299,8 +300,14 @@ Readiness still comes from tasks-axi's dependency graph and hold gates.
 Relationships to unmanaged native issues remain in br but are omitted from this graph. Use managed tasks for blockers that must gate tasks-axi dispatch.
 A native task pair can have only one dependency; conflicting pairs are rejected before creation.
 Create, update, transition, and dependency writes reread the persisted task before reporting success.
-Graph hydration uses bounded batches. Missing records or changed task timestamps cause a retryable `CONFLICT`.
+Each write reads the graph once under the lock, then rereads only the row it changed; the mirror renders from that result. `rm` rereads the whole graph, because a delete can hide other rows' edges.
+Graph hydration runs one `list`, then batches `show` (bounded by argument bytes) only for rows whose list record reports dependencies. Missing records or changed task timestamps cause a retryable `CONFLICT`.
 Writers outside this adapter are unsupported. Separate br reads do not provide a database-wide snapshot.
+
+Writers wait for the database's `<db>.lock` for up to `lock_timeout_ms` (default 120 seconds, enough for several queued writes), then fail with `LOCKED` naming the holder's pid and host.
+The holder refreshes the lock's modification time every few seconds. A waiter takes over a lock automatically when its owner process on the same host has died, or when nobody has refreshed it for 60 seconds (an owner on another host, or a frozen process), so an interrupted write never needs hand cleanup.
+Takeover and release run inside a short exclusive `<db>.lock.guard`, so two writers never hold the lock at once. The one gap is an owner frozen past the 60-second expiry that then resumes; tasks-axi cannot pause a br call it already started.
+Markdown backlogs keep their 2.5-second wait and never remove a lock automatically.
 
 Writes that span commands are not transactions. Interrupted removal keeps a recovery identity, so the same `rm` can finish and the caller id stays reserved until then.
 Close retries retain the first closed date and do not duplicate notes. Creating an already-Done task uses one native create.
@@ -345,7 +352,8 @@ For example, beads cannot represent a repo containing commas; the markdown gramm
 
 An import is not one database transaction. A failed native command or mirror write can leave earlier rows saved, even if the CLI exits nonzero.
 Rerun the same command with `--allow-existing` to finish; it never creates duplicate ids or replaces divergent records.
-TOON output reports `in_flight`, `queued`, and `done` source counts, including archived tasks, plus created/existing counts and dependencies added. `--json` returns the same summary with `ok: true`.
+TOON output reports `in_flight`, `queued`, and `done` source counts, including archived tasks, plus created/existing counts, dependencies added, `elapsed_ms`, and `ms_per_row` (elapsed time over all source rows). `--json` returns the same summary with `ok: true`.
+A killed migration leaves its lock to be recovered automatically, so the rerun with `--allow-existing` needs no hand cleanup.
 Use `--from-file` and `--to-file` for path overrides. Unset `TASKS_AXI_FILE` first, because one file override is ambiguous for two stores.
 
 #### Read-only markdown mirrors

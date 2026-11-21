@@ -1,4 +1,5 @@
-import { readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { decode } from "@toon-format/toon";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -405,6 +406,72 @@ describe.skipIf(!hasBr)("markdown to beads migration", () => {
       ),
     ).toEqual(await destination.get("first-q1"));
   }, 30_000);
+
+  it("resumes a killed migration with --allow-existing, without hand cleanup, reporting time per row", async () => {
+    const root = new URL("..", import.meta.url).pathname;
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([key]) => !key.startsWith("TASKS_AXI_"),
+      ),
+    );
+    const args = [
+      "--import",
+      "tsx",
+      join(root, "bin", "tasks-axi.ts"),
+      "migrate",
+      "--from",
+      "markdown",
+      "--to",
+      "beads",
+      "--from-file",
+      join(ws.dir, "backlog.md"),
+      "--to-file",
+      ws.path,
+    ];
+    const child = spawn(process.execPath, args, {
+      cwd: root,
+      env: { ...env, HOME: ws.dir, USERPROFILE: ws.dir },
+      stdio: "ignore",
+    });
+    const exited = new Promise((done) => child.on("close", done));
+    const imported = () =>
+      (ws.br(["list", "--all", "--limit", "0"]) as { issues: unknown[] }).issues
+        .length;
+    // Kill it while it holds the database lock, after some rows are in.
+    while (!(existsSync(ws.path + ".lock") && imported() > 0))
+      await new Promise((r) => setTimeout(r, 20));
+    child.kill("SIGKILL");
+    await exited;
+    const partial = imported();
+    expect(partial).toBeGreaterThan(0);
+
+    const output = JSON.parse(
+      await cli(
+        "migrate",
+        "--from",
+        "markdown",
+        "--to",
+        "beads",
+        "--allow-existing",
+        "--json",
+      ),
+    ) as Record<string, unknown>;
+    const total = Object.values(output.counts as Record<string, number>).reduce(
+      (a, b) => a + b,
+      0,
+    );
+    expect(output).toMatchObject({ ok: true, existing: expect.any(Number) });
+    expect(output.created).toBe(total - (output.existing as number));
+    expect(output.elapsed_ms).toEqual(expect.any(Number));
+    expect(output.ms_per_row).toBeCloseTo(
+      (output.elapsed_ms as number) / total,
+      0,
+    );
+    expect(existsSync(ws.path + ".lock")).toBe(false);
+    expect(
+      (await resolveTasksContext({ backend: "beads" }).store.list({})).total,
+    ).toBe(total);
+  }, 60_000);
 
   it("refuses a destination containing unmanaged native tasks without permission", async () => {
     ws.br(["create", "--title", "native task"]);
