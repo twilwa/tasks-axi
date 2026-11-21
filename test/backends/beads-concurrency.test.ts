@@ -115,6 +115,62 @@ describe.skipIf(!hasBr)("beads concurrency and write cost", () => {
     }
   }, 120_000);
 
+  it("reads edges from list alone while br's edge count agrees with the saved edges", async () => {
+    const store = mirrored();
+    await store.create({ id: "a", title: "A" });
+    await store.create({
+      id: "b",
+      title: "B",
+      deps: [{ type: "blocked-by", id: "a", reason: "needs a" }],
+    });
+    const recorder = recordBr(workspace.dir, workspace.path);
+    const recorded = mirrored(recorder.binary);
+    expect((await recorded.get("b"))?.deps).toEqual([
+      { type: "blocked-by", id: "a", reason: "needs a" },
+    ]);
+    const calls = readFileSync(recorder.log, "utf8").trim().split("\n");
+    expect(calls.map((line) => (JSON.parse(line) as string[])[2])).toEqual([
+      "list",
+    ]);
+  }, 60_000);
+
+  it("still sees native edge changes, deleted targets, and unmanaged targets", async () => {
+    const store = mirrored();
+    for (const id of ["a", "b", "c"])
+      await store.create({ id, title: id.toUpperCase() });
+    await store.addDep("b", { type: "blocked-by", id: "a", reason: "why" });
+    const native = (id: string) =>
+      (
+        workspace.br(["list", "--all", "--limit", "0"]) as {
+          issues: { id: string; external_ref?: string }[];
+        }
+      ).issues.find((bead) => bead.external_ref === "tasks-axi:" + id)!.id;
+    workspace.br(["dep", "add", native("b"), native("c")]);
+    // Unsaved native edges sort before saved ones.
+    expect((await store.get("b"))?.deps).toEqual([
+      { type: "blocked-by", id: "c" },
+      { type: "blocked-by", id: "a", reason: "why" },
+    ]);
+    workspace.br(["dep", "remove", native("b"), native("c")]);
+    workspace.br(["dep", "remove", native("b"), native("a")]);
+    expect((await store.get("b"))?.deps).toEqual([]);
+
+    await store.addDep("c", { type: "blocked-by", id: "a" });
+    const unmanaged = (
+      workspace.br(["create", "--title", "native only"]) as { id: string }
+    ).id;
+    workspace.br(["dep", "add", native("c"), unmanaged]);
+    expect((await store.get("c"))?.deps).toEqual([
+      { type: "blocked-by", id: "a" },
+    ]);
+
+    await store.transition("c", "done");
+    await store.transition("b", "done");
+    await store.remove("a");
+    await store.create({ id: "a", title: "A again" });
+    expect((await store.get("c"))?.deps).toEqual([]);
+  }, 120_000);
+
   it("keeps the number of br calls per write independent of backlog size", async () => {
     const callsFor = async (rows: number) => {
       workspace.cleanup();

@@ -212,11 +212,18 @@ function createExclusive(path: string, token: string): boolean {
     linkSync(tmp, path);
     return true;
   } catch (error) {
-    if (errno(error) === "EEXIST") return false;
+    if (errno(error) === "EEXIST" || busyOnWindows(error)) return false;
     throw error;
   } finally {
     unlinkSync(tmp);
   }
+}
+
+/** Windows reports a name whose file is still being deleted as EPERM/EACCES. */
+function busyOnWindows(error: unknown): boolean {
+  return (
+    process.platform === "win32" && ["EPERM", "EACCES"].includes(errno(error))
+  );
 }
 
 function sleepSync(ms: number): void {
@@ -229,7 +236,7 @@ function removeIfUnchanged(path: string, observed: Observed): void {
   try {
     renameSync(path, aside);
   } catch (error) {
-    if (errno(error) === "ENOENT") return;
+    if (errno(error) === "ENOENT" || busyOnWindows(error)) return;
     throw error;
   }
   if (readFileSafe(aside) !== observed.token) {

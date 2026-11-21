@@ -162,12 +162,22 @@ describe.skipIf(!hasBr)("beads_rust Store conformance", () => {
   it.skipIf(process.platform === "win32")(
     "rejects a managed record that changes between listing and graph hydration",
     async () => {
-      await store.create({ id: "base", title: "Base" });
-      await store.create({
-        id: "changed",
-        title: "Changed",
-        deps: [{ type: "discovered-from", id: "base" }],
-      });
+      await store.create({ id: "changed", title: "Changed" });
+      // An edge the adapter did not save makes the row need a hydrating show.
+      const raw = workspace.br(["list", "--all", "--limit", "0"]) as {
+        issues: { id: string }[];
+      };
+      const unmanaged = (
+        workspace.br(["create", "--title", "native only"]) as { id: string }
+      ).id;
+      workspace.br([
+        "dep",
+        "add",
+        raw.issues[0].id,
+        unmanaged,
+        "--type",
+        "discovered-from",
+      ]);
       const marker = join(workspace.dir, "change-during-show");
       writeFileSync(marker, "");
       const recorder = recordBr(workspace.dir, workspace.path, {
@@ -569,7 +579,7 @@ describe.skipIf(!hasBr)("beads_rust Store conformance", () => {
   );
 
   it.skipIf(process.platform === "win32")(
-    "pins all commands to the selected DB and hydrates linked rows with one batched show",
+    "pins all commands to the selected DB and reads saved edges without a show",
     async () => {
       const log = join(workspace.dir, "commands.jsonl");
       const wrapper = join(workspace.dir, "record-br.cjs");
@@ -624,7 +634,8 @@ process.exit(result.status ?? 1);\n`,
         .trim()
         .split("\n")
         .map((line) => JSON.parse(line) as string[]);
-      expect(reads).toHaveLength(2);
+      // Saved edges agree with br's edge count, so list alone is complete.
+      expect(reads).toHaveLength(1);
       expect(reads[0]).toEqual([
         "--db",
         db,
@@ -634,9 +645,6 @@ process.exit(result.status ?? 1);\n`,
         "0",
         "--json",
       ]);
-      expect(reads[1][2]).toBe("show");
-      // Only "second" has native edges; "first" is complete from list alone.
-      expect(reads[1].slice(3, -1)).toHaveLength(1);
       expect((await store.list({})).total).toBe(0);
       await recorded.update("second", { body: "Current notes" });
       await recorded.update("second", { body: "", archiveBody: true });

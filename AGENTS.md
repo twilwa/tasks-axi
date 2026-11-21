@@ -37,8 +37,7 @@ The CLI layer never knows which backend is active — it only talks to the `Stor
   Firstmate and other callers must use `tasks-axi public-followup` and `--json`, never parse or rewrite the comment.
   Generic worker readiness and lifecycle transitions cannot dispatch, complete, reopen, remove, or change the kind of an active obligation; only a posted receipt or Captain waiver completes it.
 - **Concurrency:** every mutation runs under `withLock` (advisory `<path>.lock`) and fails closed with a `LOCKED` error if another process holds the lock past the bounded timeout.
-  For markdown, if the lock looks stale, the error tells the user to remove `<path>.lock` only after confirming no `tasks-axi` process is running.
-  Beads opts into a longer wait (`beads.lock_timeout_ms`) and automatic, guarded recovery of abandoned locks (`LockOptions.recover` in `lock.ts`; README beads section).
+  For markdown, if the lock looks stale, the error tells the user to remove `<path>.lock` only after confirming no `tasks-axi` process is running; beads recovers abandoned locks itself.
   Corruption-safety is guaranteed independently by atomic temp-file + rename writes, and a hand-edit landing between read and write is detected and refused.
   Reads do not lock.
 

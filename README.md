@@ -287,7 +287,7 @@ The adapter releases that reference before deletion, allowing an id to be reused
 It only lists tasks it manages, not unrelated native issues.
 
 Bodies stay in native descriptions. With `--archive-body`, superseded bodies go into native comments and dated blocks in `note-archive.md` beside the selected database.
-Versioned `agent_context` JSON holds kind, repo, holds, dependency reasons, day stamps, and list order.
+Versioned `agent_context` JSON holds kind, repo, holds, dependency edges with their reasons and native target ids, day stamps, and list order.
 Only explicit kinds are stored; title-inferred kinds are recomputed on reads and title changes.
 Beads create results include inferred kinds immediately; Markdown currently infers them only on reread.
 Kind/repo labels and `hold:captain` are native mirrors capped at 50 characters. Kind and repo values cannot contain commas.
@@ -301,12 +301,15 @@ Relationships to unmanaged native issues remain in br but are omitted from this 
 A native task pair can have only one dependency; conflicting pairs are rejected before creation.
 Create, update, transition, and dependency writes reread the persisted task before reporting success.
 Each write reads the graph once under the lock, then rereads only the row it changed; the mirror renders from that result. `rm` rereads the whole graph, because a delete can hide other rows' edges.
-Graph hydration runs one `list`, then batches `show` (bounded by argument bytes) only for rows whose list record reports dependencies. Missing records or changed task timestamps cause a retryable `CONFLICT`.
+Graph reads run one `list`. The adapter saves each edge it writes, with its target's native id, in `agent_context`; when br's own edge count for a row matches those saved edges and every saved target is still that same native row, the saved edges are the row's edges.
+Otherwise, for example after a native `dep add` or `dep remove`, an edge to an unmanaged issue, or a deleted target, that row's edges come from `show`, batched by argument bytes. Missing records or changed task timestamps on shown rows cause a retryable `CONFLICT`.
+The one change this cannot see is a native writer rewiring a managed row's edges while keeping its edge count (removing one edge and adding another); use tasks-axi `block`/`unblock` for managed edges.
 Writers outside this adapter are unsupported. Separate br reads do not provide a database-wide snapshot.
 
 Writers wait for the database's `<db>.lock` for up to `lock_timeout_ms` (default 120 seconds, enough for several queued writes), then fail with `LOCKED` naming the holder's pid and host.
 The holder refreshes the lock's modification time every few seconds. A waiter takes over a lock automatically when its owner process on the same host has died, or when nobody has refreshed it for 60 seconds (an owner on another host, or a frozen process), so an interrupted write never needs hand cleanup.
 Takeover and release run inside a short exclusive `<db>.lock.guard`, so two writers never hold the lock at once. The one gap is an owner frozen past the 60-second expiry that then resumes; tasks-axi cannot pause a br call it already started.
+Killing tasks-axi does not kill a `br` call it already started; that call can still commit after the next writer takes the lock, so the mirror may miss that one change until the following write or `render`.
 Markdown backlogs keep their 2.5-second wait and never remove a lock automatically.
 
 Writes that span commands are not transactions. Interrupted removal keeps a recovery identity, so the same `rm` can finish and the caller id stays reserved until then.

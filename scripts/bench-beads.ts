@@ -4,7 +4,7 @@
  *
  *   pnpm exec tsx scripts/bench-beads.ts --rows 400 [--rows 1500]
  *     [--cli dist/bin/tasks-axi.js] [--seed-cli <path>] [--reps 3]
- *     [--parallel 8] [--json] [--keep]
+ *     [--parallel 8] [--json] [--keep] [--workspace <kept-dir>]
  *
  * Builds a throwaway workspace (HOME points inside it, so no real home config
  * is read) holding a synthetic markdown backlog of N rows: about 20% active
@@ -14,10 +14,14 @@
  * times add, start, done and show (median of --reps), N parallel adds, and
  * migration per row. --seed-cli migrates with a different build than --cli,
  * so an old build's write path can be timed without its slow migration.
+ * --workspace copies a workspace kept by an earlier --keep run (one --rows
+ * value) instead of building and migrating, so two builds' writes can be
+ * timed back-to-back on identical copies. Every result records the host load
+ * average and the time of a bare `br version`, the per-call floor.
  */
-import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { spawn, spawnSync } from "node:child_process";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { loadavg, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { renderBacklog } from "../src/backends/markdown-grammar.js";
 import type { State, Task } from "../src/model.js";
@@ -43,6 +47,16 @@ const cli = resolve(flag("--cli")[0] ?? "dist/bin/tasks-axi.js");
 const seedCli = resolve(flag("--seed-cli")[0] ?? cli);
 const reps = Number(flag("--reps")[0] ?? 3);
 const parallel = Number(flag("--parallel")[0] ?? 8);
+const seeded = flag("--workspace")[0];
+
+/** One trivial br call against the workspace database: the per-call floor. */
+function brFloorMs(dir: string): number {
+  const start = performance.now();
+  spawnSync("br", ["--db", join(dir, ".beads", "beads.db"), "version"], {
+    stdio: "ignore",
+  });
+  return Math.round(performance.now() - start);
+}
 
 const WORDS =
   "widget lease handoff mirror review backlog worker deploy cache retry queue gate schema token config session report migration lock fixture".split(
@@ -114,14 +128,21 @@ function backlog(tasks: Task[], states: [State, string][], title: string) {
   });
 }
 
-function run(args: string[], cwd: string, home: string, bin = cli): Promise<Run> {
+function run(
+  args: string[],
+  cwd: string,
+  home: string,
+  bin = cli,
+): Promise<Run> {
   return new Promise((done, fail) => {
     const start = performance.now();
     const child = spawn(process.execPath, [bin, ...args], {
       cwd,
       env: {
         ...Object.fromEntries(
-          Object.entries(process.env).filter(([key]) => !key.startsWith("TASKS_AXI_")),
+          Object.entries(process.env).filter(
+            ([key]) => !key.startsWith("TASKS_AXI_"),
+          ),
         ),
         HOME: home,
         USERPROFILE: home,
@@ -146,6 +167,39 @@ function median(values: number[]): number {
 async function bench(rows: number) {
   const dir = mkdtempSync(join(tmpdir(), "tasks-axi-bench-"));
   const home = join(dir, "home");
+  const result: Record<string, unknown> = {
+    rows,
+    dir,
+    load_before: loadavg().map((n) => Math.round(n * 100) / 100),
+  };
+  const failures: string[] = [];
+  const check = (name: string, r: Run) => {
+    if (r.code !== 0)
+      failures.push(
+        name + ": exit " + r.code + ": " + r.out.trim().slice(0, 300),
+      );
+    return r.ms;
+  };
+  if (seeded) {
+    // The copy keeps its relative .tasks.toml paths, so it is self-contained.
+    cpSync(seeded, dir, { recursive: true });
+    result.copied_from = seeded;
+  } else await seed(rows, dir, home, result, check);
+  result.br_floor_ms = brFloorMs(dir);
+  await writes(dir, home, result, check);
+  result.load_after = loadavg().map((n) => Math.round(n * 100) / 100);
+  if (failures.length) result.failures = failures;
+  if (!has("--keep")) rmSync(dir, { recursive: true, force: true });
+  return result;
+}
+
+async function seed(
+  rows: number,
+  dir: string,
+  home: string,
+  result: Record<string, unknown>,
+  check: (name: string, r: Run) => number,
+) {
   mkdirSync(home);
   mkdirSync(join(dir, "md"));
   const tasks = syntheticTasks(rows);
@@ -186,12 +240,6 @@ async function bench(rows: number) {
       "",
     ].join("\n"),
   );
-  const result: Record<string, unknown> = { rows, dir };
-  const failures: string[] = [];
-  const check = (name: string, r: Run) => {
-    if (r.code !== 0) failures.push(name + ": exit " + r.code + ": " + r.out.trim().slice(0, 300));
-    return r.ms;
-  };
   const migrate = await run(
     ["migrate", "--from", "markdown", "--to", "beads", "--json"],
     dir,
@@ -203,14 +251,37 @@ async function bench(rows: number) {
   result.migrate_ms_per_row = Math.round((migrate.ms / rows) * 10) / 10;
   try {
     const reported = JSON.parse(migrate.out) as Record<string, unknown>;
-    if (reported.ms_per_row !== undefined) result.migrate_reported_ms_per_row = reported.ms_per_row;
+    if (reported.ms_per_row !== undefined)
+      result.migrate_reported_ms_per_row = reported.ms_per_row;
   } catch {
     // older builds print no per-row timing
   }
-  const timings: Record<string, number[]> = { add: [], start: [], done: [], show: [] };
+}
+
+async function writes(
+  dir: string,
+  home: string,
+  result: Record<string, unknown>,
+  check: (name: string, r: Run) => number,
+) {
+  const timings: Record<string, number[]> = {
+    add: [],
+    start: [],
+    done: [],
+    show: [],
+  };
   for (let i = 0; i < reps; i++) {
     const id = "bench-" + i;
-    timings.add.push(check("add", await run(["add", id, "benchmark row " + i, "--body", "Synthetic body line."], dir, home)));
+    timings.add.push(
+      check(
+        "add",
+        await run(
+          ["add", id, "benchmark row " + i, "--body", "Synthetic body line."],
+          dir,
+          home,
+        ),
+      ),
+    );
     timings.start.push(check("start", await run(["start", id], dir, home)));
     timings.done.push(check("done", await run(["done", id], dir, home)));
     timings.show.push(check("show", await run(["show", id], dir, home)));
@@ -230,11 +301,10 @@ async function bench(rows: number) {
     succeeded: runs.filter((r) => r.code === 0).length,
     wall_ms: Math.round(performance.now() - start),
     per_writer_ms: runs.map((r) => r.ms),
-    errors: runs.filter((r) => r.code !== 0).map((r) => r.out.trim().split("\n")[0]),
+    errors: runs
+      .filter((r) => r.code !== 0)
+      .map((r) => r.out.trim().split("\n")[0]),
   };
-  if (failures.length) result.failures = failures;
-  if (!has("--keep")) rmSync(dir, { recursive: true, force: true });
-  return result;
 }
 
 const results = [];

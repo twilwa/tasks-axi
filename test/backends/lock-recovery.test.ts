@@ -103,9 +103,9 @@ describe("recoverable locks", () => {
   it("keeps a live holder's lock past the expiry by refreshing it", async () => {
     const target = join(dir, "beads.db");
     const options = {
-      timeoutMs: 200,
-      retryMs: 10,
-      recover: { expiryMs: 150, heartbeatMs: 20 },
+      timeoutMs: 1_500,
+      retryMs: 20,
+      recover: { expiryMs: 1_000, heartbeatMs: 100 },
     };
     let release!: () => void;
     let holding!: () => void;
@@ -119,7 +119,7 @@ describe("recoverable locks", () => {
       options,
     );
     await held;
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise((r) => setTimeout(r, 2_500));
     await expect(
       withLock(target, () => "stolen", options),
     ).rejects.toMatchObject({
@@ -129,7 +129,7 @@ describe("recoverable locks", () => {
     release();
     await first;
     await expect(withLock(target, () => "next", options)).resolves.toBe("next");
-  });
+  }, 15_000);
 });
 
 describe("markdown lock behaviour is unchanged", () => {

@@ -73,13 +73,15 @@ interface AdapterData {
   order: number;
   closed?: string;
   meta?: Record<string, unknown>;
-  deps?: Dep[];
+  deps?: SavedDep[];
   hold?: Hold;
   /** Exact native labels added by this adapter, not every kind:/repo: label. */
   mirrors?: string[];
   /** Durable caller identity while external_ref is released for native delete. */
   pendingDelete?: string;
 }
+/** A saved edge also names its target's native id, so a recreated id cannot pass as the old target. */
+type SavedDep = Dep & { native?: string };
 type Bead = Record<string, unknown>;
 interface LoadedTask {
   bead: Bead;
@@ -275,7 +277,8 @@ function adapterData(bead: Bead, id: string): AdapterData {
         if (
           typeof edge.id !== "string" ||
           typeof edge.type !== "string" ||
-          (edge.reason !== undefined && typeof edge.reason !== "string")
+          (edge.reason !== undefined && typeof edge.reason !== "string") ||
+          (edge.native !== undefined && typeof edge.native !== "string")
         )
           throw new Error("Invalid edge");
         checkedDep(id, edge as unknown as Dep);
@@ -747,8 +750,9 @@ export class BeadsStore implements Store {
   }
 
   /**
-   * One `list` for every row, plus `show` only for rows that have native
-   * dependencies (`list` reports their count but not the edges).
+   * One `list` for every row, plus `show` only for rows whose native edge
+   * count disagrees with the edges the adapter saved (`list` reports the
+   * count but not the edges).
    */
   private async load(): Promise<LoadedTask[]> {
     const raw = record(await this.call(["list", "--all", "--limit", "0"]));
@@ -760,7 +764,33 @@ export class BeadsStore implements Store {
       if (loaded) result.push(loaded);
     }
     this.sorted(result);
-    const linked = result.filter((item) => item.bead.dependency_count !== 0);
+    const byId = new Map(result.map((item) => [item.task.id, item]));
+    const linked: LoadedTask[] = [];
+    for (const item of result) {
+      const count = item.bead.dependency_count;
+      if (count === 0) continue;
+      // The adapter saves every edge it writes. While br's own edge count
+      // agrees and every saved target is managed, the saved list is the native
+      // edge set; any native add, remove, deleted target or unmanaged edge
+      // changes the count and sends that row to an authoritative show.
+      const saved = item.data.deps ?? [];
+      if (
+        count === saved.length &&
+        saved.every(
+          (dep) =>
+            dep.native !== undefined &&
+            byId.get(dep.id)?.bead.id === dep.native,
+        )
+      ) {
+        item.task.deps = saved.map((dep) => ({
+          type: dep.type,
+          id: dep.id,
+          ...(dep.reason ? { reason: dep.reason } : {}),
+        }));
+        continue;
+      }
+      linked.push(item);
+    }
     if (linked.length) {
       const shown = await this.show(linked.map((item) => String(item.bead.id)));
       const shownIds = new Set(shown.map((item) => item.id));
@@ -900,7 +930,7 @@ export class BeadsStore implements Store {
               : dateValue(this.now()),
         prioritySet: input.priority !== undefined,
         closed: input.closed,
-        deps,
+        deps: this.saved(all, deps),
         hold: input.hold,
         meta: input.meta,
         order:
@@ -967,6 +997,14 @@ export class BeadsStore implements Store {
     const found = all.find((item) => item.task.id === id);
     if (!found) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
     return found;
+  }
+
+  /** Edges to save in adapter metadata, each with its target's native id. */
+  private saved(all: LoadedTask[], deps: Dep[]): SavedDep[] {
+    return deps.map((dep) => {
+      const target = all.find((item) => item.task.id === dep.id);
+      return target ? { ...dep, native: String(target.bead.id) } : dep;
+    });
   }
 
   private dependency(all: LoadedTask[], id: string): LoadedTask {
@@ -1297,7 +1335,8 @@ export class BeadsStore implements Store {
       // Persist the reason before adding the edge. A retry can finish an
       // absent native edge; it must never mistake an edge with a lost reason
       // for a complete operation. Unattached metadata is invisible to reads.
-      const data = { ...found.data, deps: [...found.task.deps, checked] };
+      const deps = [...found.task.deps, checked];
+      const data = { ...found.data, deps: this.saved(all, deps) };
       await this.call([
         "update",
         String(found.bead.id),
@@ -1315,7 +1354,7 @@ export class BeadsStore implements Store {
       ]);
       settle(
         await this.verifyTask(
-          { ...found.task, deps: data.deps },
+          { ...found.task, deps },
           all,
           String(found.bead.id),
         ),
@@ -1343,12 +1382,10 @@ export class BeadsStore implements Store {
         String(found.bead.id),
         String(target.bead.id),
       ]);
-      const data = {
-        ...found.data,
-        deps: found.task.deps.filter(
-          (edge) => edge.type !== checked.type || edge.id !== checked.id,
-        ),
-      };
+      const deps = found.task.deps.filter(
+        (edge) => edge.type !== checked.type || edge.id !== checked.id,
+      );
+      const data = { ...found.data, deps: this.saved(all, deps) };
       await this.call([
         "update",
         String(found.bead.id),
@@ -1358,7 +1395,7 @@ export class BeadsStore implements Store {
       ]);
       settle(
         await this.verifyTask(
-          { ...found.task, deps: data.deps },
+          { ...found.task, deps },
           all,
           String(found.bead.id),
         ),
