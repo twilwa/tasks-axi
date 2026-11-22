@@ -328,6 +328,10 @@ async function acquireLock(
     Date.now() + Math.min(timeoutMs, Math.max(0, outer - performance.now()));
 
   while (true) {
+    // Inside a beads lock the shared budget is absolute: once it is spent, a
+    // free lockfile is not taken either. Standalone (outer = Infinity) keeps
+    // main's behaviour exactly: always one attempt, then its own wait.
+    if (Number.isFinite(outer) && outer - performance.now() <= 0) break;
     try {
       const fd = openSync(lockPath, "wx");
       const token = lockToken();
@@ -377,12 +381,19 @@ export async function withLocks<T>(
     .map(([, path]) => path);
   const optionsFor = (path: string) =>
     (typeof options === "function" ? options(path) : options) ?? {};
-  // One wait budget for the whole set: the longest single wait.
+  // A set with a beads (kernel) lock shares one wait budget, the longest
+  // single wait. A Markdown-only set keeps main's independent wait per lock,
+  // unless it is nested inside a beads lock's budget.
+  const shared = ordered.some((path) => optionsFor(path).kernel);
   const budget = Math.min(
-    performance.now() +
-      Math.max(
-        ...ordered.map((path) => optionsFor(path).timeoutMs ?? LOCK_TIMEOUT_MS),
-      ),
+    shared
+      ? performance.now() +
+          Math.max(
+            ...ordered.map(
+              (path) => optionsFor(path).timeoutMs ?? LOCK_TIMEOUT_MS,
+            ),
+          )
+      : Infinity,
     heldDeadline.getStore() ?? Infinity,
   );
   const handles: LockHandle[] = [];

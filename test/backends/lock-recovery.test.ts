@@ -230,6 +230,22 @@ describe.skipIf(!hasFlock)("kernel (flock) locks", () => {
     ).rejects.toMatchObject({ code: "LOCKED" });
   });
 
+  it("refuses a free markdown lock once the beads budget it is nested in is spent", async () => {
+    const outer = join(dir, "a.db");
+    const md = join(dir, "b.md");
+    await expect(
+      withLock(
+        outer,
+        async () => {
+          await new Promise((r) => setTimeout(r, 300));
+          return withLock(md, () => "late");
+        },
+        { timeoutMs: 200, kernel: true },
+      ),
+    ).rejects.toMatchObject({ code: "LOCKED" });
+    expect(existsSync(md + ".lock")).toBe(false);
+  });
+
   it("bounds several locks taken together by one budget", async () => {
     const first = join(dir, "a.db");
     const second = join(dir, "b.db");
@@ -281,6 +297,38 @@ describe.skipIf(!hasFlock)("kernel (flock) locks", () => {
 });
 
 describe("markdown lock behaviour is unchanged", () => {
+  it("gives each markdown lock in a set its own wait, as on main", async () => {
+    // Staggered contention: the second file frees 3.5 s in, after a shared
+    // 2.5 s budget would have expired but within its own 2.5 s wait.
+    const first = join(dir, "a.md");
+    const second = join(dir, "b.md");
+    writeFileSync(first + ".lock", "held-by-test");
+    writeFileSync(second + ".lock", "held-by-test");
+    setTimeout(() => rmSync(first + ".lock"), 1_500);
+    setTimeout(() => rmSync(second + ".lock"), 3_500);
+    const started = Date.now();
+    await expect(withLocks([first, second], () => "entered")).resolves.toBe(
+      "entered",
+    );
+    const waited = Date.now() - started;
+    expect(waited).toBeGreaterThanOrEqual(3_400);
+    expect(waited).toBeLessThan(4_200);
+  }, 15_000);
+
+  it("still refuses a second markdown file busy past its own wait", async () => {
+    const first = join(dir, "a.md");
+    const second = join(dir, "b.md");
+    writeFileSync(first + ".lock", "held-by-test");
+    writeFileSync(second + ".lock", "held-by-test");
+    setTimeout(() => rmSync(first + ".lock"), 1_000);
+    const started = Date.now();
+    await expect(
+      withLocks([first, second], () => "entered"),
+    ).rejects.toMatchObject({ code: "LOCKED" });
+    // 1 s on the first, then the second's full 2.5 s.
+    expect(Date.now() - started).toBeGreaterThanOrEqual(3_400);
+  }, 15_000);
+
   it("still refuses a crashed owner's lock after the 2.5 s default wait, without removing it", async () => {
     const path = join(dir, "backlog.md");
     writeFileSync(path, "# Backlog\n\n## Queued\n");
