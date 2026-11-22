@@ -41,6 +41,7 @@ import {
 import {
   atomicWrite,
   canonicalPath,
+  reservedPath,
   type LockOptions,
   readFileSafe,
   heldLockFds,
@@ -545,6 +546,14 @@ export class BeadsStore implements Store {
         invalid(
           "beads mirror paths must be distinct and must not overwrite the database, sidecars, locks or note archive",
         );
+      // Another store's lock or marker is just as live as this one's.
+      for (const output of outputs) {
+        const reason = reservedPath(output);
+        if (reason)
+          invalid(
+            `beads mirror path ${output} names ${reason}; choose a different file`,
+          );
+      }
     }
     this.doneKeep = options.doneKeep ?? 10;
     if (!Number.isSafeInteger(this.doneKeep) || this.doneKeep < 0)

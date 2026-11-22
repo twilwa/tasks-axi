@@ -175,6 +175,27 @@ export function atomicWrite(path: string, content: string): void {
 const FLOCK_MARKER = "tasks-axi-lock/flock-v1\n";
 const FLOCK_TIMEOUT_EXIT = 75;
 
+/**
+ * Why `path` must never be written as a data file, or undefined. Every
+ * tasks-axi lock is `<target>.lock` and every beads ready marker is
+ * `<db>.tasks-axi-ready`, whichever store owns them, and replacing one
+ * (an atomic rename onto it) silently splits a live lock. `strict` reserves
+ * every `.lock` name; otherwise only a file that already holds a kernel lock
+ * record is, so Markdown-only paths behave exactly as before.
+ */
+export function reservedPath(path: string, strict = true): string | undefined {
+  const name = basename(path);
+  if (name.endsWith(".tasks-axi-ready")) return "a beads ready marker";
+  if (!name.endsWith(".lock")) return undefined;
+  if (strict) return "a tasks-axi lock file";
+  try {
+    const head = readFileSync(path, "utf8").slice(0, FLOCK_MARKER.length);
+    return head === FLOCK_MARKER ? "a live beads lock file" : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Descriptors of kernel locks held by this async chain (passed to br). */
 const heldFds = new AsyncLocalStorage<number[]>();
 /** The wait budget (performance.now()) shared by nested acquisitions. */

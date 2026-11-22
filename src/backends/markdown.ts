@@ -45,7 +45,7 @@ import type {
   PruneResult,
   Store,
 } from "../store.js";
-import { atomicWrite, readFileSafe, withLocks } from "./lock.js";
+import { atomicWrite, readFileSafe, reservedPath, withLocks } from "./lock.js";
 import {
   assertTransferRemoval,
   registerTransferStore,
@@ -342,6 +342,15 @@ export class MarkdownStore implements Store {
         "Note archive path must not be the active backlog path",
         "VALIDATION_ERROR",
       );
+    }
+    // Never write a Markdown file over a live beads lock or ready marker.
+    for (const path of [this.path, this.archivePath, this.noteArchivePath]) {
+      const reason = reservedPath(resolve(path), false);
+      if (reason)
+        throw new AxiError(
+          `${resolve(path)} names ${reason}; choose a different file`,
+          "VALIDATION_ERROR",
+        );
     }
     this.now = options.now ?? today;
     registerTransferStore(this, this.path);
