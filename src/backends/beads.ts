@@ -37,7 +37,7 @@ import {
   canonicalPath,
   type LockOptions,
   readFileSafe,
-  trackChild,
+  heldLockFds,
 } from "./lock.js";
 import { writeMarkdownMirror } from "./markdown-mirror.js";
 import {
@@ -357,49 +357,65 @@ function brFailure(output: string): BrFailure {
     return new BrFailure("UNKNOWN", output.trim() || "br command failed");
   }
 }
-/** Stream both pipes: large backlogs must not hit execFile's 1 MiB limit. */
+/**
+ * Stream both pipes: large backlogs must not hit execFile's 1 MiB limit.
+ * br inherits the descriptors of every kernel lock this chain holds, so the
+ * lock outlives this process for as long as br (or anything it runs that
+ * keeps the descriptor) can still write. The call settles only once br has
+ * exited, so no caller unwinds, releases or rolls back under a live br.
+ */
 function runBr(
   binary: string,
   args: string[],
   cwd: string,
   timeoutMs: number,
   input?: string,
+  env?: NodeJS.ProcessEnv,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
-    // POSIX: br starts only after its pid is recorded against the held lock
-    // (exec keeps the pid), so a successor can never miss a write that this
-    // process started before dying. Windows has no sh; it records just after.
-    const gated = process.platform !== "win32";
-    const child = gated
-      ? spawn("/bin/sh", ["-c", BR_GATE, binary, ...args], {
-          cwd,
-          stdio: ["pipe", "pipe", "pipe"],
-        })
-      : spawn(binary, args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
-    const forget = trackChild(child.pid);
+    const child = spawn(binary, args, {
+      cwd,
+      ...(env ? { env } : {}),
+      stdio: ["pipe", "pipe", "pipe", ...heldLockFds()],
+    });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
-    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
     let timedOut = false;
+    let failure: Error | undefined;
+    const stop = () => {
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.stdin?.destroy();
+      child.kill("SIGKILL"); // Only the ChildProcess we spawned, never a process-group/PID search.
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.stdout.destroy();
-      child.stderr.destroy();
-      child.stdin.destroy();
-      child.kill("SIGKILL"); // Only the ChildProcess we spawned, never a process-group/PID search.
+      stop();
     }, timeoutMs);
     child.on("error", (error) => {
-      clearTimeout(timer);
-      forget();
-      reject(error);
+      if (child.pid === undefined) {
+        // Never started: nothing can still write.
+        clearTimeout(timer);
+        reject(error);
+        return;
+      }
+      // Started, then failed: stop it and settle on its exit.
+      failure ??= error;
+      stop();
     });
-    child.stdin.on("error", (error: NodeJS.ErrnoException) => {
-      if (error.code !== "EPIPE") reject(error);
+    child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "EPIPE") return;
+      failure ??= error;
+      stop();
     });
     child.on("close", (code, signal) => {
       clearTimeout(timer);
-      forget();
+      if (failure) {
+        reject(failure);
+        return;
+      }
       if (timedOut) {
         reject(
           new BrFailure(
@@ -420,12 +436,9 @@ function runBr(
           ),
         );
     });
-    if (gated) child.stdin.write("go\n");
-    child.stdin.end(input);
+    child.stdin?.end(input);
   });
 }
-
-const BR_GATE = 'IFS= read -r go && [ "$go" = go ] && exec "$0" "$@"';
 
 export class BeadsStore implements Store {
   private readonly path: string;
@@ -485,7 +498,7 @@ export class BeadsStore implements Store {
       );
     // Writers queue behind each other, so wait long enough for several
     // complete writes; an abandoned lock is recovered instead of waited out.
-    this.lockOptions = { timeoutMs: lockTimeoutMs, recover: {} };
+    this.lockOptions = { timeoutMs: lockTimeoutMs, kernel: true };
     this.now = options.now ?? today;
     if (
       options.mirrorArchivePath !== undefined &&
@@ -607,18 +620,61 @@ export class BeadsStore implements Store {
    * A database file existing does not prove `br init` finished, so first use
    * confirms it under the init lock and leaves a marker beside the database.
    */
+  /**
+   * The database file's identity. Inode numbers are reused after deletion,
+   * so the birth time is part of it.
+   */
+  private identity(): string {
+    const stat = statSync(this.path, { bigint: true });
+    return `${stat.dev}:${stat.ino}:${stat.birthtimeNs}\n`;
+  }
+
+  /** True when the ready marker certifies the database file present now. */
+  private markerMatches(): boolean {
+    const marker = readFileSafe(this.readyMarker);
+    if (!marker) return false;
+    try {
+      return marker === this.identity();
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * First use confirms the database was fully initialized, under the init
+   * lock, and binds a ready marker to that database file's identity.
+   * br 0.7.6 `init` ignores `--db` and initializes `BEADS_DIR` or
+   * `<cwd>/.beads` (and `BEADS_CACHE_DIR` can move the file), so tasks-axi
+   * only initializes `<dir>/beads.db`, with `BEADS_DIR` set to that
+   * directory and the overrides removed, and verifies where it landed.
+   */
   private async ensureInitialized(): Promise<void> {
-    if (this.initialized || existsSync(this.readyMarker)) {
+    if (this.initialized) return;
+    if (this.markerMatches()) {
       this.initialized = true;
       return;
     }
     await withLock(
       `${this.lockKey}.init`,
       async () => {
-        if (existsSync(this.readyMarker)) return;
-        mkdirSync(dirname(this.path), { recursive: true });
-        const init = (force: boolean) =>
-          runBr(
+        if (this.markerMatches()) return;
+        const beadsDir = dirname(this.path);
+        // br initializes <BEADS_DIR>/beads.db; no other name can be created.
+        const standard = basename(this.path) === "beads.db";
+        const init = async (force: boolean) => {
+          if (!standard)
+            throw new AxiError(
+              `tasks-axi can only initialize a beads database named beads.db; initialize ${this.path} with br first`,
+              "VALIDATION_ERROR",
+            );
+          mkdirSync(beadsDir, { recursive: true });
+          const env: NodeJS.ProcessEnv = {
+            ...process.env,
+            BEADS_DIR: beadsDir,
+          };
+          delete env.BEADS_CACHE_DIR;
+          delete env.BEADS_DB;
+          await runBr(
             this.binary,
             [
               "--db",
@@ -629,12 +685,15 @@ export class BeadsStore implements Store {
               this.prefix,
               "--json",
             ],
-            this.cwd,
+            dirname(beadsDir),
             this.timeoutMs,
+            undefined,
+            env,
           );
-        if (!existsSync(this.path)) await init(false);
-        else if (statSync(this.path).size === 0) await init(true);
-        else {
+        };
+        const verify = async (): Promise<string> => {
+          if (!existsSync(this.path) || statSync(this.path).size === 0)
+            return "missing";
           const info = record(
             JSON.parse(
               await runBr(
@@ -645,17 +704,32 @@ export class BeadsStore implements Store {
               ),
             ) as unknown,
           );
-          if (!text(record(info.config).issue_prefix)) {
-            // An interrupted init: safe to redo only while nothing is stored.
-            if (info.issue_count !== 0)
-              throw new AxiError(
-                `Beads database ${this.path} has issues but no prefix; repair it with br before using tasks-axi`,
-                "UNKNOWN",
-              );
-            await init(true);
-          }
+          const at = text(info.database_path);
+          if (!at || canonicalPath(at) !== this.lockKey) return "elsewhere";
+          const empty = info.issue_count === 0;
+          if (!text(record(info.config).issue_prefix))
+            return empty ? "incomplete" : "no prefix, but has issues";
+          if (
+            standard &&
+            empty &&
+            !["metadata.json", "config.yaml"].every((name) =>
+              existsSync(join(beadsDir, name)),
+            )
+          )
+            return "incomplete";
+          return "ok";
+        };
+        let state = await verify();
+        if (state === "missing" || state === "incomplete") {
+          await init(existsSync(this.path));
+          state = await verify();
         }
-        atomicWrite(this.readyMarker, "initialized by tasks-axi\n");
+        if (state !== "ok")
+          throw new AxiError(
+            `Beads database ${this.path} is not usable (${state}); repair it with br before using tasks-axi`,
+            "UNKNOWN",
+          );
+        atomicWrite(this.readyMarker, this.identity());
       },
       this.lockOptions,
     );

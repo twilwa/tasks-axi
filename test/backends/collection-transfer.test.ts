@@ -123,9 +123,13 @@ describe.skipIf(!hasBr)("markdown/beads collection transfers", () => {
         );
         expect(child.error).toBeUndefined();
         expect(child.signal).toBe("SIGKILL");
-        // The child has exited. Only its throwaway locks can now be removed.
-        for (const path of [sourcePath, targetPath])
-          rmSync(`${path}.lock`, { force: true });
+        // The child has exited. Beads locks need no cleanup; markdown's
+        // exclusive-create lockfile is still removed by hand.
+        for (const [path, backend] of [
+          [sourcePath, from],
+          [targetPath, to],
+        ])
+          if (backend === "markdown") rmSync(`${path}.lock`, { force: true });
         for (const id of ["root", "work"]) {
           expect(
             (await source.get(id)) ?? (await target.get(id)),

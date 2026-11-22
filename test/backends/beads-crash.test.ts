@@ -1,11 +1,22 @@
-import { spawn } from "node:child_process";
-import { existsSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { execFileSync, spawn } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { BeadsStore } from "../../src/backends/beads.js";
 import { canonicalPath, withLock } from "../../src/backends/lock.js";
 import { MarkdownStore } from "../../src/backends/markdown.js";
+import { showCommand } from "../../src/commands/crud.js";
+import { resolveTasksContext } from "../../src/context.js";
 import { hasBr, makeBeadsWorkspace, recordBr } from "../beads-helpers.js";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -85,7 +96,7 @@ function pauseOnce(
   );
 }
 
-describe.skipIf(!hasBr || process.platform === "win32")(
+describe.skipIf(!hasBr)(
   "beads writers across real processes and crashes",
   () => {
     beforeEach(() => {
@@ -163,55 +174,103 @@ describe.skipIf(!hasBr || process.platform === "win32")(
       const seen = join(ws.dir, "seen");
       const recorder = recordBr(ws.dir, alias, {
         before:
+          // flock -n on the canonical lock fails while it is held.
           "if (args[2] === 'list') fs.writeFileSync(" +
           JSON.stringify(seen) +
-          ", String(fs.existsSync(" +
+          ", String(require('node:child_process').spawnSync('flock', ['-n', " +
           JSON.stringify(ws.path + ".lock") +
-          ")));",
+          ", 'true']).status !== 0));",
       });
       await new BeadsStore({ path: alias, binary: recorder.binary }).list({});
       expect(readFileSync(seen, "utf8")).toBe("true");
     }, 30_000);
 
-    it("finishes an init that crashed after creating the database file", async () => {
+    it("redoes an init interrupted after br set the prefix but before it wrote its workspace files", async () => {
       const db = join(ws.dir, "fresh", ".beads", "beads.db");
       const fault = join(ws.dir, "fault");
       writeFileSync(fault, "");
       const recorder = recordBr(ws.dir, db, {
-        before:
+        after:
           "if (args[2] === 'init' && fs.existsSync(" +
           JSON.stringify(fault) +
-          ")) {" +
-          " fs.unlinkSync(" +
+          ")) { fs.unlinkSync(" +
           JSON.stringify(fault) +
-          "); fs.mkdirSync(require('node:path').dirname(args[1]), {recursive: true});" +
-          " fs.writeFileSync(args[1], ''); process.exit(9); }",
+          "); const d = require('node:path').dirname(args[1]);" +
+          " fs.rmSync(d + '/metadata.json', {force: true}); fs.rmSync(d + '/config.yaml', {force: true}); process.exit(9); }",
       });
+      const store = () =>
+        new BeadsStore({ path: db, binary: recorder.binary, prefix: "fresh" });
       await expect(
-        new BeadsStore({
-          path: db,
-          binary: recorder.binary,
-          prefix: "fresh",
-        }).create({ id: "a", title: "A" }),
+        store().create({ id: "a", title: "A" }),
       ).rejects.toBeTruthy();
       expect(existsSync(db)).toBe(true);
-      const store = new BeadsStore({
-        path: db,
-        binary: recorder.binary,
-        prefix: "fresh",
-      });
       await expect(
-        store.create({ id: "a", title: "A" }),
+        store().create({ id: "a", title: "A" }),
       ).resolves.toMatchObject({ id: "a" });
-      const raw = (await import("node:child_process")).execFileSync(
-        "br",
-        ["--db", db, "info", "--json"],
-        { encoding: "utf8" },
+      expect(existsSync(join(dirname(db), "metadata.json"))).toBe(true);
+      const info = JSON.parse(
+        execFileSync("br", ["--db", db, "info", "--json"], {
+          encoding: "utf8",
+        }),
+      ) as { config: { issue_prefix: string } };
+      expect(info.config.issue_prefix).toBe("fresh");
+    }, 60_000);
+
+    it("only initializes the layout br initializes, and ignores inherited redirects", async () => {
+      const custom = join(ws.dir, "other", ".beads", "custom.db");
+      await expect(
+        new BeadsStore({ path: custom }).create({ id: "a", title: "A" }),
+      ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+      expect(existsSync(join(ws.dir, "other", ".beads", "beads.db"))).toBe(
+        false,
       );
+      expect(existsSync(custom)).toBe(false);
+      const elsewhere = join(ws.dir, "elsewhere");
+      mkdirSync(elsewhere);
+      const db = join(ws.dir, "fresh", ".beads", "beads.db");
+      const saved = process.env.BEADS_CACHE_DIR;
+      process.env.BEADS_CACHE_DIR = elsewhere;
+      try {
+        await new BeadsStore({ path: db, prefix: "fresh" }).create({
+          id: "a",
+          title: "A",
+        });
+      } finally {
+        if (saved === undefined) delete process.env.BEADS_CACHE_DIR;
+        else process.env.BEADS_CACHE_DIR = saved;
+      }
+      expect(existsSync(db)).toBe(true);
+      // br may keep other state there, but never the database itself.
       expect(
-        (JSON.parse(raw) as { config: { issue_prefix: string } }).config
-          .issue_prefix,
-      ).toBe("fresh");
+        readdirSync(elsewhere).filter((name) => name.endsWith(".db")),
+      ).toEqual([]);
+    }, 60_000);
+
+    it("re-verifies a database replaced after it was marked ready", async () => {
+      const db = join(ws.dir, "fresh", ".beads", "beads.db");
+      await new BeadsStore({ path: db, prefix: "fresh" }).create({
+        id: "a",
+        title: "A",
+      });
+      for (const name of readdirSync(dirname(db)))
+        if (
+          name.startsWith("beads.db") &&
+          !name.endsWith(".tasks-axi-ready") &&
+          !name.endsWith(".lock")
+        )
+          rmSync(join(dirname(db), name), { force: true });
+      const before = readFileSync(db + ".tasks-axi-ready", "utf8");
+      const store = new BeadsStore({ path: db, prefix: "fresh" });
+      await expect(
+        store.create({ id: "b", title: "B" }),
+      ).resolves.toMatchObject({ id: "b" });
+      // The marker was re-earned for the new database file, not trusted.
+      const after = readFileSync(db + ".tasks-axi-ready", "utf8");
+      expect(after).not.toBe(before);
+      const stat = statSync(db, { bigint: true });
+      expect(after).toBe(
+        stat.dev + ":" + stat.ino + ":" + stat.birthtimeNs + "\n",
+      );
     }, 60_000);
 
     it("transfers wait for a held lock on either side and move nothing past the deadline", async () => {
@@ -232,7 +291,7 @@ describe.skipIf(!hasBr || process.platform === "win32")(
           holding();
           return new Promise<void>((r) => (release = r));
         },
-        { recover: {} },
+        { kernel: true },
       );
       await held;
       try {
@@ -261,6 +320,31 @@ describe.skipIf(!hasBr || process.platform === "win32")(
         new BeadsStore({ path: alias }).transferMany(["x"], store),
       ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
       expect((await store.list({})).total).toBe(1);
+    }, 30_000);
+
+    it("show reads the task and the graph it is shown against in one snapshot", async () => {
+      const store = new BeadsStore({ path: ws.path });
+      await store.create({ id: "blocker", title: "Blocker" });
+      await store.create({
+        id: "x",
+        title: "X",
+        deps: [{ type: "blocked-by", id: "blocker" }],
+      });
+      const recorder = recordBr(ws.dir, ws.path);
+      const context = resolveTasksContext({
+        backend: "beads",
+        file: ws.path,
+        cwd: ws.dir,
+        home: ws.dir,
+        env: { TASKS_AXI_BEADS_BINARY: recorder.binary },
+      });
+      expect(await showCommand(["x"], context)).toContain("blocker");
+      const reads = readFileSync(recorder.log, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => (JSON.parse(line) as string[])[2])
+        .filter((command) => command === "list" || command === "show");
+      expect(reads).toEqual(["list"]);
     }, 30_000);
   },
 );

@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -121,7 +122,10 @@ mirror_archive = "mirror/done-archive.md"
         }).get("existing-q1")
       )?.title,
     ).toBe("existing task");
-    expect(existsSync(`${ws.path}.lock`)).toBe(false);
+    // Released: a fresh flock attempt succeeds at once.
+    expect(spawnSync("flock", ["-n", `${ws.path}.lock`, "true"]).status).toBe(
+      0,
+    );
     expect(guarded.capabilities().prune).toBe(false);
   }, 30_000);
 

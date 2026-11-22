@@ -43,7 +43,7 @@ describe.skipIf(!hasBr)("beads concurrency and write cost", () => {
       script,
       "import { withLock } from " +
         JSON.stringify(lockModule) +
-        ";\nawait withLock(process.argv[2], () => process.exit(9), { recover: {} });\n",
+        ";\nawait withLock(process.argv[2], () => process.exit(9), { kernel: true });\n",
     );
     const code = await new Promise((done) =>
       spawn(process.execPath, ["--import", "tsx", script, workspace.path], {
@@ -51,7 +51,10 @@ describe.skipIf(!hasBr)("beads concurrency and write cost", () => {
       }).on("close", done),
     );
     expect(code).toBe(9);
-    expect(readFileSync(workspace.path + ".lock", "utf8")).toContain("pid=");
+    // The kernel released it when the writer died; nothing was cleaned up.
+    expect(readFileSync(workspace.path + ".lock", "utf8")).toBe(
+      "tasks-axi-lock/flock-v1\n",
+    );
     await expect(
       mirrored().create({ id: "after-crash", title: "After crash" }),
     ).resolves.toMatchObject({ id: "after-crash" });

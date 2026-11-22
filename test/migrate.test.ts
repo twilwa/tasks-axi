@@ -520,7 +520,10 @@ describe.skipIf(!hasBr)("markdown to beads migration", () => {
           (output.ms_per_row as number) - (output.elapsed_ms as number) / total,
         ),
       ).toBeLessThanOrEqual(1);
-      expect(existsSync(ws.path + ".lock")).toBe(false);
+      // Nobody removed the lock by hand; the kernel freed it when the CLI died.
+      expect(readFileSync(ws.path + ".lock", "utf8")).toBe(
+        "tasks-axi-lock/flock-v1\n",
+      );
       const migrated = await resolveTasksContext({
         backend: "beads",
       }).store.list({});
