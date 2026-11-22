@@ -8,13 +8,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, statSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import {
-  AxiError,
-  type ErrorCode,
-  isIndeterminate,
-  markIndeterminate,
-  unsupported,
-} from "../errors.js";
+import { AxiError, type ErrorCode, unsupported } from "../errors.js";
 import { validateId } from "../id.js";
 import type {
   Dep,
@@ -415,24 +409,15 @@ function runBr(
     child.on("close", (code, signal) => {
       clearTimeout(timer);
       if (failure) {
-        reject(markIndeterminate(failure));
+        reject(failure);
         return;
       }
       if (timedOut) {
         reject(
-          markIndeterminate(
-            new BrFailure(
-              "TIMEOUT",
-              `br timed out after ${timeoutMs}ms; reread before retrying`,
-            ),
+          new BrFailure(
+            "TIMEOUT",
+            `br timed out after ${timeoutMs}ms; reread before retrying`,
           ),
-        );
-        return;
-      }
-      if (signal !== null) {
-        // Killed from outside: whatever it started may still be finishing.
-        reject(
-          markIndeterminate(new BrFailure("KILLED", `br killed by ${signal}`)),
         );
         return;
       }
@@ -596,14 +581,13 @@ export class BeadsStore implements Store {
               this.doneKeep,
             );
           } catch (error) {
-            const failure = new AxiError(
+            throw new AxiError(
               `Beads write succeeded, but markdown mirror refresh failed: ${error instanceof Error ? error.message : String(error)}`,
               "UNKNOWN",
               [
                 "The database remains authoritative; fix the mirror path and run tasks-axi render --backend beads",
               ],
             );
-            throw isIndeterminate(error) ? markIndeterminate(failure) : failure;
           }
         }
         return result;
@@ -786,8 +770,7 @@ export class BeadsStore implements Store {
           code = "CONFLICT";
         else if (/LOCK|BUSY/.test(error.nativeCode)) code = "LOCKED";
       }
-      const failure = new AxiError(message, code);
-      throw isIndeterminate(error) ? markIndeterminate(failure) : failure;
+      throw new AxiError(message, code);
     }
   }
 
@@ -1412,9 +1395,6 @@ export class BeadsStore implements Store {
       try {
         await this.call(["delete", String(found.bead.id), "--force"]);
       } catch (error) {
-        // The delete may still land: issue nothing more against this row.
-        // pendingDelete keeps it addressable, so a retry can finish it.
-        if (isIndeterminate(error)) throw error;
         await this.call([
           "update",
           String(found.bead.id),

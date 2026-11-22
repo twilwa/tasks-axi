@@ -91,26 +91,6 @@ export function partialMoveError(
   );
 }
 
-const INDETERMINATE = Symbol.for("tasks-axi.indeterminate");
-
-/**
- * Mark an error whose native side effect is unknown: the call timed out, was
- * killed, or failed after it started, so a process that inherited its
- * descriptors may still be writing. Nothing may compensate for it in-process.
- */
-export function markIndeterminate<E extends object>(error: E): E {
-  (error as Record<symbol, unknown>)[INDETERMINATE] = true;
-  return error;
-}
-
-export function isIndeterminate(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    (error as Record<symbol, unknown>)[INDETERMINATE] === true
-  );
-}
-
 /**
  * mv between two stores where either is beads. Refused before any lock, read
  * or write: receiving into beads is a separate, later change.

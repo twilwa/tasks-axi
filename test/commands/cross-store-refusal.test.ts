@@ -73,12 +73,19 @@ function cli(args: string[], env: NodeJS.ProcessEnv, cwd: string) {
 }
 
 type Side = "markdown" | "beads";
-const CASES: { from: Side; to: Side; ids: string[]; fresh?: boolean }[] = [
+const CASES: {
+  from: Side;
+  to: Side;
+  ids: string[];
+  fresh?: boolean;
+  freshSource?: boolean;
+}[] = [
   { from: "markdown", to: "beads", ids: ["root"] },
   { from: "markdown", to: "beads", ids: ["work", "root"] },
   { from: "markdown", to: "beads", ids: ["work", "root"], fresh: true },
   { from: "beads", to: "markdown", ids: ["root"] },
   { from: "beads", to: "markdown", ids: ["work", "root"] },
+  { from: "beads", to: "markdown", ids: ["root"], freshSource: true },
   { from: "beads", to: "beads", ids: ["root"] },
   { from: "beads", to: "beads", ids: ["work", "root"] },
   { from: "beads", to: "beads", ids: ["work", "root"], fresh: true },
@@ -86,8 +93,8 @@ const CASES: { from: Side; to: Side; ids: string[]; fresh?: boolean }[] = [
 
 describe.skipIf(!hasBr)("cross-store mv is refused", () => {
   it.each(CASES)(
-    "$from -> $to with $ids (fresh destination: $fresh)",
-    async ({ from, to, ids, fresh }) => {
+    "$from -> $to with $ids (fresh destination: $fresh, fresh source: $freshSource)",
+    async ({ from, to, ids, fresh, freshSource }) => {
       const home = mkdtempSync(join(tmpdir(), "tasks-axi-refuse-"));
       const workspaces: { cleanup(): void }[] = [];
       try {
@@ -106,9 +113,21 @@ describe.skipIf(!hasBr)("cross-store mv is refused", () => {
             writeFileSync(path, role === "src" ? SEED : EMPTY);
             return { dir, file: path, arg: path };
           }
+          if (role === "src" && freshSource) {
+            const dir = join(home, "src-beads");
+            return {
+              dir,
+              file: join(dir, ".beads", "beads.db"),
+              arg: join(dir, ".beads"),
+            };
+          }
           if (role === "dst" && fresh) {
             const dir = join(home, "dst-beads");
-            return { dir, file: join(dir, ".beads", "beads.db"), arg: join(dir, ".beads") };
+            return {
+              dir,
+              file: join(dir, ".beads", "beads.db"),
+              arg: join(dir, ".beads"),
+            };
           }
           const ws = makeBeadsWorkspace();
           workspaces.push(ws);
@@ -153,6 +172,7 @@ describe.skipIf(!hasBr)("cross-store mv is refused", () => {
         expect(existsSync(calls), "br was invoked").toBe(false);
         expect([snapshot(src.dir), snapshot(dst.dir)]).toEqual(before);
         if (fresh) expect(existsSync(dst.dir)).toBe(false);
+        if (freshSource) expect(existsSync(src.dir)).toBe(false);
       } finally {
         for (const ws of workspaces) ws.cleanup();
         rmSync(home, { recursive: true, force: true });
@@ -192,7 +212,9 @@ describe("store-level cross-store transfers are refused", () => {
       const db = join(home, "dst", ".beads", "beads.db");
       const beads = new BeadsStore({ path: db });
       const before = snapshot(home);
-      await expect(markdown.transferMany(["root"], beads)).rejects.toMatchObject({
+      await expect(
+        markdown.transferMany(["root"], beads),
+      ).rejects.toMatchObject({
         code: "UNSUPPORTED",
         message: expect.stringContaining(
           "cross-store moves are not supported yet",
