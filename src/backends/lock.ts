@@ -186,6 +186,7 @@ const FLOCK_TIMEOUT_EXIT = 75;
 export function reservedPath(path: string, strict = true): string | undefined {
   const name = basename(path);
   if (name.endsWith(".tasks-axi-ready")) return "a beads ready marker";
+  if (name.endsWith(".tasks-axi-move")) return "a tasks-axi move record";
   if (!name.endsWith(".lock")) return undefined;
   if (strict) return "a tasks-axi lock file";
   try {

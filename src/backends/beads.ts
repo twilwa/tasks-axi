@@ -607,13 +607,14 @@ export class BeadsStore implements Store {
               this.doneKeep,
             );
           } catch (error) {
-            throw new AxiError(
+            const failure = new AxiError(
               `Beads write succeeded, but markdown mirror refresh failed: ${error instanceof Error ? error.message : String(error)}`,
               "UNKNOWN",
               [
                 "The database remains authoritative; fix the mirror path and run tasks-axi render --backend beads",
               ],
             );
+            throw isIndeterminate(error) ? markIndeterminate(failure) : failure;
           }
         }
         return result;
@@ -1426,6 +1427,9 @@ export class BeadsStore implements Store {
       try {
         await this.call(["delete", String(found.bead.id), "--force"]);
       } catch (error) {
+        // The delete may still land: issue nothing more against this row.
+        // pendingDelete keeps it addressable, so a retry can finish it.
+        if (isIndeterminate(error)) throw error;
         await this.call([
           "update",
           String(found.bead.id),

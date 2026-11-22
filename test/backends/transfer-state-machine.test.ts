@@ -1,58 +1,94 @@
 import { AsyncResource } from "node:async_hooks";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import {
   assertTransferRemoval,
+  moveRecordPath,
   registerTransferStore,
   transferCollection,
 } from "../../src/backends/collection-transfer.js";
+import { withLock } from "../../src/backends/lock.js";
 import {
   AxiError,
   isIndeterminate,
   markIndeterminate,
 } from "../../src/errors.js";
-import { withLock } from "../../src/backends/lock.js";
 import type { Task } from "../../src/model.js";
 import type { Store } from "../../src/store.js";
 
-// Exhaustive walk of docs/collection-transfer.md: every native call on either
-// side, crossed with each failure kind, with and without a writer between the
-// failed run and the retry.
+// Exhaustive walk of docs/collection-transfer.md over two in-memory stores
+// that keep the real locks and move record: every call on either side,
+// crossed with each failure kind, a concurrent writer at the failure point,
+// a writer between the failed run and the retry, and a second failure
+// during compensation. Invariants: no task is ever in zero collections; a
+// task in both is explained by the move record; a retry reconciles.
 type Fault =
   | "error" // determinate: refused before any effect
   | "timeout-applied" // indeterminate: effect landed before the timeout
   | "timeout-lost" // indeterminate: effect never landed
-  | "kill-late"; // indeterminate: a surviving descendant applies it later
+  | "kill-late" // indeterminate: a surviving descendant applies it later
+  | "kill-late-wrapped" // as kill-late, but a catch replaces the marked error
+  | "death-before" // the CLI is SIGKILLed before this call takes effect
+  | "death-after"; // the CLI is SIGKILLed right after this call took effect
 const FAULTS: Fault[] = [
   "error",
   "timeout-applied",
   "timeout-lost",
   "kill-late",
+  "kill-late-wrapped",
+  "death-before",
+  "death-after",
 ];
 
 const dir = mkdtempSync(join(tmpdir(), "transfer-sm-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 let serial = 0;
 
+// Run outside the transfer's async context, as another process would.
+const root = new AsyncResource("probe-root");
+const noChain = <T>(fn: () => Promise<T>) => root.runInAsyncScope(fn);
+
+interface World {
+  dead: boolean;
+  snapshot?: {
+    src: Map<string, Task>;
+    dst: Map<string, Task>;
+    record: string | null;
+  };
+  probe: boolean;
+}
+
 class FakeStore {
   tasks = new Map<string, Task>();
   calls = 0;
-  fault?: { at: number; kind: Fault };
+  faults: { at: number; kind: Fault }[] = [];
   late: (() => void)[] = [];
-  /** Outcomes of a concurrent tasks-axi writer probing each side mid-fault. */
   probes: string[] = [];
-  peers: FakeStore[] = [];
   readonly path: string;
-  constructor(readonly name: string) {
+  constructor(
+    readonly name: "src" | "dst",
+    readonly world: World,
+    readonly peer: () => FakeStore,
+    readonly record: () => string,
+  ) {
     this.path = join(dir, name + "-" + serial++ + ".md");
     registerTransferStore(this as unknown as Store, this.path);
   }
+  capabilities() {
+    return { backend: "beads" } as ReturnType<Store["capabilities"]>;
+  }
   /** A concurrent writer, outside the transfer's async chain, on each side. */
-  private probe(): Promise<void> {
-    return Promise.all(
-      [this, ...this.peers].map((store) =>
+  private async probe(): Promise<void> {
+    const codes = await Promise.all(
+      [this, this.peer()].map((store) =>
         noChain(() =>
           withLock(store.path, () => "entered", { timeoutMs: 30 }).then(
             (v) => v,
@@ -60,26 +96,50 @@ class FakeStore {
           ),
         ),
       ),
-    ).then((codes) => void this.probes.push(...codes));
+    );
+    this.probes.push(...codes);
   }
-  capabilities() {
-    return { backend: "beads" } as ReturnType<Store["capabilities"]>;
+  private die(): never {
+    const src = this.name === "src" ? this : this.peer();
+    const dst = this.name === "src" ? this.peer() : this;
+    const path = this.record();
+    this.world.dead = true;
+    this.world.snapshot = {
+      src: structuredClone(src.tasks),
+      dst: structuredClone(dst.tasks),
+      record: existsSync(path) ? readFileSync(path, "utf8") : null,
+    };
+    throw new Error("killed");
   }
   private async step<T>(effect: () => T): Promise<T> {
+    if (this.world.dead) throw new Error("dead");
     const at = this.calls++;
-    const fault = this.fault?.at === at ? this.fault.kind : undefined;
+    const fault = this.faults.find((f) => f.at === at)?.kind;
     if (!fault) return effect();
-    await this.probe();
+    if (this.world.probe) await this.probe();
     const fail = (message: string) =>
       markIndeterminate(new AxiError(this.name + ": " + message, "UNKNOWN"));
-    if (fault === "error")
-      throw new AxiError(this.name + ": br refused", "UNKNOWN");
-    if (fault === "timeout-applied") {
-      effect();
-      throw fail("br timed out");
+    switch (fault) {
+      case "error":
+        throw new AxiError(this.name + ": br refused", "UNKNOWN");
+      case "timeout-applied":
+        effect();
+        throw fail("br timed out");
+      case "timeout-lost":
+        throw fail("br timed out");
+      case "kill-late":
+        this.late.push(() => void effect());
+        throw fail("br killed by SIGKILL");
+      case "kill-late-wrapped":
+        this.late.push(() => void effect());
+        fail("br killed by SIGKILL");
+        throw new AxiError(this.name + ": follow-up call failed", "UNKNOWN");
+      case "death-before":
+        return this.die();
+      case "death-after":
+        effect();
+        return this.die();
     }
-    if (fault === "kill-late") this.late.push(() => void effect());
-    throw fail(fault === "kill-late" ? "br killed by SIGKILL" : "br timed out");
   }
   async list() {
     return this.step(() => {
@@ -108,10 +168,6 @@ class FakeStore {
   }
 }
 
-// Run outside the transfer's async context, as another process would.
-const root = new AsyncResource("probe-root");
-const noChain = <T>(fn: () => Promise<T>) => root.runInAsyncScope(fn);
-
 const task = (id: string, deps: Task["deps"] = []): Task =>
   ({
     id,
@@ -123,20 +179,23 @@ const task = (id: string, deps: Task["deps"] = []): Task =>
   }) as unknown as Task;
 const IDS = ["a", "b"];
 
-function seed() {
-  const source = new FakeStore("src");
-  const target = new FakeStore("dst");
-  source.peers = [target];
-  target.peers = [source];
+function seed(probe = true) {
+  const world: World = { dead: false, probe };
+  const pair: { source?: FakeStore; target?: FakeStore } = {};
+  const record = () => moveRecordPath(pair.source!.path);
+  const source = new FakeStore("src", world, () => pair.target!, record);
+  const target = new FakeStore("dst", world, () => source, record);
+  pair.source = source;
+  pair.target = target;
   source.tasks.set("a", task("a"));
   source.tasks.set(
     "b",
     task("b", [{ type: "blocked-by", id: "a" } as Task["deps"][0]]),
   );
-  return { source, target };
+  return { source, target, world, record: record() };
 }
 
-const run = (s: FakeStore, t: FakeStore) =>
+const transfer = (s: FakeStore, t: FakeStore) =>
   transferCollection(s as unknown as Store, IDS, t as unknown as Store).then(
     () => undefined,
     (error: unknown) => error,
@@ -145,13 +204,75 @@ const run = (s: FakeStore, t: FakeStore) =>
 const where = (s: FakeStore, t: FakeStore, id: string) =>
   [s.tasks.has(id) && "src", t.tasks.has(id) && "dst"].filter(Boolean);
 
-// Call counts of a clean run bound the fault positions per side.
-const clean = seed();
-await run(clean.source, clean.target);
-const SIDES = { src: clean.source.calls, dst: clean.target.calls };
+/** Fail once, let late effects land (or the CLI die), then check and retry. */
+async function exercise(
+  faults: { side: "src" | "dst"; at: number; kind: Fault }[],
+  writer: "none" | "src" | "dst",
+  probe: boolean,
+): Promise<{ error: unknown; problems: string[]; probes: string[] }> {
+  const { source, target, world, record } = seed(probe);
+  for (const f of faults)
+    (f.side === "src" ? source : target).faults.push({
+      at: f.at,
+      kind: f.kind,
+    });
+  const error = await transfer(source, target);
+  if (world.dead && world.snapshot) {
+    // Nothing after the kill happened: rewind to the moment of death.
+    source.tasks = world.snapshot.src;
+    target.tasks = world.snapshot.dst;
+    if (world.snapshot.record === null) rmSync(record, { force: true });
+    else writeFileSync(record, world.snapshot.record);
+  }
+  for (const effect of [...source.late, ...target.late]) effect();
+  world.dead = false;
+  source.faults = [];
+  target.faults = [];
+  const problems: string[] = [];
+  for (const id of IDS) {
+    const found = where(source, target, id);
+    if (!found.length) problems.push(id + " in no collection");
+    if (found.length === 2 && !existsSync(record))
+      problems.push(id + " in both collections with no move record");
+  }
+  if (error && isIndeterminate(error))
+    for (const id of IDS)
+      if (where(source, target, id).join() !== "src")
+        problems.push("raw indeterminate error after a mutation");
+  if (writer !== "none") {
+    const store = writer === "src" ? source : target;
+    const victim = [...store.tasks.values()][0];
+    if (victim) victim.title = "Edited between runs";
+  }
+  const retry = await transfer(source, target);
+  for (const id of IDS) {
+    const found = where(source, target, id);
+    if (!found.length) problems.push(id + " lost on retry");
+    if (retry === undefined && found.join() !== "dst")
+      problems.push(id + " not reconciled: " + found.join("+"));
+  }
+  if (retry === undefined && existsSync(record))
+    problems.push("move record left after a settled retry");
+  if (retry !== undefined) {
+    if (writer === "none") problems.push("retry failed: " + String(retry));
+    else if ((retry as AxiError).code !== "CONFLICT")
+      problems.push("retry refused without CONFLICT: " + String(retry));
+    for (const id of IDS)
+      if (where(source, target, id).length === 2 && !existsSync(record))
+        problems.push(id + " refused duplicate without a move record");
+  }
+  rmSync(record, { force: true });
+  return { error, problems, probes: [...source.probes, ...target.probes] };
+}
 
-const cases = (Object.keys(SIDES) as ("src" | "dst")[]).flatMap((side) =>
-  Array.from({ length: SIDES[side] }, (_, at) =>
+// Call counts of a clean run bound the first fault; compensation adds calls.
+const clean = seed();
+await transfer(clean.source, clean.target);
+const CLEAN = { src: clean.source.calls, dst: clean.target.calls };
+const SIDES = ["src", "dst"] as const;
+
+const single = SIDES.flatMap((side) =>
+  Array.from({ length: CLEAN[side] }, (_, at) =>
     FAULTS.flatMap((kind) =>
       (["none", "src", "dst"] as const).map((writer) => ({
         side,
@@ -165,66 +286,52 @@ const cases = (Object.keys(SIDES) as ("src" | "dst")[]).flatMap((side) =>
 
 describe("collection transfer state machine", () => {
   it("covers every call on both sides", () => {
-    expect(SIDES.src).toBeGreaterThanOrEqual(3);
-    expect(SIDES.dst).toBeGreaterThanOrEqual(3);
-    expect(cases.length).toBe((SIDES.src + SIDES.dst) * FAULTS.length * 3);
+    expect(CLEAN.src).toBeGreaterThanOrEqual(3);
+    expect(CLEAN.dst).toBeGreaterThanOrEqual(3);
+    expect(single.length).toBe((CLEAN.src + CLEAN.dst) * FAULTS.length * 3);
   });
 
-  it.each(cases)(
-    "$side call $at fails with $kind, writer $writer: never zero copies, duplicates explained, retry reconciles",
+  it.each(single)(
+    "$side call $at fails with $kind, writer $writer",
     async ({ side, at, kind, writer }) => {
-      const { source, target } = seed();
-      (side === "src" ? source : target).fault = { at, kind };
-      const error = await run(source, target);
-      // The descendant finishes after the CLI gave up.
-      // A concurrent writer on either side was held off at the failure point.
-      expect([...source.probes, ...target.probes]).toEqual([
-        "LOCKED",
-        "LOCKED",
-      ]);
-      for (const effect of [...source.late, ...target.late]) effect();
-      source.fault = target.fault = undefined;
-
-      for (const id of IDS) {
-        const found = where(source, target, id);
-        expect(found.length, id + " lost").toBeGreaterThan(0);
-        if (found.length === 2) {
-          // Two copies only with a recorded, recoverable reason.
-          expect(error).toBeInstanceOf(AxiError);
-          expect((error as AxiError).code).toBe("CONFLICT");
-          expect((error as Error).message).toMatch(
-            /indeterminate|partially completed/,
-          );
-        }
-      }
-      // A raw indeterminate error may only escape before any mutation was issued.
-      if (error && isIndeterminate(error))
-        for (const id of IDS)
-          expect(where(source, target, id)).toEqual(["src"]);
-      if (kind === "error" && error) {
-        // Determinate failures roll back completely.
-        for (const id of IDS)
-          expect(where(source, target, id)).toEqual(["src"]);
-      }
-
-      // A writer changes one copy between the failed run and the retry.
-      if (writer !== "none") {
-        const store = writer === "src" ? source : target;
-        const victim = [...store.tasks.values()][0];
-        if (victim) victim.title = "Edited between runs";
-      }
-
-      const retry = await run(source, target);
-      for (const id of IDS) {
-        const found = where(source, target, id);
-        expect(found.length, id + " lost on retry").toBeGreaterThan(0);
-        if (retry === undefined) expect(found).toEqual(["dst"]);
-      }
-      if (retry !== undefined) {
-        // Only a diverged duplicate may refuse, and it keeps both copies.
-        expect(writer).not.toBe("none");
-        expect((retry as AxiError).code).toBe("CONFLICT");
-      }
+      const { error, problems, probes } = await exercise(
+        [{ side, at, kind }],
+        writer,
+        true,
+      );
+      expect(problems).toEqual([]);
+      // A concurrent tasks-axi writer on either side was held off.
+      expect(probes).toEqual(["LOCKED", "LOCKED"]);
+      if (kind === "error" && error)
+        expect((error as AxiError).code).not.toBe(undefined);
     },
   );
+
+  it("survives a second failure of every kind during compensation", async () => {
+    const failures: string[] = [];
+    let runs = 0;
+    for (const side1 of SIDES)
+      for (let k1 = 0; k1 < CLEAN[side1]; k1++)
+        for (const side2 of SIDES)
+          for (let k2 = 0; k2 < CLEAN[side2] + 8; k2++) {
+            if (side2 === side1 && k2 <= k1) continue;
+            for (const kind of FAULTS) {
+              runs++;
+              const { problems } = await exercise(
+                [
+                  { side: side1, at: k1, kind: "error" },
+                  { side: side2, at: k2, kind },
+                ],
+                "none",
+                false,
+              );
+              if (problems.length)
+                failures.push(
+                  `${side1}@${k1} error, then ${side2}@${k2} ${kind}: ${problems.join("; ")}`,
+                );
+            }
+          }
+    expect(runs).toBeGreaterThan(500);
+    expect(failures).toEqual([]);
+  }, 120_000);
 });

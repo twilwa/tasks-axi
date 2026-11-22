@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { AxiError, exitCodeForError } from "axi-sdk-js";
 import type { Dep } from "./model.js";
 import {
@@ -94,12 +95,28 @@ export function partialMoveError(
 const INDETERMINATE = Symbol.for("tasks-axi.indeterminate");
 
 /**
+ * Sticky record for one multi-step operation (a transfer): set whenever any
+ * native call inside it had an unknown outcome, even if a later catch wraps
+ * or replaces that error.
+ */
+const ambiguity = new AsyncLocalStorage<{ seen: boolean }>();
+
+export function trackAmbiguity<T>(
+  fn: (state: { readonly seen: boolean }) => Promise<T>,
+): Promise<T> {
+  const state = { seen: false };
+  return ambiguity.run(state, () => fn(state));
+}
+
+/**
  * Mark an error whose native side effect is unknown: the call timed out, was
  * killed, or failed after it started, so a process that inherited its
  * descriptors may still be writing. Nothing may compensate for it in-process.
  */
 export function markIndeterminate<E extends object>(error: E): E {
   (error as Record<symbol, unknown>)[INDETERMINATE] = true;
+  const state = ambiguity.getStore();
+  if (state) state.seen = true;
   return error;
 }
 
@@ -119,6 +136,7 @@ export function indeterminateMoveError(
   id: string,
   cause: unknown,
   destination: string,
+  record?: string,
 ): AxiError {
   return new AxiError(
     `Move of "${id}" is indeterminate: a br call did not finish cleanly, so no copy was rolled back`,
@@ -126,6 +144,9 @@ export function indeterminateMoveError(
     [
       `Rerun the same mv once no br process is running on either backlog; it finishes or reconciles the move`,
       `Do not delete copies in ${destination}; they may be the only surviving tasks`,
+      ...(record
+        ? [`The move is recorded in ${record} until a rerun settles it`]
+        : []),
       `Cause: ${describeError(cause)}`,
     ],
   );
