@@ -1,4 +1,10 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -55,6 +61,12 @@ describe("lock and ready-marker paths are reserved across stores", () => {
         expect(() => new MarkdownStore(options)).toThrow(
           /names a live beads lock file/,
         );
+      // A symlink to the live lock is the lock.
+      const alias = join(dir, "alias.md");
+      symlinkSync(lock, alias);
+      expect(() => new MarkdownStore({ path: alias })).toThrow(
+        /names a live beads lock file/,
+      );
       expect(readFileSync(lock, "utf8")).toBe(before);
     },
   );

@@ -1,13 +1,14 @@
 {
   "build": "main a0c217c (pre-PR), dist/bin/tasks-axi.js",
   "recorded": "2026-11-22",
+  "note": "today's date is normalized to <today>; regenerate only from main",
   "results": {
     "add": {
       "code": 0,
-      "out": "ok: added delta -> Queued\ntask:\n  id: delta\n  title: New task\n  state: queued\n  blocked: no\n  blocked_by: none\n  held: no\n  hold_reason: \"-\"\n  hold_kind: \"-\"\n  hold_until: \"-\"\n  kind: task\n  repo: \"-\"\n  priority: \"-\"\n  created: 2026-11-21\n  closed: \"-\"\n  deps: none\n  links: none\n  body: \"\"\nhelp[2]:\n  - Run `tasks-axi start delta --file=<dir>/backlog.md` to move it to in flight\n  - Run `tasks-axi block delta --by <other> --file=<dir>/backlog.md` to record a dependency\n",
+      "out": "ok: added delta -> Queued\ntask:\n  id: delta\n  title: New task\n  state: queued\n  blocked: no\n  blocked_by: none\n  held: no\n  hold_reason: \"-\"\n  hold_kind: \"-\"\n  hold_until: \"-\"\n  kind: task\n  repo: \"-\"\n  priority: \"-\"\n  created: <today>\n  closed: \"-\"\n  deps: none\n  links: none\n  body: \"\"\nhelp[2]:\n  - Run `tasks-axi start delta --file=<dir>/backlog.md` to move it to in flight\n  - Run `tasks-axi block delta --by <other> --file=<dir>/backlog.md` to record a dependency\n",
       "files": {
-        "main": "538dc1d153813b07",
-        "other": "0f9bf893dcf0c792"
+        "main": "# Backlog\n\n## In flight\n\n- [ ] live - Something running (repo: demo) (since 2026-01-02)\n\n## Queued\n\n- [ ] alpha - First queued (repo: demo) (priority: 1)\n  A body line.\n\n  Another paragraph.\n\n- [ ] beta - Second queued blocked-by: alpha\n- [ ] gamma - Third queued (kind: docs)\n\n- [ ] delta - New task (since <today>)\n## Done\n\n- [x] old - Finished thing (done 2026-01-01)\n",
+        "other": "# Backlog\n\n## Queued\n\n"
       },
       "waitMs": 0
     },
@@ -15,8 +16,8 @@
       "code": 0,
       "out": "ok: start alpha -> In flight\nhelp[1]:\n  - Run `tasks-axi done alpha --pr <url> --file=<dir>/backlog.md` when it ships\n",
       "files": {
-        "main": "5552e6a28a8e5ab8",
-        "other": "0f9bf893dcf0c792"
+        "main": "# Backlog\n\n## In flight\n- [ ] alpha - First queued (repo: demo) (priority: 1) (since <today>)\n  A body line.\n\n  Another paragraph.\n\n- [ ] live - Something running (repo: demo) (since 2026-01-02)\n\n## Queued\n\n- [ ] beta - Second queued blocked-by: alpha\n- [ ] gamma - Third queued (kind: docs)\n\n## Done\n\n- [x] old - Finished thing (done 2026-01-01)\n",
+        "other": "# Backlog\n\n## Queued\n\n"
       },
       "waitMs": 0
     },
@@ -24,8 +25,8 @@
       "code": 0,
       "out": "ok: done live -> Done\nhelp[1]:\n  - Run `tasks-axi ready --file=<dir>/backlog.md` to dispatch work unblocked by this\n",
       "files": {
-        "main": "e44ee9326c954fb6",
-        "other": "0f9bf893dcf0c792"
+        "main": "# Backlog\n\n## In flight\n\n## Queued\n\n- [ ] alpha - First queued (repo: demo) (priority: 1)\n  A body line.\n\n  Another paragraph.\n\n- [ ] beta - Second queued blocked-by: alpha\n- [ ] gamma - Third queued (kind: docs)\n\n## Done\n- [x] live - Something running (repo: demo) (done <today>)\n\n- [x] old - Finished thing (done 2026-01-01)\n",
+        "other": "# Backlog\n\n## Queued\n\n"
       },
       "waitMs": 0
     },
@@ -33,8 +34,8 @@
       "code": 0,
       "out": "ok: updated alpha (body)\ntask:\n  id: alpha\n  title: First queued\n  state: queued\n  blocked: no\n  blocked_by: none\n  held: no\n  hold_reason: \"-\"\n  hold_kind: \"-\"\n  hold_until: \"-\"\n  kind: task\n  repo: demo\n  priority: 1\n  created: \"-\"\n  closed: \"-\"\n  deps: none\n  links: none\n  body: Replaced body\nhelp[1]:\n  - Run `tasks-axi show alpha --full --file=<dir>/backlog.md` to see the result\n",
       "files": {
-        "main": "8ef8017a1fe2c319",
-        "other": "0f9bf893dcf0c792"
+        "main": "# Backlog\n\n## In flight\n\n- [ ] live - Something running (repo: demo) (since 2026-01-02)\n\n## Queued\n\n- [ ] alpha - First queued (repo: demo) (priority: 1)\n  Replaced body\n- [ ] beta - Second queued blocked-by: alpha\n- [ ] gamma - Third queued (kind: docs)\n\n## Done\n\n- [x] old - Finished thing (done 2026-01-01)\n",
+        "other": "# Backlog\n\n## Queued\n\n"
       },
       "waitMs": 0
     },
@@ -42,8 +43,8 @@
       "code": 0,
       "out": "ok: block gamma -> blocked-by alpha\nhelp[2]:\n  - Run `tasks-axi unblock gamma --by <other> --file=<dir>/backlog.md` to clear it\n  - Run `tasks-axi ready --file=<dir>/backlog.md` to see what is still dispatchable\n",
       "files": {
-        "main": "f70bbd4134c2f596",
-        "other": "0f9bf893dcf0c792"
+        "main": "# Backlog\n\n## In flight\n\n- [ ] live - Something running (repo: demo) (since 2026-01-02)\n\n## Queued\n\n- [ ] alpha - First queued (repo: demo) (priority: 1)\n  A body line.\n\n  Another paragraph.\n\n- [ ] beta - Second queued blocked-by: alpha\n- [ ] gamma - Third queued blocked-by: alpha (kind: docs)\n## Done\n\n- [x] old - Finished thing (done 2026-01-01)\n",
+        "other": "# Backlog\n\n## Queued\n\n"
       },
       "waitMs": 0
     },
@@ -51,8 +52,8 @@
       "code": 0,
       "out": "ok: removed gamma\nhelp[1]:\n  - Run `tasks-axi list --file=<dir>/backlog.md` to see remaining tasks\n",
       "files": {
-        "main": "097999d0e9f3a1e6",
-        "other": "0f9bf893dcf0c792"
+        "main": "# Backlog\n\n## In flight\n\n- [ ] live - Something running (repo: demo) (since 2026-01-02)\n\n## Queued\n\n- [ ] alpha - First queued (repo: demo) (priority: 1)\n  A body line.\n\n  Another paragraph.\n\n- [ ] beta - Second queued blocked-by: alpha\n## Done\n\n- [x] old - Finished thing (done 2026-01-01)\n",
+        "other": "# Backlog\n\n## Queued\n\n"
       },
       "waitMs": 0
     },
@@ -60,8 +61,8 @@
       "code": 0,
       "out": "ok: render -> normalized 5\nhelp[1]:\n  - Run `tasks-axi list --file=<dir>/backlog.md` to see the normalized backlog\n",
       "files": {
-        "main": "705f1702f1bfe128",
-        "other": "0f9bf893dcf0c792"
+        "main": "# Backlog\n\n## In flight\n\n- [ ] live - Something running (repo: demo) (since 2026-01-02)\n## Queued\n\n- [ ] alpha - First queued (repo: demo) (priority: 1)\n  A body line.\n\n  Another paragraph.\n- [ ] beta - Second queued blocked-by: alpha\n- [ ] gamma - Third queued (kind: docs)\n## Done\n\n- [x] old - Finished thing (done 2026-01-01)\n",
+        "other": "# Backlog\n\n## Queued\n\n"
       },
       "waitMs": 0
     },
@@ -69,8 +70,8 @@
       "code": 0,
       "out": "ok: mv gamma old -> <dir>/other.md\nhelp[1]:\n  - Run `tasks-axi list --file=<dir>/backlog.md` to see remaining tasks\n",
       "files": {
-        "main": "fab77590e68a1528",
-        "other": "629adde22771b51f"
+        "main": "# Backlog\n\n## In flight\n\n- [ ] live - Something running (repo: demo) (since 2026-01-02)\n\n## Queued\n\n- [ ] alpha - First queued (repo: demo) (priority: 1)\n  A body line.\n\n  Another paragraph.\n\n- [ ] beta - Second queued blocked-by: alpha\n## Done\n\n",
+        "other": "# Backlog\n\n## Queued\n- [ ] gamma - Third queued (kind: docs)\n\n## In flight\n## Done\n- [x] old - Finished thing (done 2026-01-01)\n"
       },
       "waitMs": 0
     },
@@ -78,8 +79,8 @@
       "code": 0,
       "out": "task:\n  id: alpha\n  title: First queued\n  state: queued\n  blocked: no\n  blocked_by: none\n  held: no\n  hold_reason: \"-\"\n  hold_kind: \"-\"\n  hold_until: \"-\"\n  kind: task\n  repo: demo\n  priority: 1\n  created: \"-\"\n  closed: \"-\"\n  deps: none\n  links: none\n  body: \"A body line./n/nAnother paragraph.\"\n",
       "files": {
-        "main": "88b25959bdb869ae",
-        "other": "0f9bf893dcf0c792"
+        "main": "# Backlog\n\n## In flight\n\n- [ ] live - Something running (repo: demo) (since 2026-01-02)\n\n## Queued\n\n- [ ] alpha - First queued (repo: demo) (priority: 1)\n  A body line.\n\n  Another paragraph.\n\n- [ ] beta - Second queued blocked-by: alpha\n- [ ] gamma - Third queued (kind: docs)\n\n## Done\n\n- [x] old - Finished thing (done 2026-01-01)\n",
+        "other": "# Backlog\n\n## Queued\n\n"
       },
       "waitMs": 0
     },
@@ -87,17 +88,17 @@
       "code": 0,
       "out": "count: 5\ntasks[5]{id,state,kind,repo,title}:\n  live,in_flight,task,demo,Something running\n  alpha,queued,task,demo,First queued\n  beta,queued,task,\"-\",Second queued\n  gamma,queued,docs,\"-\",Third queued\n  old,done,task,\"-\",Finished thing\nhelp[2]:\n  - Run `tasks-axi show <id> --file=<dir>/backlog.md` for full notes on a task\n  - Run `tasks-axi ready --file=<dir>/backlog.md` to see unblocked queued work\n",
       "files": {
-        "main": "88b25959bdb869ae",
-        "other": "0f9bf893dcf0c792"
+        "main": "# Backlog\n\n## In flight\n\n- [ ] live - Something running (repo: demo) (since 2026-01-02)\n\n## Queued\n\n- [ ] alpha - First queued (repo: demo) (priority: 1)\n  A body line.\n\n  Another paragraph.\n\n- [ ] beta - Second queued blocked-by: alpha\n- [ ] gamma - Third queued (kind: docs)\n\n## Done\n\n- [x] old - Finished thing (done 2026-01-01)\n",
+        "other": "# Backlog\n\n## Queued\n\n"
       },
       "waitMs": 0
     },
     "write-waits-for-lock": {
       "code": 0,
-      "out": "ok: added delta -> Queued\ntask:\n  id: delta\n  title: New task\n  state: queued\n  blocked: no\n  blocked_by: none\n  held: no\n  hold_reason: \"-\"\n  hold_kind: \"-\"\n  hold_until: \"-\"\n  kind: task\n  repo: \"-\"\n  priority: \"-\"\n  created: 2026-11-21\n  closed: \"-\"\n  deps: none\n  links: none\n  body: \"\"\nhelp[2]:\n  - Run `tasks-axi start delta --file=<dir>/backlog.md` to move it to in flight\n  - Run `tasks-axi block delta --by <other> --file=<dir>/backlog.md` to record a dependency\n",
+      "out": "ok: added delta -> Queued\ntask:\n  id: delta\n  title: New task\n  state: queued\n  blocked: no\n  blocked_by: none\n  held: no\n  hold_reason: \"-\"\n  hold_kind: \"-\"\n  hold_until: \"-\"\n  kind: task\n  repo: \"-\"\n  priority: \"-\"\n  created: <today>\n  closed: \"-\"\n  deps: none\n  links: none\n  body: \"\"\nhelp[2]:\n  - Run `tasks-axi start delta --file=<dir>/backlog.md` to move it to in flight\n  - Run `tasks-axi block delta --by <other> --file=<dir>/backlog.md` to record a dependency\n",
       "files": {
-        "main": "538dc1d153813b07",
-        "other": "0f9bf893dcf0c792"
+        "main": "# Backlog\n\n## In flight\n\n- [ ] live - Something running (repo: demo) (since 2026-01-02)\n\n## Queued\n\n- [ ] alpha - First queued (repo: demo) (priority: 1)\n  A body line.\n\n  Another paragraph.\n\n- [ ] beta - Second queued blocked-by: alpha\n- [ ] gamma - Third queued (kind: docs)\n\n- [ ] delta - New task (since <today>)\n## Done\n\n- [x] old - Finished thing (done 2026-01-01)\n",
+        "other": "# Backlog\n\n## Queued\n\n"
       },
       "waitMs": 874
     },
@@ -105,26 +106,44 @@
       "code": 1,
       "out": "error: backlog is locked by another tasks-axi process\ncode: LOCKED\nhelp[1]: Wait a moment and retry\n",
       "files": {
-        "main": "88b25959bdb869ae",
-        "other": "0f9bf893dcf0c792"
+        "main": "# Backlog\n\n## In flight\n\n- [ ] live - Something running (repo: demo) (since 2026-01-02)\n\n## Queued\n\n- [ ] alpha - First queued (repo: demo) (priority: 1)\n  A body line.\n\n  Another paragraph.\n\n- [ ] beta - Second queued blocked-by: alpha\n- [ ] gamma - Third queued (kind: docs)\n\n## Done\n\n- [x] old - Finished thing (done 2026-01-01)\n",
+        "other": "# Backlog\n\n## Queued\n\n"
       },
-      "waitMs": 2476
+      "waitMs": 2504
     },
     "write-refused-stale": {
       "code": 1,
       "out": "error: \"backlog lock looks stale: <dir>/backlog.md.lock\"\ncode: LOCKED\nhelp[1]: \"If no tasks-axi process is running, remove <dir>/backlog.md.lock and retry\"\n",
       "files": {
-        "main": "88b25959bdb869ae",
-        "other": "0f9bf893dcf0c792"
+        "main": "# Backlog\n\n## In flight\n\n- [ ] live - Something running (repo: demo) (since 2026-01-02)\n\n## Queued\n\n- [ ] alpha - First queued (repo: demo) (priority: 1)\n  A body line.\n\n  Another paragraph.\n\n- [ ] beta - Second queued blocked-by: alpha\n- [ ] gamma - Third queued (kind: docs)\n\n## Done\n\n- [x] old - Finished thing (done 2026-01-01)\n",
+        "other": "# Backlog\n\n## Queued\n\n"
       },
-      "waitMs": 2499
+      "waitMs": 2503
     },
     "read-ignores-lock": {
       "code": 0,
       "out": "count: 5\ntasks[5]{id,state,kind,repo,title}:\n  live,in_flight,task,demo,Something running\n  alpha,queued,task,demo,First queued\n  beta,queued,task,\"-\",Second queued\n  gamma,queued,docs,\"-\",Third queued\n  old,done,task,\"-\",Finished thing\nhelp[2]:\n  - Run `tasks-axi show <id> --file=<dir>/backlog.md` for full notes on a task\n  - Run `tasks-axi ready --file=<dir>/backlog.md` to see unblocked queued work\n",
       "files": {
-        "main": "88b25959bdb869ae",
-        "other": "0f9bf893dcf0c792"
+        "main": "# Backlog\n\n## In flight\n\n- [ ] live - Something running (repo: demo) (since 2026-01-02)\n\n## Queued\n\n- [ ] alpha - First queued (repo: demo) (priority: 1)\n  A body line.\n\n  Another paragraph.\n\n- [ ] beta - Second queued blocked-by: alpha\n- [ ] gamma - Third queued (kind: docs)\n\n## Done\n\n- [x] old - Finished thing (done 2026-01-01)\n",
+        "other": "# Backlog\n\n## Queued\n\n"
+      },
+      "waitMs": 25
+    },
+    "show-ignores-lock": {
+      "code": 0,
+      "out": "task:\n  id: beta\n  title: Second queued\n  state: queued\n  blocked: yes\n  blocked_by: alpha\n  held: no\n  hold_reason: \"-\"\n  hold_kind: \"-\"\n  hold_until: \"-\"\n  kind: task\n  repo: \"-\"\n  priority: \"-\"\n  created: \"-\"\n  closed: \"-\"\n  deps: \"blocked-by:alpha\"\n  links: none\n  body: \"\"\nhelp[2]:\n  - Run `tasks-axi unblock beta --by <other> --file=<dir>/backlog.md` to clear a blocker\n  - Run `tasks-axi start beta --file=<dir>/backlog.md` to move it to in flight\n",
+      "files": {
+        "main": "# Backlog\n\n## In flight\n\n- [ ] live - Something running (repo: demo) (since 2026-01-02)\n\n## Queued\n\n- [ ] alpha - First queued (repo: demo) (priority: 1)\n  A body line.\n\n  Another paragraph.\n\n- [ ] beta - Second queued blocked-by: alpha\n- [ ] gamma - Third queued (kind: docs)\n\n## Done\n\n- [x] old - Finished thing (done 2026-01-01)\n",
+        "other": "# Backlog\n\n## Queued\n\n"
+      },
+      "waitMs": 0
+    },
+    "show-missing": {
+      "code": 1,
+      "out": "error: \"Task /\"nope/\" not found in this backlog\"\ncode: NOT_FOUND\nhelp[1]: Run `tasks-axi list --file=<dir>/backlog.md` to see existing tasks\n",
+      "files": {
+        "main": "# Backlog\n\n## In flight\n\n- [ ] live - Something running (repo: demo) (since 2026-01-02)\n\n## Queued\n\n- [ ] alpha - First queued (repo: demo) (priority: 1)\n  A body line.\n\n  Another paragraph.\n\n- [ ] beta - Second queued blocked-by: alpha\n- [ ] gamma - Third queued (kind: docs)\n\n## Done\n\n- [x] old - Finished thing (done 2026-01-01)\n",
+        "other": "# Backlog\n\n## Queued\n\n"
       },
       "waitMs": 0
     },
@@ -132,19 +151,19 @@
       "code": 0,
       "out": "ok: mv gamma -> <dir>/other.md\nhelp[1]:\n  - Run `tasks-axi list --file=<dir>/backlog.md` to see remaining tasks\n",
       "files": {
-        "main": "097999d0e9f3a1e6",
-        "other": "239c1a8abdc87241"
+        "main": "# Backlog\n\n## In flight\n\n- [ ] live - Something running (repo: demo) (since 2026-01-02)\n\n## Queued\n\n- [ ] alpha - First queued (repo: demo) (priority: 1)\n  A body line.\n\n  Another paragraph.\n\n- [ ] beta - Second queued blocked-by: alpha\n## Done\n\n- [x] old - Finished thing (done 2026-01-01)\n",
+        "other": "# Backlog\n\n## Queued\n- [ ] gamma - Third queued (kind: docs)\n\n## In flight\n## Done\n"
       },
-      "waitMs": 3365
+      "waitMs": 3316
     },
     "mv-second-busy-past-its-wait": {
       "code": 1,
       "out": "error: backlog is locked by another tasks-axi process\ncode: LOCKED\nhelp[1]: Wait a moment and retry\n",
       "files": {
-        "main": "88b25959bdb869ae",
-        "other": "0f9bf893dcf0c792"
+        "main": "# Backlog\n\n## In flight\n\n- [ ] live - Something running (repo: demo) (since 2026-01-02)\n\n## Queued\n\n- [ ] alpha - First queued (repo: demo) (priority: 1)\n  A body line.\n\n  Another paragraph.\n\n- [ ] beta - Second queued blocked-by: alpha\n- [ ] gamma - Third queued (kind: docs)\n\n## Done\n\n- [x] old - Finished thing (done 2026-01-01)\n",
+        "other": "# Backlog\n\n## Queued\n\n"
       },
-      "waitMs": 3392
+      "waitMs": 3342
     }
   }
 }

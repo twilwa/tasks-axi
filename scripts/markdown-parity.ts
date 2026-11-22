@@ -14,7 +14,6 @@
  * it compares them and exits 1 on any difference beyond --tolerance-ms (300).
  */
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdtempSync,
@@ -102,6 +101,15 @@ export const SCENARIOS: Scenario[] = [
     locks: [{ file: "main", releaseMs: null }],
   },
   {
+    name: "show-ignores-lock",
+    args: ["show", "beta", "--full", "--file", "{main}"],
+    locks: [{ file: "main", releaseMs: null }],
+  },
+  {
+    name: "show-missing",
+    args: ["show", "nope", "--file", "{main}"],
+  },
+  {
     name: "mv-staggered-within-each-wait",
     args: ["mv", "gamma", "--to", "{other}", "--file", "{main}"],
     locks: [
@@ -118,6 +126,22 @@ export const SCENARIOS: Scenario[] = [
     ],
   },
 ];
+
+function isoDay(date: Date, utc: boolean): string {
+  const y = utc ? date.getUTCFullYear() : date.getFullYear();
+  const m = (utc ? date.getUTCMonth() : date.getMonth()) + 1;
+  const d = utc ? date.getUTCDate() : date.getDate();
+  return `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
+
+/** Replace today's date, local and UTC, with <today>. */
+export function undated(text: string): string {
+  const now = new Date();
+  let out = text;
+  for (const day of new Set([isoDay(now, false), isoDay(now, true)]))
+    out = out.split(day).join("<today>");
+  return out;
+}
 
 export interface Outcome {
   code: number | null;
@@ -184,23 +208,18 @@ async function once(node: string[], scenario: Scenario, contended: boolean) {
     );
     const run = await exec(node, args, dir);
     timers.forEach(clearTimeout);
+    // Stamps carry today's date (local or UTC), so normalize it: the
+    // fixture must not depend on the day or time zone it was recorded in.
     const files: Record<string, string | null> = {};
     for (const [key, path] of Object.entries(paths))
       files[key] = existsSync(path)
-        ? createHash("sha256")
-            .update(readFileSync(path))
-            .digest("hex")
-            .slice(0, 16)
+        ? undated(readFileSync(path, "utf8"))
         : null;
     for (const name of ["done-archive.md", "note-archive.md"]) {
       const path = join(dir, name);
-      if (existsSync(path))
-        files[name] = createHash("sha256")
-          .update(readFileSync(path))
-          .digest("hex")
-          .slice(0, 16);
+      if (existsSync(path)) files[name] = undated(readFileSync(path, "utf8"));
     }
-    const out = run.out
+    const out = undated(run.out)
       .split(dir)
       .join("<dir>")
       .replaceAll("\\", "/")

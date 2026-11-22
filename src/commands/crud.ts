@@ -28,6 +28,7 @@ import {
   STATES,
   type Dep,
   type State,
+  type Task,
   type TaskInput,
   type TaskLink,
   type TaskPatch,
@@ -466,11 +467,20 @@ export async function showCommand(
   const positionals = requirePositionals(args, 1, 1, SHOW_HELP.split("\n")[0]);
   const id = requireId(positionals[0], "id");
 
-  // One snapshot: the task and everything derived from the graph come from
-  // the same read, so a concurrent write cannot mix two versions.
-  const all = (await store.list({})).items;
-  const task = all.find((item) => item.id === id);
-  if (!task) throw notFound(id, { globals: context?.suggestionGlobals });
+  // Beads: one snapshot, so the task and everything derived from the graph
+  // come from the same read and a concurrent write cannot mix two versions.
+  // Markdown keeps main's exact get-then-list reads.
+  let task: Task | null | undefined;
+  let all: Task[];
+  if (store.capabilities().backend === "markdown") {
+    task = await store.get(id);
+    if (!task) throw notFound(id, { globals: context?.suggestionGlobals });
+    all = (await store.list({})).items;
+  } else {
+    all = (await store.list({})).items;
+    task = all.find((item) => item.id === id);
+    if (!task) throw notFound(id, { globals: context?.suggestionGlobals });
+  }
   const isBlocked = blockedIds(all).has(id);
 
   const blocks = [renderTaskDetail(task, all, full)];

@@ -45,7 +45,13 @@ import type {
   PruneResult,
   Store,
 } from "../store.js";
-import { atomicWrite, readFileSafe, reservedPath, withLocks } from "./lock.js";
+import {
+  atomicWrite,
+  canonicalPath,
+  readFileSafe,
+  reservedPath,
+  withLocks,
+} from "./lock.js";
 import {
   assertTransferRemoval,
   registerTransferStore,
@@ -345,10 +351,11 @@ export class MarkdownStore implements Store {
     }
     // Never write a Markdown file over a live beads lock or ready marker.
     for (const path of [this.path, this.archivePath, this.noteArchivePath]) {
-      const reason = reservedPath(resolve(path), false);
+      const real = canonicalPath(path);
+      const reason = reservedPath(real, false);
       if (reason)
         throw new AxiError(
-          `${resolve(path)} names ${reason}; choose a different file`,
+          `${resolve(path)} names ${reason} (${real}); choose a different file`,
           "VALIDATION_ERROR",
         );
     }
