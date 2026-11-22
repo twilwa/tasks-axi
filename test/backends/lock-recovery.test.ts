@@ -242,6 +242,43 @@ describe("recoverable locks", () => {
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(readFileSync(target + ".lock", "utf8")).toBe(foreign);
   });
+
+  it("bounds a nested acquisition by the outer lock's remaining deadline", async () => {
+    const outer = join(dir, "a.db");
+    const inner = join(dir, "b.db");
+    let release!: () => void;
+    let holding!: () => void;
+    const held = new Promise<void>((r) => (holding = r));
+    const holder = withLock(
+      inner,
+      () => {
+        holding();
+        return new Promise<void>((r) => (release = r));
+      },
+      { recover: {} },
+    );
+    await held;
+    const started = performance.now();
+    await expect(
+      withLock(
+        outer,
+        () =>
+          withLock(inner, () => "stolen", { timeoutMs: 20_000, recover: {} }),
+        { timeoutMs: 300, retryMs: 20, recover: {} },
+      ),
+    ).rejects.toMatchObject({
+      code: "LOCKED",
+      message: expect.stringMatching(
+        new RegExp(
+          inner.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+            "\\.lock; gave up after waiting \\d+ ms",
+        ),
+      ),
+    });
+    expect(performance.now() - started).toBeLessThan(2_000);
+    release();
+    await holder;
+  });
 });
 
 describe("markdown lock behaviour is unchanged", () => {

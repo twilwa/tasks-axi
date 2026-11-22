@@ -25,9 +25,13 @@ describe.skipIf(!hasBr)("beads_rust Store conformance", () => {
   it("does not truncate large reads, bounds show arguments, applies limits after total, and sees native state changes", async () => {
     const recorder = recordBr(workspace.dir, workspace.path, {
       before:
-        "if (args[2] === 'show' && Buffer.byteLength(args.slice(3, -1).join(' ')) > 8192) process.exit(26);",
+        "if (args[2] === 'show' && Buffer.byteLength(args.slice(3, -1).join(' ')) > 200) process.exit(26);",
     });
-    store = new BeadsStore({ path: workspace.path, binary: recorder.binary });
+    store = new BeadsStore({
+      path: workspace.path,
+      binary: recorder.binary,
+      showBatchBytes: 200,
+    });
     const metadata = (order: number) =>
       JSON.stringify({
         tasks_axi: {
@@ -72,8 +76,11 @@ describe.skipIf(!hasBr)("beads_rust Store conformance", () => {
       .split("\n")
       .map((line) => JSON.parse(line) as string[])
       .filter((args) => args[2] === "show");
-    expect(shows).toHaveLength(1);
-    expect(shows[0].slice(3, -1)).toEqual(native.filter((_, i) => i % 2));
+    // 35 linked rows exceed one 200-byte batch, so the read must split.
+    expect(shows.length).toBeGreaterThan(1);
+    expect(shows.flatMap((args) => args.slice(3, -1))).toEqual(
+      native.filter((_, i) => i % 2),
+    );
     expect(items.map((item) => item.id)).toEqual(["item-0", "item-1"]);
     expect(items[0].body).toBe(body);
     expect((await store.list({ limit: 0 })).total).toBe(70);

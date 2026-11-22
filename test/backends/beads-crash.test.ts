@@ -1,0 +1,215 @@
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { BeadsStore } from "../../src/backends/beads.js";
+import { hasBr, makeBeadsWorkspace, recordBr } from "../beads-helpers.js";
+
+const root = fileURLToPath(new URL("../..", import.meta.url));
+const tsx = pathToFileURL(
+  join(root, "node_modules", "tsx", "dist", "loader.mjs"),
+).href;
+let ws: ReturnType<typeof makeBeadsWorkspace>;
+
+const env = Object.fromEntries(
+  Object.entries(process.env).filter(([key]) => !key.startsWith("TASKS_AXI_")),
+);
+
+/** A real tasks-axi CLI process against one explicit beads database. */
+function cli(args: string[], db: string, binary?: string) {
+  const child = spawn(
+    process.execPath,
+    [
+      "--import",
+      tsx,
+      join(root, "bin", "tasks-axi.ts"),
+      ...args,
+      "--backend",
+      "beads",
+      "--file",
+      db,
+    ],
+    {
+      cwd: ws.dir,
+      env: {
+        ...env,
+        HOME: ws.dir,
+        USERPROFILE: ws.dir,
+        ...(binary ? { TASKS_AXI_BEADS_BINARY: binary } : {}),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  let out = "";
+  child.stdout.on("data", (chunk: Buffer) => (out += chunk.toString()));
+  child.stderr.on("data", (chunk: Buffer) => (out += chunk.toString()));
+  const done = new Promise<{ code: number | null; out: string }>((resolve) =>
+    child.on("close", (code) => resolve({ code, out })),
+  );
+  return { child, done };
+}
+
+async function waitFor(path: string, ms = 30_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!existsSync(path)) {
+    if (Date.now() > deadline) throw new Error("timed out waiting for " + path);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+/** Recorder hook: on the first matching command, signal and pause it. */
+function pauseOnce(
+  command: string,
+  marker: string,
+  signal: string,
+  ms: number,
+) {
+  return (
+    "if (args[2] === " +
+    JSON.stringify(command) +
+    " && fs.existsSync(" +
+    JSON.stringify(marker) +
+    ")) {" +
+    " fs.unlinkSync(" +
+    JSON.stringify(marker) +
+    ");" +
+    " fs.writeFileSync(" +
+    JSON.stringify(signal) +
+    ", '');" +
+    " Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, " +
+    ms +
+    "); }"
+  );
+}
+
+describe.skipIf(!hasBr || process.platform === "win32")(
+  "beads writers across real processes and crashes",
+  () => {
+    beforeEach(() => {
+      ws = makeBeadsWorkspace();
+    });
+    afterEach(() => ws?.cleanup());
+
+    it("lets 8 separate CLI processes write one database and all succeed", async () => {
+      await new BeadsStore({ path: ws.path }).create({
+        id: "seed",
+        title: "Seed",
+      });
+      const runs = Array.from({ length: 8 }, (_, i) =>
+        cli(["add", "par-" + i, "Parallel " + i], ws.path),
+      );
+      const results = await Promise.all(runs.map((run) => run.done));
+      expect(results.map((r) => r.code)).toEqual(Array(8).fill(0));
+      expect((await new BeadsStore({ path: ws.path }).list({})).total).toBe(9);
+    }, 120_000);
+
+    it("does not let a successor in while a killed writer's br call can still commit", async () => {
+      const store = new BeadsStore({ path: ws.path });
+      await store.create({ id: "x", title: "X", body: "original" });
+      const marker = join(ws.dir, "pause");
+      const started = join(ws.dir, "started");
+      writeFileSync(marker, "");
+      const finished = join(ws.dir, "finished");
+      const recorder = recordBr(ws.dir, ws.path, {
+        before: pauseOnce("update", marker, started, 1_500),
+        after:
+          "if (args[2] === 'update') fs.appendFileSync(" +
+          JSON.stringify(finished) +
+          ", 'x');",
+      });
+      const first = cli(
+        ["update", "x", "--body", "from the killed writer"],
+        ws.path,
+        recorder.binary,
+      );
+      await waitFor(started);
+      first.child.kill("SIGKILL");
+      await first.done;
+      // The killed CLI's br update is still pending; it must land first.
+      await new BeadsStore({ path: ws.path }).update("x", {
+        body: "from the successor",
+      });
+      // Once the orphaned update has also run, the successor's write is last.
+      await waitFor(finished);
+      await new Promise((r) => setTimeout(r, 200));
+      expect((await store.get("x"))?.body).toBe("from the successor");
+    }, 60_000);
+
+    it("reads wait for an in-flight write instead of returning a torn graph", async () => {
+      const store = new BeadsStore({ path: ws.path });
+      await store.create({ id: "x", title: "X", body: "before" });
+      const marker = join(ws.dir, "pause");
+      const started = join(ws.dir, "started");
+      writeFileSync(marker, "");
+      const recorder = recordBr(ws.dir, ws.path, {
+        before: pauseOnce("update", marker, started, 1_000),
+      });
+      const writer = cli(
+        ["update", "x", "--body", "after"],
+        ws.path,
+        recorder.binary,
+      );
+      await waitFor(started);
+      expect((await store.get("x"))?.body).toBe("after");
+      expect((await writer.done).code).toBe(0);
+    }, 60_000);
+
+    it("locks an aliased database path on its canonical lock", async () => {
+      const alias = join(ws.dir, "alias.db");
+      symlinkSync(ws.path, alias);
+      const seen = join(ws.dir, "seen");
+      const recorder = recordBr(ws.dir, alias, {
+        before:
+          "if (args[2] === 'list') fs.writeFileSync(" +
+          JSON.stringify(seen) +
+          ", String(fs.existsSync(" +
+          JSON.stringify(ws.path + ".lock") +
+          ")));",
+      });
+      await new BeadsStore({ path: alias, binary: recorder.binary }).list({});
+      expect(readFileSync(seen, "utf8")).toBe("true");
+    }, 30_000);
+
+    it("finishes an init that crashed after creating the database file", async () => {
+      const db = join(ws.dir, "fresh", ".beads", "beads.db");
+      const fault = join(ws.dir, "fault");
+      writeFileSync(fault, "");
+      const recorder = recordBr(ws.dir, db, {
+        before:
+          "if (args[2] === 'init' && fs.existsSync(" +
+          JSON.stringify(fault) +
+          ")) {" +
+          " fs.unlinkSync(" +
+          JSON.stringify(fault) +
+          "); fs.mkdirSync(require('node:path').dirname(args[1]), {recursive: true});" +
+          " fs.writeFileSync(args[1], ''); process.exit(9); }",
+      });
+      await expect(
+        new BeadsStore({
+          path: db,
+          binary: recorder.binary,
+          prefix: "fresh",
+        }).create({ id: "a", title: "A" }),
+      ).rejects.toBeTruthy();
+      expect(existsSync(db)).toBe(true);
+      const store = new BeadsStore({
+        path: db,
+        binary: recorder.binary,
+        prefix: "fresh",
+      });
+      await expect(
+        store.create({ id: "a", title: "A" }),
+      ).resolves.toMatchObject({ id: "a" });
+      const raw = (await import("node:child_process")).execFileSync(
+        "br",
+        ["--db", db, "info", "--json"],
+        { encoding: "utf8" },
+      );
+      expect(
+        (JSON.parse(raw) as { config: { issue_prefix: string } }).config
+          .issue_prefix,
+      ).toBe("fresh");
+    }, 60_000);
+  },
+);

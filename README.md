@@ -280,7 +280,7 @@ Project configuration can select only the bare executable names `br` or `bd` on 
 Custom executable paths or other programs require trusted home configuration or `TASKS_AXI_BEADS_BINARY`.
 `--file` and `TASKS_AXI_FILE` take precedence over the beads path setting. Relative paths resolve from the current directory.
 The directory form selects `<path>/beads.db`. Every `br` call passes that explicit database file through `--db`.
-First use initializes only the selected database if it does not exist.
+First use initializes only the selected database, under `<db>.init.lock`, and records success in `<db>.tasks-axi-ready` beside it. An init interrupted after br created the file is finished or redone on the next use; a database with issues but no prefix is refused rather than reinitialized.
 
 Task ids remain caller-supplied slugs. Native ids are hidden behind `external_ref = "tasks-axi:<id>"`, so ids need not match the native prefix.
 The adapter releases that reference before deletion, allowing an id to be reused.
@@ -304,13 +304,16 @@ Each write reads the graph once under the lock, then rereads only the row it cha
 Graph reads run one `list`. The adapter saves each edge it writes, with its target's native id, in `agent_context`; when br's own edge count for a row matches those saved edges and every saved target is still that same native row, the saved edges are the row's edges.
 Otherwise, for example after a native `dep add` or `dep remove`, an edge to an unmanaged issue, or a deleted target, that row's edges come from `show`, batched by argument bytes. Missing records or changed task timestamps on shown rows cause a retryable `CONFLICT`.
 The one change this cannot see is a native writer rewiring a managed row's edges while keeping its edge count (removing one edge and adding another); use tasks-axi `block`/`unblock` for managed edges.
-Writers outside this adapter are unsupported. Separate br reads do not provide a database-wide snapshot.
+Writers outside this adapter are unsupported. One br `list` is not a snapshot (br reads rows and edge counts separately), so reads (`list`, `show`, `ready`) take the same lock as writes and never see a write half done.
 
-Writers wait for the database's `<db>.lock` for up to `lock_timeout_ms` (default 120 seconds, enough for several queued writes), then fail with `LOCKED` naming the holder's pid and host.
-The holder refreshes the lock's modification time every few seconds. A waiter takes over a lock automatically when its owner process on the same host has died, or when nobody has refreshed it for 60 seconds (an owner on another host, or a frozen process), so an interrupted write never needs hand cleanup.
-Takeover and release run inside a short exclusive `<db>.lock.guard`, so two writers never hold the lock at once. The one gap is an owner frozen past the 60-second expiry that then resumes; tasks-axi cannot pause a br call it already started.
-Killing tasks-axi does not kill a `br` call it already started; that call can still commit after the next writer takes the lock, so the mirror may miss that one change until the following write or `render`.
-Every writer to a database must run a tasks-axi version with this recovery: an older writer's lock is never refreshed, so it expires after 60 seconds even while that writer is still working.
+Reads and writes wait for the database's `<db>.lock` for up to `lock_timeout_ms` (default 120 seconds, enough for several queued writes). Past that they fail with `LOCKED`, naming the lock path, the holder's pid and the wait in ms. A lock taken inside another (a transfer's second collection) shares the first one's deadline.
+The lock is keyed by the database's real path, so a symlinked or relative alias of the same file shares it.
+The lock file records its owner's pid, process start time, host and PID namespace. Each `br` call the owner starts is recorded beside it, also with its start time, before it runs: on POSIX the call waits behind a `/bin/sh` gate until its pid is written.
+A waiter removes the lock only when the owner and every recorded `br` call are provably gone on this host and PID namespace (no such pid, or the pid now belongs to a process with a different start time). A one-winner claim file per lock instance makes that removal atomic. A killed tasks-axi therefore never needs hand cleanup, and the next writer starts only after the killed writer's last `br` call has exited.
+A live owner is never displaced, however long it holds the lock or however long it is paused; the waiter times out with `LOCKED` instead. A lock whose owner tasks-axi cannot check stays locked: unreadable content, or an owner on another host or in another PID namespace (containers sharing the volume). The error then says to remove `<db>.lock` only after confirming no tasks-axi process is using that database.
+Lock files from earlier tasks-axi builds (`<pid>:<nonce>:<ms>:<n>`) are honoured while that pid lives and removed after it exits; those builds never remove this build's lock, because they treat any lock they find as held.
+Pid reuse is detected only on Linux, which exposes process start times; elsewhere a reused pid keeps the lock held until it exits (fails closed). Supported: one host and one PID namespace. Shared volumes across hosts or containers fail closed, as described above.
+Windows is unverified. It has no `/bin/sh` gate, so a `br` call is recorded just after it starts rather than before. A filesystem that refuses hard links fails with `UNSUPPORTED` rather than being treated as contention.
 Markdown backlogs keep their 2.5-second wait and never remove a lock automatically.
 
 Writes that span commands are not transactions. Interrupted removal keeps a recovery identity, so the same `rm` can finish and the caller id stays reserved until then.

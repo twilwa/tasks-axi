@@ -178,8 +178,17 @@ describe.skipIf(!hasBr)("beads concurrency and write cost", () => {
       // Seed through br directly: shaped like adapter writes, without their cost.
       const native: string[] = [];
       for (let i = 0; i < rows; i++) {
+        // Adapter-format saved edges, native target ids included.
         const deps =
-          i % 4 === 1 ? [{ type: "blocked-by", id: "row-" + (i - 1) }] : [];
+          i % 4 === 1
+            ? [
+                {
+                  type: "blocked-by",
+                  id: "row-" + (i - 1),
+                  native: native[i - 1],
+                },
+              ]
+            : [];
         const created = workspace.br([
           "create",
           "--title",
@@ -210,7 +219,14 @@ describe.skipIf(!hasBr)("beads concurrency and write cost", () => {
       await store.transition("probe", "in_flight");
       await store.update("probe", { body: "Notes" });
       await store.transition("probe", "done");
-      return readFileSync(recorder.log, "utf8").trim().split("\n").length;
+      const calls = readFileSync(recorder.log, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string[]);
+      // The fast path: no row is hydrated; each show is the one-row reread.
+      for (const args of calls.filter((args) => args[2] === "show"))
+        expect(args.slice(3, -1)).toHaveLength(1);
+      return calls.length;
     };
     const small = await callsFor(4);
     const large = await callsFor(80);
