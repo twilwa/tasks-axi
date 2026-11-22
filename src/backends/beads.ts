@@ -469,7 +469,8 @@ export class BeadsStore implements Store {
   private readonly lockKey: string;
   private readonly readyMarker: string;
   private readonly showBatchBytes: number;
-  private initialized = false;
+  /** Identity of the database file this instance last verified. */
+  private verified?: string;
   private readonly mirrorPath?: string;
   private readonly mirrorArchivePath?: string;
   private readonly doneKeep: number;
@@ -673,9 +674,18 @@ export class BeadsStore implements Store {
    * directory and the overrides removed, and verifies where it landed.
    */
   private async ensureInitialized(): Promise<void> {
-    if (this.initialized) return;
-    if (this.markerMatches()) {
-      this.initialized = true;
+    // Recheck on every br call: a database replaced or removed under a warm
+    // instance must earn the marker again, never inherit the old verdict.
+    let current: string | undefined;
+    try {
+      current = this.identity();
+    } catch {
+      current = undefined;
+    }
+    if (current !== undefined && current === this.verified) return;
+    this.verified = undefined;
+    if (current !== undefined && this.markerMatches()) {
+      this.verified = current;
       return;
     }
     await withLock(
@@ -757,7 +767,7 @@ export class BeadsStore implements Store {
       },
       this.lockOptions,
     );
-    this.initialized = true;
+    this.verified = this.identity();
   }
 
   private async call(args: string[], input?: string): Promise<unknown> {

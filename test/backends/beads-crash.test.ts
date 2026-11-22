@@ -358,6 +358,38 @@ describe.skipIf(!hasBr)(
       );
     }, 60_000);
 
+    it("re-verifies a database replaced under the same warm store instance", async () => {
+      const db = join(ws.dir, "warm", ".beads", "beads.db");
+      const store = new BeadsStore({ path: db, prefix: "warm" });
+      await store.create({ id: "a", title: "A" });
+      const before = readFileSync(db + ".tasks-axi-ready", "utf8");
+      const dropDb = () => {
+        for (const name of readdirSync(dirname(db)))
+          if (
+            name.startsWith("beads.db") &&
+            !name.endsWith(".tasks-axi-ready") &&
+            !name.endsWith(".lock")
+          )
+            rmSync(join(dirname(db), name), { force: true });
+      };
+      dropDb();
+      // Same instance: the replaced database must earn the marker again.
+      await expect(
+        store.create({ id: "b", title: "B" }),
+      ).resolves.toMatchObject({ id: "b" });
+      const after = readFileSync(db + ".tasks-axi-ready", "utf8");
+      expect(after).not.toBe(before);
+      const stat = statSync(db, { bigint: true });
+      expect(after).toBe(
+        stat.dev + ":" + stat.ino + ":" + stat.birthtimeNs + "\n",
+      );
+      // A replacement that is not a usable database is refused, not used.
+      dropDb();
+      writeFileSync(db, "not a beads database\n");
+      await expect(store.list({})).rejects.toBeInstanceOf(Error);
+      expect(readFileSync(db + ".tasks-axi-ready", "utf8")).toBe(after);
+    }, 60_000);
+
     it("transfers wait for a held lock on either side and move nothing past the deadline", async () => {
       const beads = new BeadsStore({ path: ws.path, lockTimeoutMs: 300 });
       await beads.create({ id: "x", title: "X" });
