@@ -148,6 +148,8 @@ export interface Outcome {
   out: string;
   files: Record<string, string | null>;
   waitMs: number;
+  /** Raw spawn-to-exit time of the contended run: never below the staged wait. */
+  elapsedMs?: number;
 }
 
 function exec(
@@ -244,6 +246,7 @@ export async function runScenarios(
       out: run.out,
       files: run.files,
       waitMs: scenario.locks ? Math.max(0, Math.round(run.ms - base.ms)) : 0,
+      elapsedMs: Math.round(run.ms),
     };
   }
   return results;

@@ -32,7 +32,7 @@ function setup() {
       '  n=$(( $(cat "$c/count" 2>/dev/null || echo 0) + 1 )); echo $n > "$c/count"',
       '  if [ "$n" = "$(cat "$c/target" 2>/dev/null)" ]; then',
       '    case "$(cat "$c/mode")" in',
-      `      kill-late) ( sleep 1.5; '${br}' "$@" >/dev/null 2>&1; touch "$c/finished" ) & exec sleep 30;;`,
+      `      kill-late) ( sleep 4; '${br}' "$@" >/dev/null 2>&1; touch "$c/finished" ) & exec sleep 30;;`,
       `      error) echo '{"error":{"code":"INJECTED","message":"injected failure"}}'; exit 1;;`,
       "    esac",
       "  fi",
@@ -44,7 +44,13 @@ function setup() {
   );
   const md = join(ws.dir, "backlog.md");
   const stores = (binary?: string) => ({
-    beads: new BeadsStore({ path: ws.path, binary, timeoutMs: 1_000 }),
+    beads: new BeadsStore({
+      path: ws.path,
+      binary,
+      // Only the faulted run uses a short timeout; the late descendant
+      // sleeps past it. Everything else keeps the default.
+      ...(binary ? { timeoutMs: 3_000 } : {}),
+    }),
     markdown: new MarkdownStore({ path: md }),
   });
   return { ws, ctl, wrapper, md, stores };

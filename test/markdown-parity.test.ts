@@ -42,8 +42,10 @@ describe("markdown parity with the pre-PR build", () => {
         out: want.out,
         files: want.files,
       });
+      // Raw elapsed time includes the staged wait, so it is a load-proof
+      // lower bound: a build that stops waiting early fails it.
       if (want.waitMs > 0)
-        expect(got!.waitMs, name + " wait").toBeGreaterThanOrEqual(
+        expect(got!.elapsedMs ?? 0, name + " wait").toBeGreaterThanOrEqual(
           want.waitMs - 300,
         );
     }
