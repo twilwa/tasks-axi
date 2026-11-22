@@ -218,7 +218,7 @@ function lockedAfter(lockPath: string, waitedMs: number): AxiError {
 
 function unsupported(lockPath: string, detail: string): AxiError {
   return new AxiError(`cannot lock ${lockPath}: ${detail}`, "UNSUPPORTED", [
-    "The beads backend needs Linux with util-linux flock on PATH and a local filesystem that supports flock",
+    "The beads backend is refused on Windows; elsewhere it needs a working util-linux-compatible flock on PATH and a local filesystem that supports flock",
   ]);
 }
 
