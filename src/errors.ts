@@ -91,6 +91,46 @@ export function partialMoveError(
   );
 }
 
+const INDETERMINATE = Symbol.for("tasks-axi.indeterminate");
+
+/**
+ * Mark an error whose native side effect is unknown: the call timed out, was
+ * killed, or failed after it started, so a process that inherited its
+ * descriptors may still be writing. Nothing may compensate for it in-process.
+ */
+export function markIndeterminate<E extends object>(error: E): E {
+  (error as Record<symbol, unknown>)[INDETERMINATE] = true;
+  return error;
+}
+
+export function isIndeterminate(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as Record<symbol, unknown>)[INDETERMINATE] === true
+  );
+}
+
+/**
+ * A move stopped at a step whose native outcome is unknown. Every copy is kept
+ * as it stands; rerunning the same mv reconciles them.
+ */
+export function indeterminateMoveError(
+  id: string,
+  cause: unknown,
+  destination: string,
+): AxiError {
+  return new AxiError(
+    `Move of "${id}" is indeterminate: a br call did not finish cleanly, so no copy was rolled back`,
+    "CONFLICT",
+    [
+      `Rerun the same mv once no br process is running on either backlog; it finishes or reconciles the move`,
+      `Do not delete copies in ${destination}; they may be the only surviving tasks`,
+      `Cause: ${describeError(cause)}`,
+    ],
+  );
+}
+
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }

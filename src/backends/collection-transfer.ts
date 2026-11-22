@@ -3,6 +3,8 @@ import { resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
   AxiError,
+  indeterminateMoveError,
+  isIndeterminate,
   partialMoveError,
   stillBlockingError,
   strandedDepError,
@@ -234,6 +236,16 @@ export async function transferCollection(
               await removeTransferredTask(source, task);
           }
         } catch (error) {
+          // A step whose native effect is unknown freezes the move: a process
+          // that inherited the lock may still be applying it, so neither side
+          // can be read as settled. Keep every copy; the retry reconciles.
+          // See docs/collection-transfer.md for the state machine.
+          if (isIndeterminate(error))
+            throw indeterminateMoveError(
+              uniqueIds.join(", "),
+              error,
+              targetPath,
+            );
           try {
             // Restore deleted source tasks first; never remove their last copy.
             for (const task of ordered) {
@@ -244,6 +256,12 @@ export async function transferCollection(
                 await source.create(transferInput(task));
             }
             for (const task of [...copied].reverse()) {
+              // Only drop a staged copy whose source is confirmed back.
+              if (
+                remaining.some((item) => item.id === task.id) &&
+                !(await source.get(task.id))
+              )
+                continue;
               if (await target.get(task.id))
                 await removeTransferredTask(target, task);
             }

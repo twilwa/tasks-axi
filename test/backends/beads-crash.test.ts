@@ -117,6 +117,91 @@ describe.skipIf(!hasBr)(
       expect((await new BeadsStore({ path: ws.path }).list({})).total).toBe(9);
     }, 120_000);
 
+    it("keeps the last copy when a beads-to-markdown move times out during a late source delete", async () => {
+      const br = execFileSync("bash", ["-c", "type -P br"]).toString().trim();
+      await new BeadsStore({ path: ws.path }).create({
+        id: "a",
+        title: "Only",
+      });
+      const armed = join(ws.dir, "armed");
+      const finished = join(ws.dir, "finished");
+      const wrapper = join(ws.dir, "br-wrapper.sh");
+      // A supported launcher: its background child keeps the lock descriptor
+      // and applies the delete after the CLI's br timeout has fired.
+      writeFileSync(
+        wrapper,
+        [
+          "#!/bin/sh",
+          'case " $* " in *" delete "*)',
+          `  if [ -e '${armed}' ]; then rm '${armed}'; ( sleep 2; '${br}' "$@" >/dev/null 2>&1; touch '${finished}' ) & exec sleep 30; fi;;`,
+          "esac",
+          `exec '${br}' "$@"`,
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+      writeFileSync(armed, "");
+      const target = join(ws.dir, "dst.md");
+      const child = spawn(
+        process.execPath,
+        [
+          "--import",
+          tsx,
+          join(root, "bin", "tasks-axi.ts"),
+          "mv",
+          "a",
+          "--to",
+          target,
+          "--to-backend",
+          "markdown",
+          "--backend",
+          "beads",
+          "--file",
+          ws.path,
+        ],
+        {
+          cwd: ws.dir,
+          env: {
+            ...env,
+            HOME: ws.dir,
+            USERPROFILE: ws.dir,
+            TASKS_AXI_BEADS_BINARY: wrapper,
+            TASKS_AXI_BEADS_TIMEOUT_MS: "1250",
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      let out = "";
+      child.stdout.on("data", (c: Buffer) => (out += c.toString()));
+      child.stderr.on("data", (c: Buffer) => (out += c.toString()));
+      const code = await new Promise<number | null>((r) =>
+        child.on("close", r),
+      );
+      expect(code, out).not.toBe(0);
+      await waitFor(finished);
+      const inSource = (
+        await new BeadsStore({ path: ws.path }).list({})
+      ).items.some((t) => t.id === "a");
+      const inTarget =
+        existsSync(target) && /\ba - Only/.test(readFileSync(target, "utf8"));
+      expect(inSource || inTarget, "both copies lost").toBe(true);
+      expect(inTarget, "staged copy must be kept").toBe(true);
+      expect(out).toMatch(/indeterminate/);
+      // The retry reconciles to exactly one copy.
+      const retry = cli(
+        ["mv", "a", "--to", target, "--to-backend", "markdown"],
+        ws.path,
+      );
+      const result = await retry.done;
+      expect(result.code, result.out).toBe(0);
+      expect(
+        (await new BeadsStore({ path: ws.path }).list({})).items.some(
+          (t) => t.id === "a",
+        ),
+      ).toBe(false);
+      expect(readFileSync(target, "utf8")).toMatch(/\ba - Only/);
+    }, 120_000);
+
     it("does not let a successor in while a killed writer's br call can still commit", async () => {
       const store = new BeadsStore({ path: ws.path });
       await store.create({ id: "x", title: "X", body: "original" });

@@ -8,7 +8,13 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, statSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { AxiError, type ErrorCode, unsupported } from "../errors.js";
+import {
+  AxiError,
+  type ErrorCode,
+  isIndeterminate,
+  markIndeterminate,
+  unsupported,
+} from "../errors.js";
 import { validateId } from "../id.js";
 import type {
   Dep,
@@ -413,15 +419,24 @@ function runBr(
     child.on("close", (code, signal) => {
       clearTimeout(timer);
       if (failure) {
-        reject(failure);
+        reject(markIndeterminate(failure));
         return;
       }
       if (timedOut) {
         reject(
-          new BrFailure(
-            "TIMEOUT",
-            `br timed out after ${timeoutMs}ms; reread before retrying`,
+          markIndeterminate(
+            new BrFailure(
+              "TIMEOUT",
+              `br timed out after ${timeoutMs}ms; reread before retrying`,
+            ),
           ),
+        );
+        return;
+      }
+      if (signal !== null) {
+        // Killed from outside: whatever it started may still be finishing.
+        reject(
+          markIndeterminate(new BrFailure("KILLED", `br killed by ${signal}`)),
         );
         return;
       }
@@ -765,7 +780,8 @@ export class BeadsStore implements Store {
           code = "CONFLICT";
         else if (/LOCK|BUSY/.test(error.nativeCode)) code = "LOCKED";
       }
-      throw new AxiError(message, code);
+      const failure = new AxiError(message, code);
+      throw isIndeterminate(error) ? markIndeterminate(failure) : failure;
     }
   }
 
