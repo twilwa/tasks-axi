@@ -230,61 +230,6 @@ describe.skipIf(!hasFlock)("kernel (flock) locks", () => {
     ).rejects.toMatchObject({ code: "LOCKED" });
   });
 
-  it("refuses a free markdown lock once the beads budget it is nested in is spent", async () => {
-    const outer = join(dir, "a.db");
-    const md = join(dir, "b.md");
-    await expect(
-      withLock(
-        outer,
-        async () => {
-          await new Promise((r) => setTimeout(r, 300));
-          return withLock(md, () => "late");
-        },
-        { timeoutMs: 200, kernel: true },
-      ),
-    ).rejects.toMatchObject({ code: "LOCKED" });
-    expect(existsSync(md + ".lock")).toBe(false);
-  });
-
-  it("bounds several locks taken together by one budget", async () => {
-    const first = join(dir, "a.db");
-    const second = join(dir, "b.db");
-    const a = await hold(first, kernel);
-    const b = await hold(second, kernel);
-    setTimeout(() => a.release(), 600);
-    const started = performance.now();
-    await expect(
-      withLocks([first, second], () => "stolen", {
-        timeoutMs: 800,
-        kernel: true,
-      }),
-    ).rejects.toMatchObject({ code: "LOCKED" });
-    // One 800 ms budget for both, not 800 ms each (~1,400 ms).
-    expect(performance.now() - started).toBeLessThan(1_150);
-    b.release();
-    await Promise.all([a.done, b.done]);
-  }, 15_000);
-
-  it("gives a mixed markdown and kernel set one budget", async () => {
-    const md = join(dir, "a.md");
-    const db = join(dir, "b.db");
-    const mdOwner = await hold(md, {});
-    const dbOwner = await hold(db, kernel);
-    setTimeout(() => mdOwner.release(), 1_500);
-    const started = performance.now();
-    await expect(
-      withLocks(
-        [md, db],
-        () => "stolen",
-        (path) => (path === md ? {} : { timeoutMs: 2_000, kernel: true }),
-      ),
-    ).rejects.toMatchObject({ code: "LOCKED" });
-    // Budget is the longest single wait (markdown's 2.5 s), not 1.5 + 2 s.
-    expect(performance.now() - started).toBeLessThan(3_100);
-    dbOwner.release();
-    await Promise.all([mdOwner.done, dbOwner.done]);
-  }, 15_000);
-
   it("fails closed with UNSUPPORTED when util-linux flock is missing", async () => {
     vi.stubEnv("PATH", dir);
     await expect(

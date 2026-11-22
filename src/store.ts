@@ -86,12 +86,11 @@ export interface Store {
   /**
    * Move a connected set into `destination`, gated on `collectionTransfer`.
    * The adapter owns collision, dependency and obligation validation. Markdown
-   * retains its two-file transaction; transfers involving beads copy the whole
-   * destination graph first, then remove the source with best-effort rollback.
-   * Those transfers can leave crash duplicates, never missing tasks, and retry
-   * the same intent by recognizing identical destination copies. Adapters that
-   * cannot preserve this contract omit it; the CLI offers only a single-id
-   * copy-then-remove fallback.
+   * implements it as its two-file transaction between Markdown backlogs and
+   * refuses any other destination; beads does not offer it, and the CLI
+   * refuses every move with a beads side before touching either store.
+   * Adapters that cannot preserve this contract omit it; the CLI offers only
+   * a single-id copy-then-remove fallback.
    */
   transferMany?(ids: string[], destination: Store): Promise<Task[]>;
 

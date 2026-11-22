@@ -8,6 +8,7 @@ import {
 import { dirname, resolve } from "node:path";
 import {
   AxiError,
+  crossStoreMoveError,
   partialMoveError,
   stillBlockingError,
   strandedDepError,
@@ -45,19 +46,7 @@ import type {
   PruneResult,
   Store,
 } from "../store.js";
-import {
-  atomicWrite,
-  canonicalPath,
-  readFileSafe,
-  reservedPath,
-  withLocks,
-} from "./lock.js";
-import {
-  assertTransferRemoval,
-  registerTransferStore,
-  transferCollection,
-  withCollectionLock as withLock,
-} from "./collection-transfer.js";
+import { atomicWrite, readFileSafe, withLock, withLocks } from "./lock.js";
 import {
   type BacklogDoc,
   type Entry,
@@ -349,18 +338,7 @@ export class MarkdownStore implements Store {
         "VALIDATION_ERROR",
       );
     }
-    // Never write a Markdown file over a live beads lock or ready marker.
-    for (const path of [this.path, this.archivePath, this.noteArchivePath]) {
-      const real = canonicalPath(path);
-      const reason = reservedPath(real, false);
-      if (reason)
-        throw new AxiError(
-          `${resolve(path)} names ${reason} (${real}); choose a different file`,
-          "VALIDATION_ERROR",
-        );
-    }
     this.now = options.now ?? today;
-    registerTransferStore(this, this.path);
   }
 
   capabilities(): Capabilities {
@@ -802,7 +780,6 @@ export class MarkdownStore implements Store {
       const found = this.findEntry(doc, id);
       if (!found) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
       const task = found.entry.task;
-      assertTransferRemoval(this, task);
       if (
         isPublicFollowupTask(task) &&
         task.public_followup &&
@@ -826,11 +803,17 @@ export class MarkdownStore implements Store {
     return moved;
   }
 
-  /** Keep the upstream two-file markdown path; br uses recoverable copy-first transfer. */
+  /** The upstream two-file markdown transaction; other destinations are refused. */
   async transferMany(ids: string[], destination: Store): Promise<Task[]> {
-    return destination instanceof MarkdownStore
-      ? this.moveManyTo(ids, destination)
-      : transferCollection(this, ids, destination);
+    if (!(destination instanceof MarkdownStore))
+      throw crossStoreMoveError(
+        { backend: "markdown", path: this.path },
+        {
+          backend: destination.capabilities().backend,
+          path: "the destination store",
+        },
+      );
+    return this.moveManyTo(ids, destination);
   }
 
   /**

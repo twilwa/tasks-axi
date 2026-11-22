@@ -21,6 +21,7 @@ import {
 } from "../derive.js";
 import {
   AxiError,
+  crossStoreMoveError,
   notFound,
   partialMoveError,
   stillBlockingError,
@@ -107,23 +108,21 @@ ready_public_followups group; use tasks-axi public-followup ready for their full
 Held work is excluded by default; --include-held shows it in a separate held group.`;
 
 export const MV_HELP = `usage: tasks-axi mv <id> [<id>...] --to <path-or-dir> [--to-backend markdown|beads]
-Move a connected set to another collection. Markdown-to-markdown keeps its two-file
-transaction. Beads transfers copy the whole graph first, then remove the source;
-rerun the same command after an interruption to finish identical destination copies.
+Move a connected set to another Markdown backlog in one two-file transaction.
+Moves into or out of a beads store are refused for now (cross-store moves are not
+supported yet): nothing is locked, read or changed, and the command exits nonzero.
 Pass a whole connected set (a blocker and its dependents) to move it together;
 their blocked-by links and reason strings are preserved byte-exact.
 Duplicate ids are ignored after their first occurrence.
 Refuses if a moved item's dependency or active dependent would be stranded in the other
 collection - include the whole set, or move the missing endpoint there first.
-Differing destination content is a collision. Beads transfers refuse public obligations
-and fields the destination cannot preserve.
+A moved id that already exists in the destination is a collision.
 flags:
-  --to-backend markdown|beads   destination backend (default: source backend)
+  --to-backend markdown|beads   destination backend (default: source backend; beads is refused for now)
   --json   print the result as a JSON object
 examples:
   tasks-axi mv hibit-cert-cleanup --to ../homemux/data/backlog.md
-  tasks-axi mv blocker-b1 dependent-d2 --to ../homemux/.beads --to-backend beads
-  tasks-axi mv blocker-b1 dependent-d2 --backend beads --file .beads --to backlog.md --to-backend markdown`;
+  tasks-axi mv blocker-b1 dependent-d2 --to ../homemux/data/backlog.md`;
 
 export async function startCommand(
   rawArgs: string[],
@@ -794,6 +793,18 @@ export async function mvCommand(
     ]);
   }
   const ids = [...new Set(positionals.map((p) => requireId(p, "id")))];
+
+  // Any move with a beads side is refused here, before the destination is
+  // resolved or either store is locked, read or written. A beads "move" onto
+  // its own path still gets the current-backlog error below.
+  if (
+    (config.backend === "beads" || toBackend === "beads") &&
+    !(toBackend === config.backend && resolve(to) === resolve(config.path))
+  )
+    throw crossStoreMoveError(
+      { backend: config.backend, path: config.path },
+      { backend: toBackend, path: to },
+    );
 
   const targetPath =
     toBackend === "markdown" ? resolveBacklogTarget(to) : resolve(to);

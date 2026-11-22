@@ -45,14 +45,9 @@ import {
   type LockOptions,
   readFileSafe,
   heldLockFds,
+  withLock,
 } from "./lock.js";
 import { writeMarkdownMirror } from "./markdown-mirror.js";
-import {
-  assertTransferRemoval,
-  registerTransferStore,
-  transferCollection,
-  withCollectionLock as withLock,
-} from "./collection-transfer.js";
 
 export interface BeadsStoreOptions {
   /** Explicit .beads workspace directory or .db file; never auto-discovered. */
@@ -559,12 +554,6 @@ export class BeadsStore implements Store {
     this.doneKeep = options.doneKeep ?? 10;
     if (!Number.isSafeInteger(this.doneKeep) || this.doneKeep < 0)
       invalid("markdown.done_keep must be a non-negative integer");
-    registerTransferStore(
-      this,
-      this.lockKey,
-      this.mirrorPath ? () => this.mutate(async () => undefined) : undefined,
-      this.lockOptions,
-    );
   }
 
   private writePaths(): string[] {
@@ -633,13 +622,10 @@ export class BeadsStore implements Store {
       realtimeSync: false,
       customStates: true,
       serverMintsIds: true,
-      collectionTransfer: true,
+      // Cross-store moves are refused until receiving into beads lands.
+      collectionTransfer: false,
       publicFollowups: false,
     };
-  }
-
-  async transferMany(ids: string[], destination: Store): Promise<Task[]> {
-    return transferCollection(this, ids, destination);
   }
 
   /**
@@ -1400,7 +1386,6 @@ export class BeadsStore implements Store {
     return this.mutate(async () => {
       const all = await this.load();
       const found = this.required(all, id);
-      assertTransferRemoval(this, found.task);
       const dependents = all.filter(
         (item) =>
           item.task.state !== "done" &&

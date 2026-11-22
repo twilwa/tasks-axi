@@ -58,6 +58,9 @@ export interface Scenario {
     releaseMs: number | null;
     stale?: boolean;
   }[];
+  /** File name of {main} (default backlog.md) and its starting content. */
+  mainName?: string;
+  mainSeed?: string;
 }
 
 export const SCENARIOS: Scenario[] = [
@@ -116,6 +119,23 @@ export const SCENARIOS: Scenario[] = [
       { file: "main", releaseMs: 1_500 },
       { file: "other", releaseMs: 3_500 },
     ],
+  },
+  // Names beads reserves are ordinary files when only Markdown is in use.
+  {
+    name: "backlog-named-lock",
+    args: ["add", "delta", "New task", "--file", "{main}"],
+    mainName: "backlog.lock",
+  },
+  {
+    name: "backlog-named-ready-marker",
+    args: ["add", "delta", "New task", "--file", "{main}"],
+    mainName: "beads.db.tasks-axi-ready",
+  },
+  {
+    name: "backlog-holding-flock-marker",
+    args: ["add", "delta", "New task", "--file", "{main}"],
+    mainName: "beads.db.lock",
+    mainSeed: "tasks-axi-lock/flock-v1\n",
   },
   {
     name: "mv-second-busy-past-its-wait",
@@ -186,10 +206,10 @@ async function once(node: string[], scenario: Scenario, contended: boolean) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "tasks-axi-md-parity-")));
   try {
     const paths = {
-      main: join(dir, "backlog.md"),
+      main: join(dir, scenario.mainName ?? "backlog.md"),
       other: join(dir, "other.md"),
     };
-    writeFileSync(paths.main, SEED);
+    writeFileSync(paths.main, scenario.mainSeed ?? SEED);
     writeFileSync(paths.other, "# Backlog\n\n## Queued\n\n");
     const timers: NodeJS.Timeout[] = [];
     if (contended)

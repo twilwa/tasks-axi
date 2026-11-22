@@ -176,25 +176,17 @@ const FLOCK_MARKER = "tasks-axi-lock/flock-v1\n";
 const FLOCK_TIMEOUT_EXIT = 75;
 
 /**
- * Why `path` must never be written as a data file, or undefined. Every
- * tasks-axi lock is `<target>.lock` and every beads ready marker is
+ * Why a beads mirror or archive `path` must never be written, or undefined.
+ * Every tasks-axi lock is `<target>.lock` and every beads ready marker is
  * `<db>.tasks-axi-ready`, whichever store owns them, and replacing one
- * (an atomic rename onto it) silently splits a live lock. `strict` reserves
- * every `.lock` name; otherwise only a file that already holds a kernel lock
- * record is, so Markdown-only paths behave exactly as before.
+ * (an atomic rename onto it) silently splits a live lock. Only beads
+ * configuration checks this; Markdown paths are handled exactly as before.
  */
-export function reservedPath(path: string, strict = true): string | undefined {
+export function reservedPath(path: string): string | undefined {
   const name = basename(path);
   if (name.endsWith(".tasks-axi-ready")) return "a beads ready marker";
-  if (name.endsWith(".tasks-axi-move")) return "a tasks-axi move record";
-  if (!name.endsWith(".lock")) return undefined;
-  if (strict) return "a tasks-axi lock file";
-  try {
-    const head = readFileSync(path, "utf8").slice(0, FLOCK_MARKER.length);
-    return head === FLOCK_MARKER ? "a live beads lock file" : undefined;
-  } catch {
-    return undefined;
-  }
+  if (name.endsWith(".lock")) return "a tasks-axi lock file";
+  return undefined;
 }
 
 /** Descriptors of kernel locks held by this async chain (passed to br). */
@@ -336,24 +328,18 @@ async function acquireKernel(
 async function acquireLock(
   targetPath: string,
   options: LockOptions = {},
-  outer = heldDeadline.getStore() ?? Infinity,
 ): Promise<LockHandle> {
   const lockPath = `${targetPath}.lock`;
   mkdirSync(dirname(targetPath), { recursive: true });
-  if (options.kernel) return acquireKernel(lockPath, options, outer);
+  // Nested beads locks (the init lock inside a write) share the outer wait.
+  if (options.kernel)
+    return acquireKernel(lockPath, options, heldDeadline.getStore() ?? Infinity);
   const timeoutMs = options.timeoutMs ?? LOCK_TIMEOUT_MS;
   const retryMs = options.retryMs ?? LOCK_RETRY_MS;
   const staleMs = options.staleMs ?? LOCK_STALE_MS;
-  // Standalone markdown keeps its own wait; inside a multi-lock acquisition
-  // it is also bounded by the shared budget.
-  const deadline =
-    Date.now() + Math.min(timeoutMs, Math.max(0, outer - performance.now()));
+  const deadline = Date.now() + timeoutMs;
 
   while (true) {
-    // Inside a beads lock the shared budget is absolute: once it is spent, a
-    // free lockfile is not taken either. Standalone (outer = Infinity) keeps
-    // main's behaviour exactly: always one attempt, then its own wait.
-    if (Number.isFinite(outer) && outer - performance.now() <= 0) break;
     try {
       const fd = openSync(lockPath, "wx");
       const token = lockToken();
@@ -394,34 +380,16 @@ export async function withLock<T>(
 export async function withLocks<T>(
   paths: string[],
   fn: () => Promise<T> | T,
-  options?: LockOptions | ((path: string) => LockOptions | undefined),
+  options?: LockOptions,
 ): Promise<T> {
   const byResolved = new Map<string, string>();
   for (const path of paths) byResolved.set(resolve(path), path);
   const ordered = [...byResolved.entries()]
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([, path]) => path);
-  const optionsFor = (path: string) =>
-    (typeof options === "function" ? options(path) : options) ?? {};
-  // A set with a beads (kernel) lock shares one wait budget, the longest
-  // single wait. A Markdown-only set keeps main's independent wait per lock,
-  // unless it is nested inside a beads lock's budget.
-  const shared = ordered.some((path) => optionsFor(path).kernel);
-  const budget = Math.min(
-    shared
-      ? performance.now() +
-          Math.max(
-            ...ordered.map(
-              (path) => optionsFor(path).timeoutMs ?? LOCK_TIMEOUT_MS,
-            ),
-          )
-      : Infinity,
-    heldDeadline.getStore() ?? Infinity,
-  );
   const handles: LockHandle[] = [];
   try {
-    for (const path of ordered)
-      handles.push(await acquireLock(path, optionsFor(path), budget));
+    for (const path of ordered) handles.push(await acquireLock(path, options));
     return await holding(handles, fn);
   } finally {
     for (const handle of handles.reverse()) handle.release();
