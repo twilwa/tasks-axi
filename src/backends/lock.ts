@@ -1,15 +1,18 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import {
+  appendFileSync,
   closeSync,
   existsSync,
   linkSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   statSync,
   unlinkSync,
-  utimesSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
@@ -31,6 +34,24 @@ let lockTokenCounter = 0;
 
 export interface LockHandle {
   release(): void;
+  /** Recoverable locks: where this holder records its subprocesses. */
+  children?: string;
+  deadline?: number;
+}
+
+/** Run `fn` with the held recoverable locks visible to `trackChild`. */
+function holding<T>(handles: LockHandle[], fn: () => Promise<T> | T) {
+  const files = handles.flatMap((handle) =>
+    handle.children ? [handle.children] : [],
+  );
+  if (!files.length) return fn();
+  const deadline = Math.min(
+    ...handles.map((handle) => handle.deadline ?? Infinity),
+    heldDeadline.getStore() ?? Infinity,
+  );
+  return heldDeadline.run(deadline, () =>
+    heldChildren.run([...(heldChildren.getStore() ?? []), ...files], fn),
+  );
 }
 
 export interface LockOptions {
@@ -39,27 +60,27 @@ export interface LockOptions {
   staleMs?: number;
   /**
    * Opt-in automatic recovery of a lock whose owner is gone. Without it a
-   * leftover lock is only reported (markdown's behaviour). With it the owner
-   * refreshes the lock's mtime every `heartbeatMs`, and a waiter takes the lock
-   * over when its owner process on this host is dead, or when the lock has not
-   * been refreshed for `expiryMs` (an owner on another host, a frozen owner,
-   * or an unreadable lock). Takeover and release both run inside a short
-   * exclusive guard, so two writers never hold the lock at once.
+   * leftover lock is only reported (markdown's behaviour). With it a waiter
+   * removes a lock once its owner process, and every subprocess the owner
+   * recorded with `trackChild`, is dead on this host and PID namespace; a
+   * one-winner claim per lock instance makes that removal atomic. Locks
+   * from another host or namespace are never removed automatically.
    */
   recover?: RecoverOptions;
 }
 
-export interface RecoverOptions {
-  expiryMs?: number;
-  heartbeatMs?: number;
-}
+/** Reserved for future recovery settings; pass `{}` to opt in. */
+export type RecoverOptions = Record<string, never>;
 
-export const LOCK_EXPIRY_MS = 60_000;
-const LOCK_HEARTBEAT_MS = 5_000;
-/** A guard is held for a few syscalls; one this old belongs to a crashed taker. */
-const GUARD_STALE_MS = 5_000;
-const GUARD_WAIT_MS = 10_000;
 const HOST = hostname();
+/** Linux PID namespace identity; a pid is only checkable inside its own. */
+const PID_NS = (() => {
+  try {
+    return readlinkSync("/proc/self/ns/pid");
+  } catch {
+    return "-";
+  }
+})();
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -162,46 +183,111 @@ export function atomicWrite(path: string, content: string): void {
 
 interface Observed {
   token: string;
+  ino: number;
   mtimeMs: number;
 }
 
-/** Recoverable tokens name their owner; legacy/unknown content parses to undefined. */
-function recoverableToken(): string {
-  lockTokenCounter += 1;
-  return `tasks-axi-lock/v2 pid=${process.pid} host=${HOST} nonce=${randomNonce()} n=${lockTokenCounter}\n`;
+interface Owner {
+  pid: number;
+  /** Process start time, when the owner's platform exposes one. */
+  start?: string;
+  /** False when the pid belongs to another host or PID namespace. */
+  local: boolean;
+  nonce?: string;
 }
 
-function owner(token: string): { pid: number; host: string } | undefined {
-  const match = /^tasks-axi-lock\/v2 pid=(\d+) host=(\S+) /.exec(token);
-  return match ? { pid: Number(match[1]), host: match[2] } : undefined;
+/**
+ * A process's start time (Linux /proc, in clock ticks since boot), so a pid
+ * reused by an unrelated process is not mistaken for the recorded one.
+ * Undefined where the platform does not expose it.
+ */
+export function processStart(pid: number): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // Field 22; the command name in field 2 may contain spaces or parens.
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+  } catch {
+    return undefined;
+  }
+}
+
+/** Recoverable tokens name their owner, host and PID namespace. */
+function recoverableToken(nonce: string): string {
+  lockTokenCounter += 1;
+  return `tasks-axi-lock/v2 pid=${process.pid} host=${HOST} ns=${PID_NS} nonce=${nonce} start=${processStart(process.pid) ?? "-"} n=${lockTokenCounter}\n`;
+}
+
+function owner(token: string): Owner | undefined {
+  const v2 =
+    /^tasks-axi-lock\/v2 pid=(\d+) host=(\S+) ns=(\S+) nonce=([a-z0-9]+) start=(\S+) /.exec(
+      token,
+    );
+  if (v2)
+    return {
+      pid: Number(v2[1]),
+      local: v2[2] === HOST && v2[3] === PID_NS,
+      nonce: v2[4],
+      ...(v2[5] !== "-" ? { start: v2[5] } : {}),
+    };
+  // Every earlier tasks-axi build writes "<pid>:<nonce>:<ms>:<n>" and runs on
+  // the single host this backend supports; it never refreshes its lock.
+  const legacy = /^(\d+):[a-z0-9]+:\d+:\d+\n?$/.exec(token);
+  return legacy ? { pid: Number(legacy[1]), local: true } : undefined;
 }
 
 function observe(path: string): Observed | undefined {
   try {
     const token = readFileSync(path, "utf8");
-    return { token, mtimeMs: statSync(path).mtimeMs };
+    const stat = statSync(path);
+    return { token, ino: stat.ino, mtimeMs: stat.mtimeMs };
   } catch (error) {
     if (errno(error) === "ENOENT") return undefined;
     throw error;
   }
 }
 
-function processAlive(pid: number): boolean {
+/**
+ * False only when the recorded process provably no longer exists: no such
+ * pid, or the pid now belongs to a process started at a different time.
+ * Anything unprovable counts as alive, so the lock stays held.
+ */
+function processAlive(pid: number, start?: string): boolean {
   if (pid === process.pid) return true;
   try {
     process.kill(pid, 0);
-    return true;
   } catch (error) {
     // EPERM: the pid exists but belongs to someone else.
-    return errno(error) !== "ESRCH";
+    if (errno(error) === "ESRCH") return false;
   }
+  if (start === undefined) return true;
+  const current = processStart(pid);
+  return current === undefined || current === start;
 }
 
-function abandoned(observed: Observed, expiryMs: number): boolean {
+function childrenPath(lockPath: string, nonce: string): string {
+  return `${lockPath}.children-${nonce}`;
+}
+
+/**
+ * Abandoned means provably finished: the owner process (and every subprocess
+ * it recorded) is dead on this host and PID namespace. A live owner is never
+ * displaced, however long it holds the lock. Only content naming no owner (a
+ * torn or foreign write) falls back to its age.
+ */
+function abandoned(lockPath: string, observed: Observed): boolean {
   const holder = owner(observed.token);
-  // A pid is only meaningful in the namespace that wrote it.
-  if (holder && holder.host === HOST && !processAlive(holder.pid)) return true;
-  return Date.now() - observed.mtimeMs > expiryMs;
+  // Unreadable or foreign content proves nothing: it stays locked.
+  if (!holder) return false;
+  if (!holder.local || processAlive(holder.pid, holder.start)) return false;
+  if (!holder.nonce) return true;
+  const children = readFileSafe(childrenPath(lockPath, holder.nonce)) ?? "";
+  return !children
+    .split("\n")
+    .filter(Boolean)
+    .some((line) => {
+      const [pid, start] = line.split(" ");
+      return processAlive(Number(pid), start === "-" ? undefined : start);
+    });
 }
 
 /** Atomically create `path` holding `token`; false when it already exists. */
@@ -212,7 +298,15 @@ function createExclusive(path: string, token: string): boolean {
     linkSync(tmp, path);
     return true;
   } catch (error) {
-    if (errno(error) === "EEXIST" || busyOnWindows(error)) return false;
+    if (errno(error) === "EEXIST") return false;
+    if (busyOnWindows(error)) {
+      if (existsSync(path)) return false;
+      throw new AxiError(
+        `cannot create lock ${path}: this filesystem refused a hard link (${errno(error)})`,
+        "UNSUPPORTED",
+        ["Keep the beads database on a local NTFS or POSIX filesystem"],
+      );
+    }
     throw error;
   } finally {
     unlinkSync(tmp);
@@ -226,125 +320,133 @@ function busyOnWindows(error: unknown): boolean {
   );
 }
 
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+function unlinkIfPresent(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch (error) {
+    if (errno(error) !== "ENOENT") throw error;
+  }
 }
 
-/** Remove `path` only if it still holds exactly what was observed. */
-function removeIfUnchanged(path: string, observed: Observed): void {
-  const aside = `${path}.${process.pid}.${randomNonce()}.stale`;
-  try {
-    renameSync(path, aside);
-  } catch (error) {
-    if (errno(error) === "ENOENT" || busyOnWindows(error)) return;
-    throw error;
-  }
-  if (readFileSafe(aside) !== observed.token) {
-    // Lost a race to a fresh holder: put its file back unless another exists.
-    try {
-      linkSync(aside, path);
-    } catch (error) {
-      if (errno(error) !== "EEXIST") throw error;
-    }
-  }
-  unlinkSync(aside);
+function sameInstance(a: Observed, b: Observed): boolean {
+  return a.token === b.token && a.ino === b.ino && a.mtimeMs === b.mtimeMs;
 }
 
 /**
- * Run `fn` synchronously inside the takeover guard. Every removal of a
- * recoverable lock (takeover and release) happens here, so the check that
- * decided a removal and the removal itself are one critical section.
+ * Remove one abandoned lock instance. Each instance has its own claim name, so
+ * exactly one contender can win the right to remove it; every other path that
+ * changes the lock (its owner's release, a fresh create) needs either a live
+ * owner or an absent file, neither of which an abandoned instance allows. The
+ * winner rechecks the instance and unlinks it; a late winner of an
+ * already-removed instance sees a different instance and does nothing. A
+ * claimant that crashes is itself an abandoned owner, recovered the same way.
  */
-function guarded(lockPath: string, fn: () => void): boolean {
-  const guardPath = `${lockPath}.guard`;
-  const token = recoverableToken();
-  const deadline = Date.now() + GUARD_WAIT_MS;
-  while (!createExclusive(guardPath, token)) {
-    const stale = observe(guardPath);
-    if (stale && abandoned(stale, GUARD_STALE_MS))
-      removeIfUnchanged(guardPath, stale);
-    else if (Date.now() > deadline) return false;
-    else sleepSync(1);
+function takeOver(lockPath: string, observed: Observed, depth = 0): void {
+  const id = createHash("sha256")
+    .update(`${observed.token}\0${observed.ino}\0${observed.mtimeMs}`)
+    .digest("hex")
+    .slice(0, 24);
+  const claim = `${lockPath}.claim-${id}`;
+  const nonce = randomNonce();
+  if (!createExclusive(claim, recoverableToken(nonce))) {
+    const rival = observe(claim);
+    if (rival && depth < 8 && abandoned(claim, rival))
+      takeOver(claim, rival, depth + 1);
+    return;
   }
   try {
-    fn();
-    return true;
+    const current = observe(lockPath);
+    if (current && sameInstance(current, observed)) {
+      unlinkIfPresent(lockPath);
+      const holder = owner(observed.token);
+      if (holder?.nonce) unlinkIfPresent(childrenPath(lockPath, holder.nonce));
+    }
   } finally {
-    if (readFileSafe(guardPath) === token) unlinkSync(guardPath);
+    unlinkIfPresent(claim);
   }
 }
 
-function heldError(
-  lockPath: string,
-  waitedMs: number,
-  expiryMs: number,
-): AxiError {
+function heldError(lockPath: string, waitedMs: number): AxiError {
+  waitedMs = Math.round(waitedMs);
   const observed = observe(lockPath);
   const holder = observed ? owner(observed.token) : undefined;
-  const age = observed
-    ? `, last refreshed ${Math.round((Date.now() - observed.mtimeMs) / 1000)}s ago`
-    : "";
+  const where = holder
+    ? holder.local
+      ? ` (pid ${holder.pid} or a br subprocess it started is still running)`
+      : ` (pid ${holder.pid} on another host or PID namespace)`
+    : observed
+      ? " (its owner cannot be identified)"
+      : "";
   return new AxiError(
-    `backlog is locked by another tasks-axi process${
-      holder ? ` (pid ${holder.pid} on ${holder.host}${age})` : age
-    }; gave up after waiting ${Math.round(waitedMs / 1000)}s`,
+    `backlog is locked by another tasks-axi process${where}: ${lockPath}; gave up after waiting ${waitedMs} ms`,
     "LOCKED",
-    [
-      `Retry once that write finishes; a lock whose owner died is recovered automatically, and one not refreshed for ${Math.round(expiryMs / 1000)}s expires`,
-    ],
+    observed && !holder?.local
+      ? [
+          `tasks-axi cannot check that owner; remove ${lockPath} only after confirming it is not running`,
+        ]
+      : [
+          "Retry once that write finishes; a lock whose owner and its br subprocesses have exited is recovered automatically",
+        ],
   );
+}
+
+/** Subprocess pids recorded against recoverable locks held by this async chain. */
+const heldChildren = new AsyncLocalStorage<string[]>();
+/** The outermost recoverable acquisition's deadline (performance.now()). */
+const heldDeadline = new AsyncLocalStorage<number>();
+
+/**
+ * Record a subprocess started while holding recoverable locks, so a waiter
+ * does not take over after this process dies until that subprocess has also
+ * exited. Returns a function that forgets it once it exits.
+ */
+export function trackChild(pid: number | undefined): () => void {
+  const files = heldChildren.getStore() ?? [];
+  if (pid === undefined || !files.length) return () => undefined;
+  const line = `${pid} ${processStart(pid) ?? "-"}`;
+  for (const file of files) appendFileSync(file, `${line}\n`);
+  return () => {
+    for (const file of files) {
+      const kept = (readFileSafe(file) ?? "")
+        .split("\n")
+        .filter((kept) => kept && kept !== line);
+      if (kept.length) atomicWrite(file, kept.join("\n") + "\n");
+      else unlinkIfPresent(file);
+    }
+  };
 }
 
 async function acquireRecoverable(
   lockPath: string,
   options: LockOptions,
-  recover: RecoverOptions,
 ): Promise<LockHandle> {
   const timeoutMs = options.timeoutMs ?? LOCK_TIMEOUT_MS;
   const retryMs = options.retryMs ?? LOCK_RETRY_MS;
-  const expiryMs = recover.expiryMs ?? LOCK_EXPIRY_MS;
-  const heartbeatMs =
-    recover.heartbeatMs ?? Math.min(LOCK_HEARTBEAT_MS, expiryMs / 4);
-  const started = Date.now();
-  const token = recoverableToken();
+  const started = performance.now();
+  // One monotonic budget: nested acquisitions never outlive the outermost.
+  const deadline = Math.min(
+    started + timeoutMs,
+    heldDeadline.getStore() ?? Infinity,
+  );
+  const nonce = randomNonce();
+  const token = recoverableToken(nonce);
 
   while (!createExclusive(lockPath, token)) {
     const observed = observe(lockPath);
-    if (observed && abandoned(observed, expiryMs)) {
-      guarded(lockPath, () => {
-        const current = observe(lockPath);
-        if (
-          current?.token === observed.token &&
-          current.mtimeMs === observed.mtimeMs &&
-          abandoned(current, expiryMs)
-        )
-          unlinkSync(lockPath);
-      });
-      continue;
-    }
-    const remaining = started + timeoutMs - Date.now();
-    if (remaining <= 0) throw heldError(lockPath, Date.now() - started, expiryMs);
-    await sleep(Math.min(retryMs, remaining));
+    if (observed && abandoned(lockPath, observed)) takeOver(lockPath, observed);
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) throw heldError(lockPath, performance.now() - started);
+    if (observe(lockPath)) await sleep(Math.min(retryMs, remaining));
   }
-
-  const heartbeat = setInterval(() => {
-    try {
-      if (readFileSafe(lockPath) === token) {
-        const now = new Date();
-        utimesSync(lockPath, now, now);
-      }
-    } catch {
-      // A missed beat only shortens the time before expiry.
-    }
-  }, heartbeatMs);
-  heartbeat.unref();
+  const children = childrenPath(lockPath, nonce);
   return {
+    children,
+    deadline,
+    // Only a live owner releases, and nobody displaces a live owner, so the
+    // token check cannot race a successor.
     release: () => {
-      clearInterval(heartbeat);
-      const released = guarded(lockPath, () => {
-        if (readFileSafe(lockPath) === token) unlinkSync(lockPath);
-      });
-      if (!released && readFileSafe(lockPath) === token) unlinkSync(lockPath);
+      if (readFileSafe(lockPath) === token) unlinkIfPresent(lockPath);
+      unlinkIfPresent(children);
     },
   };
 }
@@ -355,8 +457,7 @@ async function acquireLock(
 ): Promise<LockHandle> {
   const lockPath = `${targetPath}.lock`;
   mkdirSync(dirname(targetPath), { recursive: true });
-  if (options.recover)
-    return acquireRecoverable(lockPath, options, options.recover);
+  if (options.recover) return acquireRecoverable(lockPath, options);
   const timeoutMs = options.timeoutMs ?? LOCK_TIMEOUT_MS;
   const retryMs = options.retryMs ?? LOCK_RETRY_MS;
   const staleMs = options.staleMs ?? LOCK_STALE_MS;
@@ -394,7 +495,7 @@ export async function withLock<T>(
 ): Promise<T> {
   const handle = await acquireLock(path, options);
   try {
-    return await fn();
+    return await holding([handle], fn);
   } finally {
     handle.release();
   }
@@ -419,7 +520,7 @@ export async function withLocks<T>(
           typeof options === "function" ? options(path) : options,
         ),
       );
-    return await fn();
+    return await holding(handles, fn);
   } finally {
     for (const handle of handles.reverse()) handle.release();
   }

@@ -84,28 +84,31 @@ describe("recoverable locks", () => {
     expect(isLocked(target)).toBe(false);
   }, 60_000);
 
-  it("expires a lock whose owner cannot be identified once it has not been refreshed", async () => {
+  it("never removes a lock whose owner cannot be identified, however old", async () => {
     const target = join(dir, "beads.db");
     writeFileSync(target + ".lock", "unknown-holder\n");
-    const options = {
-      timeoutMs: 100,
-      retryMs: 5,
-      recover: { expiryMs: 1_000 },
-    };
-    await expect(
-      withLock(target, () => "never", options),
-    ).rejects.toMatchObject({ code: "LOCKED" });
-    const old = new Date(Date.now() - 5_000);
+    const old = new Date(Date.now() - 600_000);
     utimesSync(target + ".lock", old, old);
-    await expect(withLock(target, () => "ok", options)).resolves.toBe("ok");
+    await expect(
+      withLock(target, () => "never", {
+        timeoutMs: 100,
+        retryMs: 5,
+        recover: {},
+      }),
+    ).rejects.toMatchObject({
+      code: "LOCKED",
+      message: expect.stringContaining(target + ".lock"),
+      suggestions: [expect.stringContaining("remove " + target + ".lock")],
+    });
+    expect(readFileSync(target + ".lock", "utf8")).toBe("unknown-holder\n");
   });
 
-  it("keeps a live holder's lock past the expiry by refreshing it", async () => {
+  it("never takes over a live holder, however long it holds the lock", async () => {
     const target = join(dir, "beads.db");
     const options = {
       timeoutMs: 1_500,
       retryMs: 20,
-      recover: { expiryMs: 1_000, heartbeatMs: 100 },
+      recover: {},
     };
     let release!: () => void;
     let holding!: () => void;
@@ -119,7 +122,8 @@ describe("recoverable locks", () => {
       options,
     );
     await held;
-    await new Promise((r) => setTimeout(r, 2_500));
+    const old = new Date(Date.now() - 600_000);
+    utimesSync(target + ".lock", old, old);
     await expect(
       withLock(target, () => "stolen", options),
     ).rejects.toMatchObject({
@@ -130,6 +134,114 @@ describe("recoverable locks", () => {
     await first;
     await expect(withLock(target, () => "next", options)).resolves.toBe("next");
   }, 15_000);
+
+  it("keeps admitting one writer at a time across repeated crashes and takeovers", async () => {
+    const target = join(dir, "beads.db");
+    const log = join(dir, "log");
+    for (let round = 0; round < 4; round++) {
+      expect(await child(target, "crash", recover)).toBe(7);
+      const codes = await Promise.all(
+        Array.from({ length: 6 }, () => child(target, "work", recover, log)),
+      );
+      expect(codes).toEqual(Array(6).fill(0));
+    }
+    const lines = readFileSync(log, "utf8").trim().split("\n");
+    expect(lines).toEqual(Array(24).fill(["enter", "exit"]).flat());
+    expect(isLocked(target)).toBe(false);
+  }, 120_000);
+
+  it("treats a pre-recovery tasks-axi lock as owned while its process lives", async () => {
+    const target = join(dir, "beads.db");
+    const sleeper = spawn(process.execPath, [
+      "-e",
+      "setTimeout(() => {}, 60000)",
+    ]);
+    try {
+      // The token format every earlier tasks-axi build writes.
+      const legacy = sleeper.pid + ":abc123:" + Date.now() + ":1\n";
+      writeFileSync(target + ".lock", legacy);
+      const old = new Date(Date.now() - 600_000);
+      utimesSync(target + ".lock", old, old);
+      const options = {
+        timeoutMs: 400,
+        retryMs: 20,
+        recover: {},
+      };
+      await expect(
+        withLock(target, () => "stolen", options),
+      ).rejects.toMatchObject({ code: "LOCKED" });
+      expect(readFileSync(target + ".lock", "utf8")).toBe(legacy);
+      sleeper.kill();
+      await new Promise((r) => sleeper.on("close", r));
+      await expect(withLock(target, () => "ok", options)).resolves.toBe("ok");
+    } finally {
+      sleeper.kill();
+    }
+  }, 30_000);
+
+  it("waits for a crashed owner's still-running subprocess before taking over", async () => {
+    const target = join(dir, "beads.db");
+    const script = join(dir, "spawner.mts");
+    writeFileSync(
+      script,
+      [
+        'import { spawn } from "node:child_process";',
+        'import { writeFileSync } from "node:fs";',
+        "import { trackChild, withLock } from " +
+          JSON.stringify(lockModule) +
+          ";",
+        "const [target, pidFile] = process.argv.slice(2);",
+        "await withLock(target, () => {",
+        '  const sub = spawn(process.execPath, ["-e", "setTimeout(() => {}, 2500)"], { detached: true, stdio: "ignore" });',
+        "  trackChild(sub.pid);",
+        "  writeFileSync(pidFile, String(sub.pid));",
+        "  process.exit(7);",
+        "}, { recover: {} });",
+      ].join("\n"),
+    );
+    const pidFile = join(dir, "sub.pid");
+    const code = await new Promise((done) =>
+      spawn(process.execPath, ["--import", "tsx", script, target, pidFile], {
+        stdio: "inherit",
+      }).on("close", done),
+    );
+    expect(code).toBe(7);
+    const sub = Number(readFileSync(pidFile, "utf8"));
+    const alive = () => {
+      try {
+        process.kill(sub, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    expect(alive()).toBe(true);
+    await expect(
+      withLock(target, () => alive(), { timeoutMs: 20_000, recover: {} }),
+    ).resolves.toBe(false);
+  }, 30_000);
+
+  it("never takes over a lock from another host or PID namespace, and gives up on time", async () => {
+    const target = join(dir, "beads.db");
+    const foreign =
+      "tasks-axi-lock/v2 pid=1 host=elsewhere ns=pid:[1] nonce=x start=- n=1\n";
+    writeFileSync(target + ".lock", foreign);
+    const old = new Date(Date.now() - 600_000);
+    utimesSync(target + ".lock", old, old);
+    const started = Date.now();
+    await expect(
+      withLock(target, () => "stolen", {
+        timeoutMs: 300,
+        retryMs: 20,
+        recover: {},
+      }),
+    ).rejects.toMatchObject({
+      code: "LOCKED",
+      suggestions: [expect.stringContaining(target + ".lock")],
+    });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(readFileSync(target + ".lock", "utf8")).toBe(foreign);
+  });
 });
 
 describe("markdown lock behaviour is unchanged", () => {
