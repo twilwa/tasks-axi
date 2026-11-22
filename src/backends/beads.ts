@@ -463,7 +463,7 @@ export class BeadsStore implements Store {
         : dirname(this.path);
     this.noteArchivePath = join(dirname(this.path), "note-archive.md");
     this.lockKey = canonicalPath(this.path);
-    this.readyMarker = `${this.path}.tasks-axi-ready`;
+    this.readyMarker = `${this.lockKey}.tasks-axi-ready`;
     this.showBatchBytes = options.showBatchBytes ?? SHOW_ARGV_BYTES;
     this.binary = options.binary ?? "br";
     this.prefix = options.prefix ?? "tasks";
@@ -536,7 +536,6 @@ export class BeadsStore implements Store {
       `${this.path}-shm`,
       `${this.path}-journal`,
       `${this.path}.lock`,
-      `${this.path}.lock.guard`,
       `${this.path}.init.lock`,
       this.readyMarker,
       this.noteArchivePath,

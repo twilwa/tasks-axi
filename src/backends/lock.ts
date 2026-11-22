@@ -202,10 +202,16 @@ interface Owner {
  * Undefined where the platform does not expose it.
  */
 export function processStart(pid: number): string | undefined {
+  return procStat(pid)?.start;
+}
+
+/** Linux /proc state and start time; undefined where /proc is absent. */
+function procStat(pid: number): { state: string; start: string } | undefined {
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    // Field 22; the command name in field 2 may contain spaces or parens.
-    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+    // Fields 3 and 22; the command name in field 2 may contain spaces or parens.
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return { state: fields[0], start: fields[19] };
   } catch {
     return undefined;
   }
@@ -259,9 +265,11 @@ function processAlive(pid: number, start?: string): boolean {
     // EPERM: the pid exists but belongs to someone else.
     if (errno(error) === "ESRCH") return false;
   }
-  if (start === undefined) return true;
-  const current = processStart(pid);
-  return current === undefined || current === start;
+  const current = procStat(pid);
+  // A zombie (exited, not yet reaped by its parent) can no longer write.
+  if (current && ["Z", "X", "x"].includes(current.state)) return false;
+  if (start === undefined || current === undefined) return true;
+  return current.start === start;
 }
 
 function childrenPath(lockPath: string, nonce: string): string {
@@ -300,18 +308,18 @@ function createExclusive(path: string, token: string): boolean {
   } catch (error) {
     if (errno(error) === "EEXIST") return false;
     if (busyOnWindows(error)) {
-      if (existsSync(path)) return false;
-      throw new AxiError(
-        `cannot create lock ${path}: this filesystem refused a hard link (${errno(error)})`,
-        "UNSUPPORTED",
-        ["Keep the beads database on a local NTFS or POSIX filesystem"],
-      );
+      // Usually a lock still being deleted; retried until the deadline.
+      if (!existsSync(path)) lastRefusal.set(path, errno(error));
+      return false;
     }
     throw error;
   } finally {
     unlinkSync(tmp);
   }
 }
+
+/** Lock paths whose last create Windows refused with no lock present. */
+const lastRefusal = new Map<string, string>();
 
 /** Windows reports a name whose file is still being deleted as EPERM/EACCES. */
 function busyOnWindows(error: unknown): boolean {
@@ -340,8 +348,13 @@ function sameInstance(a: Observed, b: Observed): boolean {
  * winner rechecks the instance and unlinks it; a late winner of an
  * already-removed instance sees a different instance and does nothing. A
  * claimant that crashes is itself an abandoned owner, recovered the same way.
+ * Exported so tests can replay a late contender deterministically.
  */
-function takeOver(lockPath: string, observed: Observed, depth = 0): void {
+export function takeOver(
+  lockPath: string,
+  observed: Observed,
+  depth = 0,
+): void {
   const id = createHash("sha256")
     .update(`${observed.token}\0${observed.ino}\0${observed.mtimeMs}`)
     .digest("hex")
@@ -431,13 +444,26 @@ async function acquireRecoverable(
   const nonce = randomNonce();
   const token = recoverableToken(nonce);
 
+  lastRefusal.delete(lockPath);
   while (!createExclusive(lockPath, token)) {
     const observed = observe(lockPath);
     if (observed && abandoned(lockPath, observed)) takeOver(lockPath, observed);
     const remaining = deadline - performance.now();
-    if (remaining <= 0) throw heldError(lockPath, performance.now() - started);
-    if (observe(lockPath)) await sleep(Math.min(retryMs, remaining));
+    if (remaining <= 0) {
+      const refused = lastRefusal.get(lockPath);
+      lastRefusal.delete(lockPath);
+      if (refused && !observe(lockPath))
+        throw new AxiError(
+          `cannot create lock ${lockPath}: the filesystem kept refusing a hard link (${refused}) for ${Math.round(performance.now() - started)} ms`,
+          "UNSUPPORTED",
+          ["Keep the beads database on a local NTFS or POSIX filesystem"],
+        );
+      throw heldError(lockPath, performance.now() - started);
+    }
+    if (observe(lockPath) || lastRefusal.has(lockPath))
+      await sleep(Math.min(retryMs, remaining));
   }
+  lastRefusal.delete(lockPath);
   const children = childrenPath(lockPath, nonce);
   return {
     children,
@@ -513,13 +539,23 @@ export async function withLocks<T>(
     .map(([, path]) => path);
   const handles: LockHandle[] = [];
   try {
-    for (const path of ordered)
-      handles.push(
-        await acquireLock(
+    for (const path of ordered) {
+      // Later locks share the deadline of those already held.
+      const deadline = Math.min(
+        ...handles.map((handle) => handle.deadline ?? Infinity),
+        heldDeadline.getStore() ?? Infinity,
+      );
+      const acquire = () =>
+        acquireLock(
           path,
           typeof options === "function" ? options(path) : options,
-        ),
+        );
+      handles.push(
+        await (deadline === Infinity
+          ? acquire()
+          : heldDeadline.run(deadline, acquire)),
       );
+    }
     return await holding(handles, fn);
   } finally {
     for (const handle of handles.reverse()) handle.release();

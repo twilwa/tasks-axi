@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { BeadsStore } from "../../src/backends/beads.js";
+import { canonicalPath, withLock } from "../../src/backends/lock.js";
+import { MarkdownStore } from "../../src/backends/markdown.js";
 import { hasBr, makeBeadsWorkspace, recordBr } from "../beads-helpers.js";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -211,5 +213,54 @@ describe.skipIf(!hasBr || process.platform === "win32")(
           .issue_prefix,
       ).toBe("fresh");
     }, 60_000);
+
+    it("transfers wait for a held lock on either side and move nothing past the deadline", async () => {
+      const beads = new BeadsStore({ path: ws.path, lockTimeoutMs: 300 });
+      await beads.create({ id: "x", title: "X" });
+      const mdPath = join(ws.dir, "backlog.md");
+      writeFileSync(
+        mdPath,
+        "# Backlog\n\n## In flight\n\n## Queued\n\n- [ ] y - Y\n\n## Done\n",
+      );
+      const md = new MarkdownStore({ path: mdPath });
+      let release!: () => void;
+      let holding!: () => void;
+      const held = new Promise<void>((r) => (holding = r));
+      const holder = withLock(
+        canonicalPath(ws.path),
+        () => {
+          holding();
+          return new Promise<void>((r) => (release = r));
+        },
+        { recover: {} },
+      );
+      await held;
+      try {
+        await expect(beads.transferMany(["x"], md)).rejects.toMatchObject({
+          code: "LOCKED",
+        });
+        await expect(md.transferMany(["y"], beads)).rejects.toMatchObject({
+          code: "LOCKED",
+        });
+      } finally {
+        release();
+        await holder;
+      }
+      expect((await md.list({})).items.map((task) => task.id)).toEqual(["y"]);
+      expect((await beads.list({})).items.map((task) => task.id)).toEqual([
+        "x",
+      ]);
+    }, 30_000);
+
+    it("refuses to move tasks onto the same database through an alias", async () => {
+      const alias = join(ws.dir, "alias.db");
+      symlinkSync(ws.path, alias);
+      const store = new BeadsStore({ path: ws.path });
+      await store.create({ id: "x", title: "X" });
+      await expect(
+        new BeadsStore({ path: alias }).transferMany(["x"], store),
+      ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+      expect((await store.list({})).total).toBe(1);
+    }, 30_000);
   },
 );

@@ -3,15 +3,22 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  readlinkSync,
   rmSync,
+  statSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { isLocked, withLock } from "../../src/backends/lock.js";
+import {
+  isLocked,
+  takeOver,
+  withLock,
+  withLocks,
+} from "../../src/backends/lock.js";
 import { MarkdownStore } from "../../src/backends/markdown.js";
 
 const lockModule = pathToFileURL(resolve("src/backends/lock.ts")).href;
@@ -207,12 +214,18 @@ describe("recoverable locks", () => {
     );
     expect(code).toBe(7);
     const sub = Number(readFileSync(pidFile, "utf8"));
+    // A zombie (exited, awaiting its reaper) can no longer write.
     const alive = () => {
       try {
         process.kill(sub, 0);
-        return true;
       } catch {
         return false;
+      }
+      try {
+        const stat = readFileSync("/proc/" + sub + "/stat", "utf8");
+        return !stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+      } catch {
+        return process.platform !== "linux";
       }
     };
     expect(alive()).toBe(true);
@@ -279,6 +292,164 @@ describe("recoverable locks", () => {
     release();
     await holder;
   });
+
+  it("bounds several locks taken together by one deadline", async () => {
+    const first = join(dir, "a.db");
+    const second = join(dir, "b.db");
+    const hold = async (path: string, ms: number) => {
+      let holding!: () => void;
+      const held = new Promise<void>((r) => (holding = r));
+      const done = withLock(
+        path,
+        async () => {
+          holding();
+          await new Promise((r) => setTimeout(r, ms));
+        },
+        { recover: {} },
+      );
+      await held;
+      return { done };
+    };
+    // The first lock costs ~600 ms of the budget; the second is never free.
+    const a = await hold(first, 600);
+    const b = await hold(second, 4_000);
+    const started = performance.now();
+    await expect(
+      withLocks([first, second], () => "stolen", {
+        timeoutMs: 800,
+        retryMs: 20,
+        recover: {},
+      }),
+    ).rejects.toMatchObject({ code: "LOCKED" });
+    // One 800 ms budget for both, not 800 ms each (which would be ~1,400 ms).
+    expect(performance.now() - started).toBeLessThan(1_150);
+    await Promise.all([a.done, b.done]);
+  }, 15_000);
+
+  it("a late contender for an already-recovered lock leaves its successor alone", async () => {
+    const target = join(dir, "beads.db");
+    expect(await child(target, "crash", recover)).toBe(7);
+    const lock = target + ".lock";
+    // Contender A observed the abandoned instance, then stalled.
+    const stat = statSync(lock);
+    const stale = {
+      token: readFileSync(lock, "utf8"),
+      ino: stat.ino,
+      mtimeMs: stat.mtimeMs,
+    };
+    let release!: () => void;
+    let holding!: () => void;
+    const held = new Promise<void>((r) => (holding = r));
+    // Contender B recovered the lock and now holds a fresh one.
+    const successor = withLock(
+      target,
+      () => {
+        holding();
+        return new Promise<void>((r) => (release = r));
+      },
+      recover,
+    );
+    await held;
+    const fresh = readFileSync(lock, "utf8");
+    // A resumes with its stale observation; it must not remove B's lock.
+    takeOver(lock, stale);
+    expect(readFileSync(lock, "utf8")).toBe(fresh);
+    await expect(
+      withLock(target, () => "stolen", {
+        timeoutMs: 200,
+        retryMs: 20,
+        recover: {},
+      }),
+    ).rejects.toMatchObject({ code: "LOCKED" });
+    release();
+    await successor;
+  }, 30_000);
+
+  it.skipIf(process.platform !== "linux")(
+    "takes over from an exited owner its parent has not reaped yet",
+    async () => {
+      const target = join(dir, "beads.db");
+      const crash = join(dir, "crash.mts");
+      writeFileSync(
+        crash,
+        [
+          'import { writeFileSync } from "node:fs";',
+          "import { withLock } from " + JSON.stringify(lockModule) + ";",
+          "await withLock(process.argv[2], () => {",
+          "  writeFileSync(process.argv[3], String(process.pid));",
+          "  process.exit(7);",
+          "}, { recover: {} });",
+        ].join("\n"),
+      );
+      const pidFile = join(dir, "owner.pid");
+      // The parent blocks its event loop, so it never reaps the dead owner.
+      const parent = spawn(
+        process.execPath,
+        [
+          "-e",
+          [
+            "const { spawn } = require('node:child_process');",
+            "const fs = require('node:fs');",
+            "spawn(process.execPath, ['--import', 'tsx', " +
+              JSON.stringify(crash) +
+              ", " +
+              JSON.stringify(target) +
+              ", " +
+              JSON.stringify(pidFile) +
+              "], { stdio: 'ignore' });",
+            "const until = Date.now() + 15000;",
+            "while (Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);",
+          ].join("\n"),
+        ],
+        { stdio: "ignore", cwd: resolve(".") },
+      );
+      try {
+        const zombie = () => {
+          if (!existsSync(pidFile)) return false;
+          const pid = readFileSync(pidFile, "utf8");
+          try {
+            const stat = readFileSync("/proc/" + pid + "/stat", "utf8");
+            return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+          } catch {
+            return false;
+          }
+        };
+        const deadline = Date.now() + 10_000;
+        while (!zombie()) {
+          if (Date.now() > deadline)
+            throw new Error("owner never became a zombie");
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        await expect(
+          withLock(target, () => "ok", { timeoutMs: 2_000, recover: {} }),
+        ).resolves.toBe("ok");
+        expect(zombie()).toBe(true);
+      } finally {
+        parent.kill("SIGKILL");
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(process.platform !== "linux")(
+    "takes over when the owner's pid now belongs to a different process",
+    async () => {
+      const target = join(dir, "beads.db");
+      // A live pid (this test runner) with a start time it never had.
+      const reused =
+        "tasks-axi-lock/v2 pid=" +
+        process.ppid +
+        " host=" +
+        hostname() +
+        " ns=" +
+        readlinkSync("/proc/self/ns/pid") +
+        " nonce=reused start=1 n=1\n";
+      writeFileSync(target + ".lock", reused);
+      await expect(
+        withLock(target, () => "ok", { timeoutMs: 2_000, recover: {} }),
+      ).resolves.toBe("ok");
+    },
+  );
 });
 
 describe("markdown lock behaviour is unchanged", () => {
