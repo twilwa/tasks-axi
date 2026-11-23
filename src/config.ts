@@ -26,8 +26,17 @@ export interface ResolvedConfig {
   beadsBinary?: string;
   beadsPrefix?: string;
   beadsTimeoutMs?: number;
+  /** How long a beads writer waits for the backlog lock. */
+  beadsLockTimeoutMs?: number;
   beadsMirrorPath?: string;
   beadsMirrorArchivePath?: string;
+  /**
+   * Markdown only, when a beads store is also configured: that store's path
+   * as the beads backend would receive it. Markdown targets must not resolve
+   * to anything it owns. Undefined without beads configuration, so Markdown
+   * is exactly as on main.
+   */
+  beadsConfiguredPath?: string;
 }
 
 export interface ConfigOverrides {
@@ -45,6 +54,8 @@ interface TomlConfig {
     binary?: string;
     prefix?: string;
     timeout_ms?: number;
+    /** Raw TOML value text; parsed and validated only when beads is selected. */
+    lock_timeout_ms?: string;
     mirror?: string;
     mirror_archive?: string;
   };
@@ -94,6 +105,13 @@ export function parseConfigToml(src: string): TomlConfig {
     const key = kv[1];
     const source = configKeySource(table, key);
     if (!source) continue;
+    if (table === "beads" && key === "lock_timeout_ms") {
+      // A Markdown-only workspace ignores this beads-only setting, as before
+      // it existed; resolveConfig validates it when beads is selected.
+      config.beads ??= {};
+      config.beads.lock_timeout_ms = kv[2];
+      continue;
+    }
     const value = parseTomlValue(kv[2], source);
 
     if (table === "root") {
@@ -165,6 +183,7 @@ function configKeySource(table: ConfigTable, key: string): string | undefined {
       key === "binary" ||
       key === "prefix" ||
       key === "timeout_ms" ||
+      key === "lock_timeout_ms" ||
       key === "mirror" ||
       key === "mirror_archive")
   ) {
@@ -340,6 +359,33 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ResolvedConfig {
         );
       config.beadsTimeoutMs = timeout;
     }
+    const lockTimeoutToml =
+      projectToml.beads?.lock_timeout_ms ?? homeToml.beads?.lock_timeout_ms;
+    let lockTimeout: number | undefined;
+    if (env.TASKS_AXI_BEADS_LOCK_TIMEOUT_MS !== undefined)
+      lockTimeout = Number(env.TASKS_AXI_BEADS_LOCK_TIMEOUT_MS);
+    else if (lockTimeoutToml !== undefined) {
+      const value = parseTomlValue(lockTimeoutToml, "beads.lock_timeout_ms");
+      if (typeof value !== "number")
+        throw new AxiError(
+          "beads.lock_timeout_ms must be an integer",
+          "VALIDATION_ERROR",
+        );
+      lockTimeout = value;
+    }
+    if (lockTimeout !== undefined) {
+      if (
+        !Number.isSafeInteger(lockTimeout) ||
+        lockTimeout < 1 ||
+        lockTimeout > 2147483647 ||
+        env.TASKS_AXI_BEADS_LOCK_TIMEOUT_MS === ""
+      )
+        throw new AxiError(
+          "beads.lock_timeout_ms must be an integer between 1 and 2147483647",
+          "VALIDATION_ERROR",
+        );
+      config.beadsLockTimeoutMs = lockTimeout;
+    }
     const mirror = validatePathValue(
       projectToml.beads?.mirror ?? homeToml.beads?.mirror,
       "beads.mirror",
@@ -370,6 +416,19 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ResolvedConfig {
         homeToml.beads?.prefix,
       "beads.prefix",
     );
+  }
+  if (backend !== "beads") {
+    const configuredDatabase =
+      env.TASKS_AXI_BEADS_PATH ??
+      projectToml.beads?.path ??
+      homeToml.beads?.path;
+    // Spelled as resolveStorePath would select it for the beads backend.
+    if (configuredDatabase !== undefined && configuredDatabase.trim() !== "")
+      config.beadsConfiguredPath = resolveStorePath(
+        configuredDatabase,
+        undefined,
+        cwd,
+      );
   }
   if (archive) {
     config.archivePath = isAbsolute(archive) ? archive : resolve(cwd, archive);

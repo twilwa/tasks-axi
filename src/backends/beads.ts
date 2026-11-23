@@ -5,7 +5,7 @@
  * https://github.com/RooseveltAdvisors/tasks-axi/blob/8c6f96eb58924fd094053eb1a57dd57c64655bbd/src/backends/beads.ts
  */
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { AxiError, type ErrorCode, unsupported } from "../errors.js";
@@ -32,14 +32,67 @@ import {
   parseBacklog,
   renderTaskLines,
 } from "./markdown-grammar.js";
-import { atomicWrite, canonicalPath, readFileSafe } from "./lock.js";
-import { writeMarkdownMirror } from "./markdown-mirror.js";
 import {
-  assertTransferRemoval,
-  registerTransferStore,
-  transferCollection,
-  withCollectionLock as withLock,
-} from "./collection-transfer.js";
+  atomicWrite,
+  canonicalPath,
+  isLoop,
+  physicalPath,
+  reservedPath,
+  type LockOptions,
+  readFileSafe,
+  heldLockFds,
+  withLock,
+} from "./lock.js";
+import { writeMarkdownMirror } from "./markdown-mirror.js";
+
+/**
+ * The paths a beads store selected by `selected` uses, derived exactly as
+ * the store derives them: database, canonical lock key, ready marker and
+ * note archive.
+ */
+function beadsStorePaths(selected: string) {
+  const absolute = resolve(selected);
+  const path =
+    extname(absolute) === ".db" ? absolute : join(absolute, "beads.db");
+  const lockKey = canonicalPath(path);
+  return {
+    path,
+    lockKey,
+    readyMarker: `${lockKey}.tasks-axi-ready`,
+    noteArchivePath: join(dirname(path), "note-archive.md"),
+  };
+}
+
+/**
+ * Every pathname a beads store selected by `selected` opens, writes or locks,
+ * spelled as its own I/O spells them: the database and SQLite sidecars under
+ * both the selected and canonical name; the backlog lock, init lock and
+ * ready marker under the canonical lock key; the note archive; and the note
+ * archive's lock both beside the file it reaches now and beside its own
+ * directory entry (where the lock lands once the store's atomic rename
+ * replaces a symlinked note archive with a file). A note archive that is a
+ * symlink loop keeps its entry and that local lock reserved; only the lock
+ * beside its unresolvable referent is skipped.
+ */
+export function beadsOwnedPaths(selected: string): string[] {
+  const { path, lockKey, readyMarker, noteArchivePath } =
+    beadsStorePaths(selected);
+  const owned = new Set<string>();
+  for (const db of [path, lockKey])
+    for (const suffix of ["", "-wal", "-shm", "-journal"])
+      owned.add(`${db}${suffix}`);
+  owned.add(`${lockKey}.lock`);
+  owned.add(`${lockKey}.init.lock`);
+  owned.add(readyMarker);
+  owned.add(noteArchivePath);
+  owned.add(`${physicalPath(noteArchivePath, false)}.lock`);
+  try {
+    owned.add(`${canonicalPath(noteArchivePath)}.lock`);
+  } catch (error) {
+    if (!isLoop(error)) throw error;
+  }
+  return [...owned];
+}
 
 export interface BeadsStoreOptions {
   /** Explicit .beads workspace directory or .db file; never auto-discovered. */
@@ -49,6 +102,10 @@ export interface BeadsStoreOptions {
   prefix?: string;
   /** Kill an owned br child after this many milliseconds; default 30 seconds. */
   timeoutMs?: number;
+  /** Wait this long for the backlog lock; default 120 seconds. */
+  lockTimeoutMs?: number;
+  /** Bound on show argv bytes per call; tests lower it to force batching. */
+  showBatchBytes?: number;
   /** Optional one-way canonical markdown projections; never read as input. */
   mirrorPath?: string;
   mirrorArchivePath?: string;
@@ -66,13 +123,15 @@ interface AdapterData {
   order: number;
   closed?: string;
   meta?: Record<string, unknown>;
-  deps?: Dep[];
+  deps?: SavedDep[];
   hold?: Hold;
   /** Exact native labels added by this adapter, not every kind:/repo: label. */
   mirrors?: string[];
   /** Durable caller identity while external_ref is released for native delete. */
   pendingDelete?: string;
 }
+/** A saved edge also names its target's native id, so a recreated id cannot pass as the old target. */
+type SavedDep = Dep & { native?: string };
 type Bead = Record<string, unknown>;
 interface LoadedTask {
   bead: Bead;
@@ -268,7 +327,8 @@ function adapterData(bead: Bead, id: string): AdapterData {
         if (
           typeof edge.id !== "string" ||
           typeof edge.type !== "string" ||
-          (edge.reason !== undefined && typeof edge.reason !== "string")
+          (edge.reason !== undefined && typeof edge.reason !== "string") ||
+          (edge.native !== undefined && typeof edge.native !== "string")
         )
           throw new Error("Invalid edge");
         checkedDep(id, edge as unknown as Dep);
@@ -314,6 +374,9 @@ function mirrorArgs(
     ),
   };
 }
+const DEFAULT_LOCK_TIMEOUT_MS = 120_000;
+const SHOW_ARGV_BYTES = 8192;
+
 function stateOf(value: unknown): State {
   return value === "in_progress"
     ? "in_flight"
@@ -341,37 +404,65 @@ function brFailure(output: string): BrFailure {
     return new BrFailure("UNKNOWN", output.trim() || "br command failed");
   }
 }
-/** Stream both pipes: large backlogs must not hit execFile's 1 MiB limit. */
+/**
+ * Stream both pipes: large backlogs must not hit execFile's 1 MiB limit.
+ * br inherits the descriptors of every kernel lock this chain holds, so the
+ * lock outlives this process for as long as br (or anything it runs that
+ * keeps the descriptor) can still write. The call settles only once br has
+ * exited, so no caller unwinds, releases or rolls back under a live br.
+ */
 function runBr(
   binary: string,
   args: string[],
   cwd: string,
   timeoutMs: number,
   input?: string,
+  env?: NodeJS.ProcessEnv,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn(binary, args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(binary, args, {
+      cwd,
+      ...(env ? { env } : {}),
+      stdio: ["pipe", "pipe", "pipe", ...heldLockFds()],
+    });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
-    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
     let timedOut = false;
+    let failure: Error | undefined;
+    const stop = () => {
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.stdin?.destroy();
+      child.kill("SIGKILL"); // Only the ChildProcess we spawned, never a process-group/PID search.
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.stdout.destroy();
-      child.stderr.destroy();
-      child.stdin.destroy();
-      child.kill("SIGKILL"); // Only the ChildProcess we spawned, never a process-group/PID search.
+      stop();
     }, timeoutMs);
     child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
+      if (child.pid === undefined) {
+        // Never started: nothing can still write.
+        clearTimeout(timer);
+        reject(error);
+        return;
+      }
+      // Started, then failed: stop it and settle on its exit.
+      failure ??= error;
+      stop();
     });
-    child.stdin.on("error", (error: NodeJS.ErrnoException) => {
-      if (error.code !== "EPIPE") reject(error);
+    child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "EPIPE") return;
+      failure ??= error;
+      stop();
     });
     child.on("close", (code, signal) => {
       clearTimeout(timer);
+      if (failure) {
+        reject(failure);
+        return;
+      }
       if (timedOut) {
         reject(
           new BrFailure(
@@ -392,7 +483,7 @@ function runBr(
           ),
         );
     });
-    child.stdin.end(input);
+    child.stdin?.end(input);
   });
 }
 
@@ -404,6 +495,13 @@ export class BeadsStore implements Store {
   private readonly prefix: string;
   private readonly now: () => string;
   private readonly timeoutMs: number;
+  private readonly lockOptions: LockOptions;
+  /** Canonical database path: aliases of one database share one lock. */
+  private readonly lockKey: string;
+  private readonly readyMarker: string;
+  private readonly showBatchBytes: number;
+  /** Identity of the database file this instance last verified. */
+  private verified?: string;
   private readonly mirrorPath?: string;
   private readonly mirrorArchivePath?: string;
   private readonly doneKeep: number;
@@ -416,15 +514,17 @@ export class BeadsStore implements Store {
         "An explicit beads database path is required",
         "VALIDATION_ERROR",
       );
-    const selected = resolve(options.path);
-    this.path =
-      extname(selected) === ".db" ? selected : join(selected, "beads.db");
+    const paths = beadsStorePaths(options.path);
+    this.path = paths.path;
     // init creates .beads relative to cwd, so never run it inside .beads itself.
     this.cwd =
       basename(dirname(this.path)) === ".beads"
         ? dirname(dirname(this.path))
         : dirname(this.path);
-    this.noteArchivePath = join(dirname(this.path), "note-archive.md");
+    this.noteArchivePath = paths.noteArchivePath;
+    this.lockKey = paths.lockKey;
+    this.readyMarker = paths.readyMarker;
+    this.showBatchBytes = options.showBatchBytes ?? SHOW_ARGV_BYTES;
     this.binary = options.binary ?? "br";
     this.prefix = options.prefix ?? "tasks";
     this.timeoutMs = options.timeoutMs ?? 30_000;
@@ -434,6 +534,18 @@ export class BeadsStore implements Store {
       this.timeoutMs > 2147483647
     )
       invalid("beads.timeout_ms must be an integer between 1 and 2147483647");
+    const lockTimeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
+    if (
+      !Number.isSafeInteger(lockTimeoutMs) ||
+      lockTimeoutMs < 1 ||
+      lockTimeoutMs > 2147483647
+    )
+      invalid(
+        "beads.lock_timeout_ms must be an integer between 1 and 2147483647",
+      );
+    // Writers queue behind each other, so wait long enough for several
+    // complete writes; an abandoned lock is recovered instead of waited out.
+    this.lockOptions = { timeoutMs: lockTimeoutMs, kernel: true };
     this.now = options.now ?? today;
     if (
       options.mirrorArchivePath !== undefined &&
@@ -465,15 +577,18 @@ export class BeadsStore implements Store {
         invalid(
           "beads mirror paths must be distinct and must not overwrite the database, sidecars, locks or note archive",
         );
+      // Another store's lock or marker is just as live as this one's.
+      for (const output of outputs) {
+        const reason = reservedPath(output);
+        if (reason)
+          invalid(
+            `beads mirror path ${output} names ${reason}; choose a different file`,
+          );
+      }
     }
     this.doneKeep = options.doneKeep ?? 10;
     if (!Number.isSafeInteger(this.doneKeep) || this.doneKeep < 0)
       invalid("markdown.done_keep must be a non-negative integer");
-    registerTransferStore(
-      this,
-      this.path,
-      this.mirrorPath ? () => this.mutate(async () => undefined) : undefined,
-    );
   }
 
   private writePaths(): string[] {
@@ -484,34 +599,51 @@ export class BeadsStore implements Store {
       `${this.path}-journal`,
       `${this.path}.lock`,
       `${this.path}.init.lock`,
+      this.readyMarker,
       this.noteArchivePath,
     ].map(canonicalPath);
   }
 
-  private async mutate<T>(operation: () => Promise<T>): Promise<T> {
-    return withLock(this.path, async () => {
-      const result = await operation();
-      if (this.mirrorPath && this.mirrorArchivePath) {
-        try {
-          const tasks = (await this.load()).map((item) => item.task);
-          writeMarkdownMirror(
-            tasks,
-            this.mirrorPath,
-            this.mirrorArchivePath,
-            this.doneKeep,
-          );
-        } catch (error) {
-          throw new AxiError(
-            `Beads write succeeded, but markdown mirror refresh failed: ${error instanceof Error ? error.message : String(error)}`,
-            "UNKNOWN",
-            [
-              "The database remains authoritative; fix the mirror path and run tasks-axi render --backend beads",
-            ],
-          );
+  /**
+   * Run a write under the backlog lock, then refresh the mirror. An operation
+   * that ends holding the post-write graph passes it to `settle`, so the
+   * mirror renders from it instead of re-reading every row from br.
+   */
+  private async mutate<T>(
+    operation: (settle: (tasks: LoadedTask[]) => void) => Promise<T>,
+  ): Promise<T> {
+    return withLock(
+      this.lockKey,
+      async () => {
+        let settled: LoadedTask[] | undefined;
+        const result = await operation((tasks) => {
+          settled = tasks;
+        });
+        if (this.mirrorPath && this.mirrorArchivePath) {
+          try {
+            const tasks = (settled ?? (await this.load())).map(
+              (item) => item.task,
+            );
+            writeMarkdownMirror(
+              tasks,
+              this.mirrorPath,
+              this.mirrorArchivePath,
+              this.doneKeep,
+            );
+          } catch (error) {
+            throw new AxiError(
+              `Beads write succeeded, but markdown mirror refresh failed: ${error instanceof Error ? error.message : String(error)}`,
+              "UNKNOWN",
+              [
+                "The database remains authoritative; fix the mirror path and run tasks-axi render --backend beads",
+              ],
+            );
+          }
         }
-      }
-      return result;
-    });
+        return result;
+      },
+      this.lockOptions,
+    );
   }
 
   capabilities(): Capabilities {
@@ -524,29 +656,144 @@ export class BeadsStore implements Store {
       realtimeSync: false,
       customStates: true,
       serverMintsIds: true,
-      collectionTransfer: true,
+      // Cross-store moves are refused until receiving into beads lands.
+      collectionTransfer: false,
       publicFollowups: false,
     };
   }
 
-  async transferMany(ids: string[], destination: Store): Promise<Task[]> {
-    return transferCollection(this, ids, destination);
+  /**
+   * A database file existing does not prove `br init` finished, so first use
+   * confirms it under the init lock and leaves a marker beside the database.
+   */
+  /**
+   * The database file's identity. Inode numbers are reused after deletion,
+   * so the birth time is part of it.
+   */
+  private identity(): string {
+    const stat = statSync(this.path, { bigint: true });
+    return `${stat.dev}:${stat.ino}:${stat.birthtimeNs}\n`;
+  }
+
+  /** True when the ready marker certifies the database file present now. */
+  private markerMatches(): boolean {
+    const marker = readFileSafe(this.readyMarker);
+    if (!marker) return false;
+    try {
+      return marker === this.identity();
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * First use confirms the database was fully initialized, under the init
+   * lock, and binds a ready marker to that database file's identity.
+   * br 0.7.6 `init` ignores `--db` and initializes `BEADS_DIR` or
+   * `<cwd>/.beads` (and `BEADS_CACHE_DIR` can move the file), so tasks-axi
+   * only initializes `<dir>/beads.db`, with `BEADS_DIR` set to that
+   * directory and the overrides removed, and verifies where it landed.
+   */
+  private async ensureInitialized(): Promise<void> {
+    // Recheck on every br call: a database replaced or removed under a warm
+    // instance must earn the marker again, never inherit the old verdict.
+    let current: string | undefined;
+    try {
+      current = this.identity();
+    } catch {
+      current = undefined;
+    }
+    if (current !== undefined && current === this.verified) return;
+    this.verified = undefined;
+    if (current !== undefined && this.markerMatches()) {
+      this.verified = current;
+      return;
+    }
+    await withLock(
+      `${this.lockKey}.init`,
+      async () => {
+        if (this.markerMatches()) return;
+        const beadsDir = dirname(this.path);
+        // br initializes <BEADS_DIR>/beads.db; no other name can be created.
+        const standard = basename(this.path) === "beads.db";
+        const init = async (force: boolean) => {
+          if (!standard)
+            throw new AxiError(
+              `tasks-axi can only initialize a beads database named beads.db; initialize ${this.path} with br first`,
+              "VALIDATION_ERROR",
+            );
+          mkdirSync(beadsDir, { recursive: true });
+          const env: NodeJS.ProcessEnv = {
+            ...process.env,
+            BEADS_DIR: beadsDir,
+          };
+          delete env.BEADS_CACHE_DIR;
+          delete env.BEADS_DB;
+          await runBr(
+            this.binary,
+            [
+              "--db",
+              this.path,
+              "init",
+              ...(force ? ["--force"] : []),
+              "--prefix",
+              this.prefix,
+              "--json",
+            ],
+            dirname(beadsDir),
+            this.timeoutMs,
+            undefined,
+            env,
+          );
+        };
+        const verify = async (): Promise<string> => {
+          if (!existsSync(this.path) || statSync(this.path).size === 0)
+            return "missing";
+          const info = record(
+            JSON.parse(
+              await runBr(
+                this.binary,
+                ["--db", this.path, "info", "--json"],
+                this.cwd,
+                this.timeoutMs,
+              ),
+            ) as unknown,
+          );
+          const at = text(info.database_path);
+          if (!at || canonicalPath(at) !== this.lockKey) return "elsewhere";
+          const empty = info.issue_count === 0;
+          if (!text(record(info.config).issue_prefix))
+            return empty ? "incomplete" : "no prefix, but has issues";
+          if (
+            standard &&
+            empty &&
+            !["metadata.json", "config.yaml"].every((name) =>
+              existsSync(join(beadsDir, name)),
+            )
+          )
+            return "incomplete";
+          return "ok";
+        };
+        let state = await verify();
+        if (state === "missing" || state === "incomplete") {
+          await init(existsSync(this.path));
+          state = await verify();
+        }
+        if (state !== "ok")
+          throw new AxiError(
+            `Beads database ${this.path} is not usable (${state}); repair it with br before using tasks-axi`,
+            "UNKNOWN",
+          );
+        atomicWrite(this.readyMarker, this.identity());
+      },
+      this.lockOptions,
+    );
+    this.verified = this.identity();
   }
 
   private async call(args: string[], input?: string): Promise<unknown> {
     try {
-      if (!existsSync(this.path)) {
-        await withLock(`${this.path}.init`, async () => {
-          if (existsSync(this.path)) return;
-          mkdirSync(dirname(this.path), { recursive: true });
-          await runBr(
-            this.binary,
-            ["--db", this.path, "init", "--prefix", this.prefix, "--json"],
-            this.cwd,
-            this.timeoutMs,
-          );
-        });
-      }
+      await this.ensureInitialized();
       // Every subprocess, reads included, is pinned to this exact database.
       const out = await runBr(
         this.binary,
@@ -577,131 +824,121 @@ export class BeadsStore implements Store {
     }
   }
 
-  private async load(): Promise<LoadedTask[]> {
-    const raw = record(await this.call(["list", "--all", "--limit", "0"]));
-    if (!Array.isArray(raw.issues))
-      throw new AxiError("br list returned invalid issues", "UNKNOWN");
-    const result: LoadedTask[] = [];
-    for (const value of raw.issues) {
-      const bead = record(value);
-      const ref = text(bead.external_ref);
-      if (bead.status === "tombstone") continue;
-      let callerId = ref?.startsWith("tasks-axi:")
-        ? ref.slice("tasks-axi:".length)
-        : undefined;
-      if (callerId === undefined && ref === undefined) {
-        // A failed/interrupted delete must remain addressable, not look absent.
-        try {
-          callerId = text(nativeData(bead).pendingDelete);
-        } catch {
-          continue;
-        }
+  /** Project one native record; undefined for rows tasks-axi does not own. */
+  private project(value: unknown): LoadedTask | undefined {
+    const bead = record(value);
+    const ref = text(bead.external_ref);
+    if (bead.status === "tombstone") return undefined;
+    let callerId = ref?.startsWith("tasks-axi:")
+      ? ref.slice("tasks-axi:".length)
+      : undefined;
+    if (callerId === undefined && ref === undefined) {
+      // A failed/interrupted delete must remain addressable, not look absent.
+      try {
+        callerId = text(nativeData(bead).pendingDelete);
+      } catch {
+        return undefined;
       }
-      if (callerId === undefined) continue;
-      const id = validateId(callerId);
-      if (typeof bead.id !== "string") invalid(`Invalid native id for "${id}"`);
-      this.ids.set(bead.id, id);
-      const data = adapterData(bead, id);
-      workerKind(data.kind);
-      const title = text(bead.title) ?? id;
-      const task: Task = {
-        id,
-        title,
-        state: stateOf(bead.status),
-        links: deriveLinks(title),
-        deps: [],
-      };
-      const kind = data.kind ?? leadingKind(title);
-      if (kind) task.kind = kind;
-      if (data.repo) task.repo = data.repo;
-      if (data.meta) task.meta = data.meta;
-      if (data.hold) task.hold = { ...data.hold };
-      if (text(bead.description)) task.body = text(bead.description);
-      // Match markdown's read projection: Done renders only its closed stamp.
-      if (data.created && task.state !== "done") task.created = data.created;
-      // Hide only br's implicit default, never a non-default native priority.
-      if (
-        (data.prioritySet || bead.priority !== 2) &&
-        typeof bead.priority === "number"
-      )
-        task.priority = bead.priority;
-      if (task.state === "done" && data.closed) task.closed = data.closed;
-      result.push({ bead, data, task });
     }
+    if (callerId === undefined) return undefined;
+    const id = validateId(callerId);
+    if (typeof bead.id !== "string") invalid(`Invalid native id for "${id}"`);
+    this.ids.set(bead.id, id);
+    const data = adapterData(bead, id);
+    workerKind(data.kind);
+    const title = text(bead.title) ?? id;
+    const task: Task = {
+      id,
+      title,
+      state: stateOf(bead.status),
+      links: deriveLinks(title),
+      deps: [],
+    };
+    const kind = data.kind ?? leadingKind(title);
+    if (kind) task.kind = kind;
+    if (data.repo) task.repo = data.repo;
+    if (data.meta) task.meta = data.meta;
+    if (data.hold) task.hold = { ...data.hold };
+    if (text(bead.description)) task.body = text(bead.description);
+    // Match markdown's read projection: Done renders only its closed stamp.
+    if (data.created && task.state !== "done") task.created = data.created;
+    // Hide only br's implicit default, never a non-default native priority.
+    if (
+      (data.prioritySet || bead.priority !== 2) &&
+      typeof bead.priority === "number"
+    )
+      task.priority = bead.priority;
+    if (task.state === "done" && data.closed) task.closed = data.closed;
+    return { bead, data, task };
+  }
+
+  /** Native edges are authoritative; saved reasons and order decorate them. */
+  private attachDeps(
+    loaded: LoadedTask,
+    detail: Bead,
+    byNative: Map<unknown, LoadedTask>,
+  ): void {
+    const deps: Dep[] = [];
+    for (const value of Array.isArray(detail.dependencies)
+      ? detail.dependencies
+      : []) {
+      const edge = record(value);
+      const type = (Object.keys(DEP_TYPES) as Dep["type"][]).find(
+        (key) => DEP_TYPES[key] === edge.dependency_type,
+      );
+      if (!type) continue;
+      const target = byNative.get(edge.id);
+      // The Store graph contains caller-owned tasks only. Native-only
+      // relationships are left untouched, but cannot expose native ids here.
+      if (!target) continue;
+      const saved = loaded.data.deps?.find(
+        (dep) => dep.type === type && dep.id === target.task.id,
+      );
+      deps.push({
+        type,
+        id: target.task.id,
+        ...(saved?.reason ? { reason: saved.reason } : {}),
+      });
+    }
+    const order = (dep: Dep) =>
+      loaded.data.deps?.findIndex(
+        (saved) => saved.type === dep.type && saved.id === dep.id,
+      ) ?? -1;
+    loaded.task.deps = deps.sort((a, b) => order(a) - order(b));
+  }
+
+  private async show(ids: string[]): Promise<Bead[]> {
+    // Bound UTF-8 argv bytes, well below platform (Windows) command-line limits.
+    const batches: string[][] = [];
+    let batch: string[] = [];
+    let bytes = 0;
+    for (const id of ids) {
+      const size = Buffer.byteLength(id) + 1;
+      if (batch.length && bytes + size > this.showBatchBytes) {
+        batches.push(batch);
+        batch = [];
+        bytes = 0;
+      }
+      batch.push(id);
+      bytes += size;
+    }
+    if (batch.length) batches.push(batch);
+    const shown: Bead[] = [];
+    for (const ids of batches) {
+      const details = await this.call(["show", ...ids]);
+      if (!Array.isArray(details))
+        throw new AxiError("br show returned invalid issues", "UNKNOWN");
+      shown.push(...details.map(record));
+    }
+    return shown;
+  }
+
+  private sorted(result: LoadedTask[]): LoadedTask[] {
     if (new Set(result.map((item) => item.task.id)).size !== result.length) {
       throw new AxiError(
         "Duplicate tasks-axi external references in beads",
         "CONFLICT",
       );
-    }
-    if (result.length) {
-      // Bound both ID count and UTF-8 bytes, well below platform argv limits.
-      const batches: string[][] = [];
-      let batch: string[] = [];
-      let bytes = 0;
-      for (const item of result) {
-        const id = String(item.bead.id);
-        const size = Buffer.byteLength(id) + 1;
-        if (batch.length && (batch.length >= 64 || bytes + size > 8192)) {
-          batches.push(batch);
-          batch = [];
-          bytes = 0;
-        }
-        batch.push(id);
-        bytes += size;
-      }
-      if (batch.length) batches.push(batch);
-      const shown: unknown[] = [];
-      for (const ids of batches) {
-        const details = await this.call(["show", ...ids]);
-        if (!Array.isArray(details))
-          throw new AxiError("br show returned invalid issues", "UNKNOWN");
-        shown.push(...details);
-      }
-      const shownIds = new Set(shown.map((item) => record(item).id));
-      if (result.some((item) => !shownIds.has(item.bead.id)))
-        throw new AxiError(
-          "Beads graph changed while reading; retry",
-          "CONFLICT",
-        );
-      const byNative = new Map(result.map((item) => [item.bead.id, item]));
-      for (const value of shown) {
-        const detail = record(value);
-        const loaded = byNative.get(detail.id);
-        if (!loaded) continue;
-        if (loaded.bead.updated_at !== detail.updated_at)
-          throw new AxiError(
-            "Beads task changed while reading; retry",
-            "CONFLICT",
-          );
-        const deps: Dep[] = [];
-        for (const value of Array.isArray(detail.dependencies)
-          ? detail.dependencies
-          : []) {
-          const edge = record(value);
-          const type = (Object.keys(DEP_TYPES) as Dep["type"][]).find(
-            (key) => DEP_TYPES[key] === edge.dependency_type,
-          );
-          if (!type) continue;
-          const target = byNative.get(edge.id);
-          // The Store graph contains caller-owned tasks only. Native-only
-          // relationships are left untouched, but cannot expose native ids here.
-          if (!target) continue;
-          const saved = loaded.data.deps?.find(
-            (dep) => dep.type === type && dep.id === target.task.id,
-          );
-          deps.push({
-            type,
-            id: target.task.id,
-            ...(saved?.reason ? { reason: saved.reason } : {}),
-          });
-        }
-        const order = (dep: Dep) =>
-          loaded.data.deps?.findIndex(
-            (saved) => saved.type === dep.type && saved.id === dep.id,
-          ) ?? -1;
-        loaded.task.deps = deps.sort((a, b) => order(a) - order(b));
-      }
     }
     const states: State[] = ["in_flight", "queued", "done"];
     return result.sort(
@@ -711,8 +948,104 @@ export class BeadsStore implements Store {
     );
   }
 
-  async isEmpty(): Promise<boolean> {
+  /**
+   * One `list` for every row, plus `show` only for rows whose native edge
+   * count disagrees with the edges the adapter saved (`list` reports the
+   * count but not the edges).
+   */
+  private async load(): Promise<LoadedTask[]> {
     const raw = record(await this.call(["list", "--all", "--limit", "0"]));
+    if (!Array.isArray(raw.issues))
+      throw new AxiError("br list returned invalid issues", "UNKNOWN");
+    const result: LoadedTask[] = [];
+    for (const value of raw.issues) {
+      const loaded = this.project(value);
+      if (loaded) result.push(loaded);
+    }
+    this.sorted(result);
+    const byId = new Map(result.map((item) => [item.task.id, item]));
+    const linked: LoadedTask[] = [];
+    for (const item of result) {
+      const count = item.bead.dependency_count;
+      if (count === 0) continue;
+      // The adapter saves every edge it writes. While br's own edge count
+      // agrees and every saved target is managed, the saved list is the native
+      // edge set; any native add, remove, deleted target or unmanaged edge
+      // changes the count and sends that row to an authoritative show.
+      const saved = item.data.deps ?? [];
+      if (
+        count === saved.length &&
+        saved.every(
+          (dep) =>
+            dep.native !== undefined &&
+            byId.get(dep.id)?.bead.id === dep.native,
+        )
+      ) {
+        item.task.deps = saved.map((dep) => ({
+          type: dep.type,
+          id: dep.id,
+          ...(dep.reason ? { reason: dep.reason } : {}),
+        }));
+        continue;
+      }
+      linked.push(item);
+    }
+    if (linked.length) {
+      const shown = await this.show(linked.map((item) => String(item.bead.id)));
+      const shownIds = new Set(shown.map((item) => item.id));
+      if (linked.some((item) => !shownIds.has(item.bead.id)))
+        throw new AxiError(
+          "Beads graph changed while reading; retry",
+          "CONFLICT",
+        );
+      const byNative = new Map(result.map((item) => [item.bead.id, item]));
+      for (const detail of shown) {
+        const loaded = byNative.get(detail.id);
+        if (!loaded) continue;
+        if (loaded.bead.updated_at !== detail.updated_at)
+          throw new AxiError(
+            "Beads task changed while reading; retry",
+            "CONFLICT",
+          );
+        this.attachDeps(loaded, detail, byNative);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * The locked snapshot with one row re-read from br. Each adapter write
+   * changes only its own row's fields and edges (an edge lives on the
+   * dependent), so this equals a full reload without re-reading every row.
+   */
+  private async reread(
+    all: LoadedTask[],
+    nativeId: string,
+  ): Promise<LoadedTask[]> {
+    const [detail] = await this.show([nativeId]);
+    const others = all.filter((item) => item.bead.id !== nativeId);
+    const loaded = detail?.id === nativeId ? this.project(detail) : undefined;
+    if (!loaded) return others;
+    const byNative = new Map(
+      [...others, loaded].map((item) => [item.bead.id, item]),
+    );
+    this.attachDeps(loaded, detail, byNative);
+    return this.sorted([...others, loaded]);
+  }
+
+  /**
+   * Public reads hold the same lock as writes: one br list is not a snapshot
+   * (br reads rows and edge counts separately), so an unlocked read could see
+   * a row from before a write with counts from after it.
+   */
+  private locked<T>(read: () => Promise<T>): Promise<T> {
+    return withLock(this.lockKey, read, this.lockOptions);
+  }
+
+  async isEmpty(): Promise<boolean> {
+    const raw = record(
+      await this.locked(() => this.call(["list", "--all", "--limit", "0"])),
+    );
     if (!Array.isArray(raw.issues))
       throw new AxiError("br list returned invalid issues", "UNKNOWN");
     return raw.issues.every((value) => record(value).status === "tombstone");
@@ -720,11 +1053,12 @@ export class BeadsStore implements Store {
 
   async get(id: string): Promise<Task | null> {
     return (
-      (await this.load()).find((item) => item.task.id === id)?.task ?? null
+      (await this.locked(() => this.load())).find((item) => item.task.id === id)
+        ?.task ?? null
     );
   }
   async list(query: TaskQuery): Promise<{ items: Task[]; total: number }> {
-    let items = (await this.load()).map((item) => item.task);
+    let items = (await this.locked(() => this.load())).map((item) => item.task);
     if (query.state) items = items.filter((task) => task.state === query.state);
     if (query.repo) items = items.filter((task) => task.repo === query.repo);
     if (query.kind) items = items.filter((task) => task.kind === query.kind);
@@ -775,7 +1109,7 @@ export class BeadsStore implements Store {
 
   async create(input: TaskInput): Promise<Task> {
     input = prepareInput(input);
-    return this.mutate(async () => {
+    return this.mutate(async (settle) => {
       const id = validateId(input.id);
       const all = await this.load();
       if (all.some((item) => item.task.id === id))
@@ -807,7 +1141,7 @@ export class BeadsStore implements Store {
               : dateValue(this.now()),
         prioritySet: input.priority !== undefined,
         closed: input.closed,
-        deps,
+        deps: this.saved(all, deps),
         hold: input.hold,
         meta: input.meta,
         order:
@@ -818,34 +1152,36 @@ export class BeadsStore implements Store {
       const kind = input.kind ?? leadingKind(input.title);
       const mirrors = mirrorLabels({ ...input, kind });
       data.mirrors = mirrors;
-      await this.call(
-        [
-          "create",
-          ...(nativeDeps.length ? ["--deps", nativeDeps.join(",")] : []),
-          ...(mirrors.length ? ["--labels", mirrors.join(",")] : []),
-          ...(input.hold?.until ? ["--defer", input.hold.until] : []),
-          "--title",
-          input.title,
-          "--slug",
-          id,
-          "--external-ref",
-          `tasks-axi:${id}`,
-          "--type",
-          "task",
-          "--status",
-          state === "done"
-            ? "closed"
-            : state === "in_flight"
-              ? "in_progress"
-              : "open",
-          "--description-file",
-          "-",
-          "--priority",
-          String(input.priority ?? 2),
-          "--agent-context",
-          JSON.stringify({ tasks_axi: data }),
-        ],
-        input.body ?? "",
+      const created = record(
+        await this.call(
+          [
+            "create",
+            ...(nativeDeps.length ? ["--deps", nativeDeps.join(",")] : []),
+            ...(mirrors.length ? ["--labels", mirrors.join(",")] : []),
+            ...(input.hold?.until ? ["--defer", input.hold.until] : []),
+            "--title",
+            input.title,
+            "--slug",
+            id,
+            "--external-ref",
+            `tasks-axi:${id}`,
+            "--type",
+            "task",
+            "--status",
+            state === "done"
+              ? "closed"
+              : state === "in_flight"
+                ? "in_progress"
+                : "open",
+            "--description-file",
+            "-",
+            "--priority",
+            String(input.priority ?? 2),
+            "--agent-context",
+            JSON.stringify({ tasks_axi: data }),
+          ],
+          input.body ?? "",
+        ),
       );
       const task: Task = {
         id,
@@ -862,7 +1198,9 @@ export class BeadsStore implements Store {
       if (data.created) task.created = data.created;
       if (input.closed) task.closed = input.closed;
       if (input.meta) task.meta = input.meta;
-      await this.verifyTask(task);
+      if (typeof created.id !== "string")
+        throw new AxiError("br create returned no issue id", "UNKNOWN");
+      settle(await this.verifyTask(task, all, created.id));
       return task;
     });
   }
@@ -872,6 +1210,14 @@ export class BeadsStore implements Store {
     return found;
   }
 
+  /** Edges to save in adapter metadata, each with its target's native id. */
+  private saved(all: LoadedTask[], deps: Dep[]): SavedDep[] {
+    return deps.map((dep) => {
+      const target = all.find((item) => item.task.id === dep.id);
+      return target ? { ...dep, native: String(target.bead.id) } : dep;
+    });
+  }
+
   private dependency(all: LoadedTask[], id: string): LoadedTask {
     const found = all.find((item) => item.task.id === id);
     if (!found) invalid(`Dependency "${id}" not found`);
@@ -879,8 +1225,13 @@ export class BeadsStore implements Store {
   }
 
   /** Verify persistence, but return computed mutations to retain markdown's immediate-result dates. */
-  private async verifyTask(expected: Task): Promise<void> {
-    const actual = this.required(await this.load(), expected.id).task;
+  private async verifyTask(
+    expected: Task,
+    all: LoadedTask[],
+    nativeId: string,
+  ): Promise<LoadedTask[]> {
+    const after = await this.reread(all, nativeId);
+    const actual = this.required(after, expected.id).task;
     const wanted = {
       ...expected,
       kind: expected.kind ?? leadingKind(expected.title),
@@ -899,6 +1250,7 @@ export class BeadsStore implements Store {
           "CONFLICT",
         );
     }
+    return after;
   }
 
   private context(bead: Bead, data: AdapterData): string {
@@ -921,8 +1273,9 @@ export class BeadsStore implements Store {
       priority: priorityValue(patch.priority),
     };
     workerKind(patch.kind);
-    return this.mutate(async () => {
-      const found = this.required(await this.load(), id);
+    return this.mutate(async (settle) => {
+      const all = await this.load();
+      const found = this.required(all, id);
       const task = { ...found.task };
       const changed: TaskUpdateChange[] = [];
       const mark = (field: TaskUpdateChange) => {
@@ -984,7 +1337,10 @@ export class BeadsStore implements Store {
           mark("links");
         }
       }
-      if (!changed.length) return { task: found.task, changed };
+      if (!changed.length) {
+        settle(all);
+        return { task: found.task, changed };
+      }
       const mirrors = mirrorArgs(
         found.bead,
         found.data.mirrors ?? mirrorLabels(found.task),
@@ -1033,15 +1389,19 @@ export class BeadsStore implements Store {
             ["comments", "add", String(found.bead.id), "-f", "-"],
             oldBody,
           );
-        await withLock(this.noteArchivePath, () => {
-          const existing = readFileSafe(this.noteArchivePath) ?? "";
-          const lines = renderTaskLines(found.task).join("\n");
-          if (!existing.includes(`\n${lines}\n`))
-            atomicWrite(
-              this.noteArchivePath,
-              `${existing}\n## Archived ${this.now()}\n${lines}\n`,
-            );
-        });
+        await withLock(
+          canonicalPath(this.noteArchivePath),
+          () => {
+            const existing = readFileSafe(this.noteArchivePath) ?? "";
+            const lines = renderTaskLines(found.task).join("\n");
+            if (!existing.includes(`\n${lines}\n`))
+              atomicWrite(
+                this.noteArchivePath,
+                `${existing}\n## Archived ${this.now()}\n${lines}\n`,
+              );
+          },
+          this.lockOptions,
+        );
         mark("archive");
       }
       await this.call(
@@ -1050,15 +1410,15 @@ export class BeadsStore implements Store {
       );
       task.links = deriveLinks(task.title);
       task.updated = this.now();
-      await this.verifyTask(task);
+      settle(await this.verifyTask(task, all, String(found.bead.id)));
       return { task, changed };
     });
   }
   async remove(id: string): Promise<Task> {
+    // A delete can change other rows' visible edges: let mutate reload.
     return this.mutate(async () => {
       const all = await this.load();
       const found = this.required(all, id);
-      assertTransferRemoval(this, found.task);
       const dependents = all.filter(
         (item) =>
           item.task.state !== "done" &&
@@ -1104,7 +1464,7 @@ export class BeadsStore implements Store {
     to: State,
     opts: TransitionOpts = {},
   ): Promise<Task> {
-    return this.mutate(async () => {
+    return this.mutate(async (settle) => {
       const all = await this.load();
       const found = this.required(all, id);
       if (!STATES.includes(to)) invalid("Invalid task state");
@@ -1162,28 +1522,31 @@ export class BeadsStore implements Store {
         closed: data.closed,
         updated: this.now(),
       };
-      await this.verifyTask(task);
+      settle(await this.verifyTask(task, all, String(found.bead.id)));
       return task;
     });
   }
   async addDep(id: string, dep: Dep): Promise<boolean> {
     const checked = checkedDep(id, dep);
-    return this.mutate(async () => {
+    return this.mutate(async (settle) => {
       const all = await this.load();
       const found = this.required(all, id);
       if (
         found.task.deps.some(
           (edge) => edge.type === checked.type && edge.id === checked.id,
         )
-      )
+      ) {
+        settle(all);
         return false;
+      }
       const target = this.dependency(all, checked.id);
       if (found.task.deps.some((edge) => edge.id === checked.id))
         invalid("Beads supports only one dependency per task pair");
       // Persist the reason before adding the edge. A retry can finish an
       // absent native edge; it must never mistake an edge with a lost reason
       // for a complete operation. Unattached metadata is invisible to reads.
-      const data = { ...found.data, deps: [...found.task.deps, checked] };
+      const deps = [...found.task.deps, checked];
+      const data = { ...found.data, deps: this.saved(all, deps) };
       await this.call([
         "update",
         String(found.bead.id),
@@ -1199,21 +1562,29 @@ export class BeadsStore implements Store {
         "--type",
         DEP_TYPES[checked.type],
       ]);
-      await this.verifyTask({ ...found.task, deps: data.deps });
+      settle(
+        await this.verifyTask(
+          { ...found.task, deps },
+          all,
+          String(found.bead.id),
+        ),
+      );
       return true;
     });
   }
   async removeDep(id: string, dep: Dep): Promise<boolean> {
     const checked = checkedDep(id, dep);
-    return this.mutate(async () => {
+    return this.mutate(async (settle) => {
       const all = await this.load();
       const found = this.required(all, id);
       if (
         !found.task.deps.some(
           (edge) => edge.type === checked.type && edge.id === checked.id,
         )
-      )
+      ) {
+        settle(all);
         return false;
+      }
       const target = this.required(all, checked.id);
       await this.call([
         "dep",
@@ -1221,12 +1592,10 @@ export class BeadsStore implements Store {
         String(found.bead.id),
         String(target.bead.id),
       ]);
-      const data = {
-        ...found.data,
-        deps: found.task.deps.filter(
-          (edge) => edge.type !== checked.type || edge.id !== checked.id,
-        ),
-      };
+      const deps = found.task.deps.filter(
+        (edge) => edge.type !== checked.type || edge.id !== checked.id,
+      );
+      const data = { ...found.data, deps: this.saved(all, deps) };
       await this.call([
         "update",
         String(found.bead.id),
@@ -1234,14 +1603,24 @@ export class BeadsStore implements Store {
         "--agent-context",
         this.context(found.bead, data),
       ]);
-      await this.verifyTask({ ...found.task, deps: data.deps });
+      settle(
+        await this.verifyTask(
+          { ...found.task, deps },
+          all,
+          String(found.bead.id),
+        ),
+      );
       return true;
     });
   }
   async render(): Promise<number> {
     if (!this.mirrorPath)
       throw unsupported("render without beads.mirror", "beads");
-    return this.mutate(async () => (await this.load()).length);
+    return this.mutate(async (settle) => {
+      const all = await this.load();
+      settle(all);
+      return all.length;
+    });
   }
 
   async updatePublicFollowup(): Promise<Task> {

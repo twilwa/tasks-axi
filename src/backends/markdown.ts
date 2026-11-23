@@ -8,6 +8,7 @@ import {
 import { dirname, resolve } from "node:path";
 import {
   AxiError,
+  crossStoreMoveError,
   partialMoveError,
   stillBlockingError,
   strandedDepError,
@@ -45,13 +46,13 @@ import type {
   PruneResult,
   Store,
 } from "../store.js";
-import { atomicWrite, readFileSafe, withLocks } from "./lock.js";
 import {
-  assertTransferRemoval,
-  registerTransferStore,
-  transferCollection,
-  withCollectionLock as withLock,
-} from "./collection-transfer.js";
+  atomicWrite,
+  pathIdentities,
+  readFileSafe,
+  withLock,
+  withLocks,
+} from "./lock.js";
 import {
   type BacklogDoc,
   type Entry,
@@ -66,6 +67,12 @@ import {
 
 export interface MarkdownStoreOptions {
   path: string;
+  /**
+   * Canonical paths a configured beads store owns. The backlog, its lock
+   * and its archives must not resolve to any of them. Absent (Markdown
+   * only), no path is checked, exactly as before.
+   */
+  reservedPaths?: string[];
   /** Read-only archive view: recognize `## Archived YYYY-MM-DD` as Done. */
   archived?: boolean;
   /** Where pruned Done items are archived (default `<dir>/done-archive.md`). */
@@ -343,8 +350,25 @@ export class MarkdownStore implements Store {
         "VALIDATION_ERROR",
       );
     }
+    if (options.reservedPaths?.length) {
+      // Compare the directory entry and the file it reaches on both sides,
+      // spelled as each side's I/O spells them (the lock is the backlog's
+      // own spelling plus .lock, as acquisition derives it).
+      const reserved = new Set(options.reservedPaths.flatMap(pathIdentities));
+      for (const target of [
+        this.path,
+        `${this.path}.lock`,
+        this.archivePath,
+        this.noteArchivePath,
+      ])
+        for (const path of pathIdentities(target))
+          if (reserved.has(path))
+            throw new AxiError(
+              `${target} resolves to ${path}, which is reserved by the configured beads store; choose a different Markdown file`,
+              "VALIDATION_ERROR",
+            );
+    }
     this.now = options.now ?? today;
-    registerTransferStore(this, this.path);
   }
 
   capabilities(): Capabilities {
@@ -786,7 +810,6 @@ export class MarkdownStore implements Store {
       const found = this.findEntry(doc, id);
       if (!found) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
       const task = found.entry.task;
-      assertTransferRemoval(this, task);
       if (
         isPublicFollowupTask(task) &&
         task.public_followup &&
@@ -810,11 +833,17 @@ export class MarkdownStore implements Store {
     return moved;
   }
 
-  /** Keep the upstream two-file markdown path; br uses recoverable copy-first transfer. */
+  /** The upstream two-file markdown transaction; other destinations are refused. */
   async transferMany(ids: string[], destination: Store): Promise<Task[]> {
-    return destination instanceof MarkdownStore
-      ? this.moveManyTo(ids, destination)
-      : transferCollection(this, ids, destination);
+    if (!(destination instanceof MarkdownStore))
+      throw crossStoreMoveError(
+        { backend: "markdown", path: this.path },
+        {
+          backend: destination.capabilities().backend,
+          path: "the destination store",
+        },
+      );
+    return this.moveManyTo(ids, destination);
   }
 
   /**

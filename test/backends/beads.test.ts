@@ -25,9 +25,13 @@ describe.skipIf(!hasBr)("beads_rust Store conformance", () => {
   it("does not truncate large reads, bounds show arguments, applies limits after total, and sees native state changes", async () => {
     const recorder = recordBr(workspace.dir, workspace.path, {
       before:
-        "if (args[2] === 'show' && args.slice(3, -1).length > 64) process.exit(26);",
+        "if (args[2] === 'show' && Buffer.byteLength(args.slice(3, -1).join(' ')) > 200) process.exit(26);",
     });
-    store = new BeadsStore({ path: workspace.path, binary: recorder.binary });
+    store = new BeadsStore({
+      path: workspace.path,
+      binary: recorder.binary,
+      showBatchBytes: 200,
+    });
     const metadata = (order: number) =>
       JSON.stringify({
         tasks_axi: {
@@ -40,10 +44,13 @@ describe.skipIf(!hasBr)("beads_rust Store conformance", () => {
         },
       });
     const body = "Detailed notes\n".repeat(80_000);
-    for (let i = 0; i < 70; i++)
-      workspace.br(
+    const native: string[] = [];
+    for (let i = 0; i < 70; i++) {
+      const created = workspace.br(
         [
           "create",
+          // Only rows with native edges need a show; link every odd row.
+          ...(i % 2 ? ["--deps", `blocks:${native[i - 1]}`] : []),
           "--title",
           `Task ${i}`,
           "--slug",
@@ -55,7 +62,9 @@ describe.skipIf(!hasBr)("beads_rust Store conformance", () => {
           ...(i === 0 ? ["--description-file", "-"] : []),
         ],
         i === 0 ? body : undefined,
-      );
+      ) as { id: string };
+      native.push(created.id);
+    }
     const { items, total } = await store.list({
       repo: "example",
       kind: "task",
@@ -67,8 +76,11 @@ describe.skipIf(!hasBr)("beads_rust Store conformance", () => {
       .split("\n")
       .map((line) => JSON.parse(line) as string[])
       .filter((args) => args[2] === "show");
-    expect(shows).toHaveLength(2);
-    expect(shows.every((args) => args.slice(3, -1).length <= 64)).toBe(true);
+    // 35 linked rows exceed one 200-byte batch, so the read must split.
+    expect(shows.length).toBeGreaterThan(1);
+    expect(shows.flatMap((args) => args.slice(3, -1))).toEqual(
+      native.filter((_, i) => i % 2),
+    );
     expect(items.map((item) => item.id)).toEqual(["item-0", "item-1"]);
     expect(items[0].body).toBe(body);
     expect((await store.list({ limit: 0 })).total).toBe(70);
@@ -158,6 +170,21 @@ describe.skipIf(!hasBr)("beads_rust Store conformance", () => {
     "rejects a managed record that changes between listing and graph hydration",
     async () => {
       await store.create({ id: "changed", title: "Changed" });
+      // An edge the adapter did not save makes the row need a hydrating show.
+      const raw = workspace.br(["list", "--all", "--limit", "0"]) as {
+        issues: { id: string }[];
+      };
+      const unmanaged = (
+        workspace.br(["create", "--title", "native only"]) as { id: string }
+      ).id;
+      workspace.br([
+        "dep",
+        "add",
+        raw.issues[0].id,
+        unmanaged,
+        "--type",
+        "discovered-from",
+      ]);
       const marker = join(workspace.dir, "change-during-show");
       writeFileSync(marker, "");
       const recorder = recordBr(workspace.dir, workspace.path, {
@@ -559,7 +586,7 @@ describe.skipIf(!hasBr)("beads_rust Store conformance", () => {
   );
 
   it.skipIf(process.platform === "win32")(
-    "pins all commands to the selected DB and hydrates the graph with one batched show",
+    "pins all commands to the selected DB and reads saved edges without a show",
     async () => {
       const log = join(workspace.dir, "commands.jsonl");
       const wrapper = join(workspace.dir, "record-br.cjs");
@@ -614,7 +641,8 @@ process.exit(result.status ?? 1);\n`,
         .trim()
         .split("\n")
         .map((line) => JSON.parse(line) as string[]);
-      expect(reads).toHaveLength(2);
+      // Saved edges agree with br's edge count, so list alone is complete.
+      expect(reads).toHaveLength(1);
       expect(reads[0]).toEqual([
         "--db",
         db,
@@ -624,8 +652,6 @@ process.exit(result.status ?? 1);\n`,
         "0",
         "--json",
       ]);
-      expect(reads[1][2]).toBe("show");
-      expect(reads[1].slice(3, -1)).toHaveLength(2);
       expect((await store.list({})).total).toBe(0);
       await recorded.update("second", { body: "Current notes" });
       await recorded.update("second", { body: "", archiveBody: true });

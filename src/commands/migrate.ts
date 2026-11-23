@@ -25,6 +25,8 @@ notes:
   The destination must be empty unless --allow-existing is supplied.
   Reruns skip matching tasks and finish missing dependencies, never overwrite.
   Counts include archived Done tasks.
+  elapsed_ms / ms_per_row report the run's wall time, per source row.
+  An interrupted run resumes with --allow-existing; its lock clears itself.
 `;
 
 /** Compare persisted task values, ignoring storage-only timestamps and absent fields. */
@@ -45,6 +47,7 @@ function compatible(source: Task, existing: Task): boolean {
 }
 
 export async function migrateCommand(rawArgs: string[]): Promise<string> {
+  const started = performance.now();
   const args = [...rawArgs];
   const from = takeFlag(args, "--from");
   const to = takeFlag(args, "--to");
@@ -196,11 +199,15 @@ export async function migrateCommand(rawArgs: string[]): Promise<string> {
     }
   }
   if (destination.config.beadsMirrorPath) await destination.store.render?.();
+  const elapsed = performance.now() - started;
   const result = {
     counts,
     created,
     existing: tasks.length - created,
     dependencies_added: dependenciesAdded,
+    elapsed_ms: Math.round(elapsed),
+    // Over every source row, so a full run's figure extrapolates to N rows.
+    ms_per_row: tasks.length ? Math.round(elapsed / tasks.length) : 0,
   };
   const already = created === 0 && dependenciesAdded === 0;
   return renderMutation({

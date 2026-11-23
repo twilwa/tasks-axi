@@ -91,6 +91,24 @@ export function partialMoveError(
   );
 }
 
+/**
+ * mv between two stores where either is beads. Refused before any lock, read
+ * or write: receiving into beads is a separate, later change.
+ */
+export function crossStoreMoveError(
+  from: { backend: string; path: string },
+  to: { backend: string; path: string },
+): AxiError {
+  return new AxiError(
+    `cross-store moves are not supported yet: ${from.backend} ${from.path} -> ${to.backend} ${to.path}; nothing was changed`,
+    "UNSUPPORTED",
+    [
+      "Moves into or out of a beads store are refused until a follow-up adds receiving into beads",
+      "Moves between two Markdown backlogs still work",
+    ],
+  );
+}
+
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }

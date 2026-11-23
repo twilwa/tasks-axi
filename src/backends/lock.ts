@@ -1,9 +1,15 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { spawn } from "node:child_process";
 import {
   closeSync,
   existsSync,
+  fstatSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readlinkSync,
+  readSync,
   realpathSync,
   renameSync,
   statSync,
@@ -11,7 +17,7 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { AxiError } from "../errors.js";
 
 /**
@@ -28,12 +34,37 @@ let lockTokenCounter = 0;
 
 export interface LockHandle {
   release(): void;
+  /** Kernel locks: the locked descriptor subprocesses must inherit. */
+  fd?: number;
+  /** Kernel locks: the wait budget nested acquisitions share. */
+  deadline?: number;
+}
+
+/** Run `fn` with held kernel locks visible to subprocesses and nested locks. */
+function holding<T>(handles: LockHandle[], fn: () => Promise<T> | T) {
+  const fds = handles.flatMap((handle) =>
+    handle.fd === undefined ? [] : [handle.fd],
+  );
+  if (!fds.length) return fn();
+  const deadline = Math.min(
+    ...handles.map((handle) => handle.deadline ?? Infinity),
+    heldDeadline.getStore() ?? Infinity,
+  );
+  return heldDeadline.run(deadline, () =>
+    heldFds.run([...(heldFds.getStore() ?? []), ...fds], fn),
+  );
 }
 
 export interface LockOptions {
   timeoutMs?: number;
   retryMs?: number;
   staleMs?: number;
+  /**
+   * Use the kernel-backed flock lock (beads) instead of the exclusive-create
+   * lockfile (markdown, which only reports a leftover lock). See
+   * `acquireKernel`.
+   */
+  kernel?: boolean;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -101,8 +132,12 @@ export function readFileSafe(path: string): string | undefined {
   }
 }
 
-/** Resolve existing symlink ancestors too, including when the leaf is new. */
-export function canonicalPath(path: string): string {
+/**
+ * Resolve existing symlink ancestors too, including when the leaf is new, and
+ * follow a dangling symlink to the path it names (a link to a lock file that
+ * does not exist yet is still that lock file).
+ */
+export function canonicalPath(path: string, depth = 0): string {
   const absolute = resolve(path);
   try {
     return realpathSync(absolute);
@@ -112,8 +147,83 @@ export function canonicalPath(path: string): string {
       dirname(absolute) === absolute
     )
       throw error;
-    return join(canonicalPath(dirname(absolute)), basename(absolute));
+    let link: string | undefined;
+    try {
+      if (lstatSync(absolute).isSymbolicLink()) link = readlinkSync(absolute);
+    } catch {
+      link = undefined;
+    }
+    if (link !== undefined) {
+      if (depth >= 40)
+        throw Object.assign(new Error(`too many symlinks: ${absolute}`), {
+          code: "ELOOP",
+        });
+      return canonicalPath(resolve(dirname(absolute), link), depth + 1);
+    }
+    return join(canonicalPath(dirname(absolute), depth), basename(absolute));
   }
+}
+
+/**
+ * Resolve `path` the way the kernel does when it is opened: components left
+ * to right, following each symlink (the leaf only when `followLeaf`), and
+ * applying ".." to the physical directory reached so far, never lexically.
+ * Missing components are kept as spelled. Relative paths start at the cwd.
+ */
+export function physicalPath(path: string, followLeaf: boolean): string {
+  if (process.platform === "win32") return canonicalPath(path);
+  const queue = (isAbsolute(path) ? path : `${process.cwd()}/${path}`)
+    .split("/")
+    .filter((part) => part !== "");
+  let current = "/";
+  let links = 0;
+  while (queue.length) {
+    const part = queue.shift()!;
+    if (part === ".") continue;
+    if (part === "..") {
+      current = dirname(current);
+      continue;
+    }
+    const next = current === "/" ? `/${part}` : `${current}/${part}`;
+    let link: string | undefined;
+    if (queue.length || followLeaf)
+      try {
+        if (lstatSync(next).isSymbolicLink()) link = readlinkSync(next);
+      } catch {
+        link = undefined;
+      }
+    if (link === undefined) {
+      current = next;
+      continue;
+    }
+    if (++links > 40)
+      throw Object.assign(new Error(`too many symlinks: ${path}`), {
+        code: "ELOOP",
+      });
+    queue.unshift(...link.split("/").filter((p) => p !== ""));
+    if (link.startsWith("/")) current = "/";
+  }
+  return current;
+}
+
+/**
+ * The directory entry `path` names (rename and unlink act on it) and the
+ * file it reaches (open, append and truncate act on that).
+ */
+export function pathIdentities(path: string): string[] {
+  const entry = physicalPath(path, false);
+  try {
+    return [entry, physicalPath(path, true)];
+  } catch (error) {
+    // A leaf that is a symlink loop reaches no file: keep only its entry.
+    if (isLoop(error)) return [entry];
+    throw error;
+  }
+}
+
+/** True for a too-many-symlinks failure (a loop), and nothing else. */
+export function isLoop(error: unknown): boolean {
+  return errno(error) === "ELOOP";
 }
 
 /** Write `content` atomically: temp file in the same dir, then rename over. */
@@ -135,12 +245,180 @@ export function atomicWrite(path: string, content: string): void {
   }
 }
 
+/**
+ * Kernel-backed lock for collections written through subprocesses (beads).
+ * The lock is util-linux flock(1) on one open file description of
+ * <target>.lock; every br child inherits that descriptor, so the kernel keeps
+ * the lock until the last process that can still write (this CLI, br, or a
+ * grandchild that kept the descriptor) has exited. Nothing infers liveness,
+ * nothing is ever unlinked, and a killed writer needs no cleanup.
+ */
+const FLOCK_MARKER = "tasks-axi-lock/flock-v1\n";
+const FLOCK_TIMEOUT_EXIT = 75;
+
+/**
+ * Why a beads mirror or archive `path` must never be written, or undefined.
+ * Every tasks-axi lock is `<target>.lock` and every beads ready marker is
+ * `<db>.tasks-axi-ready`, whichever store owns them, and replacing one
+ * (an atomic rename onto it) silently splits a live lock. Only beads
+ * configuration checks this; Markdown paths are handled exactly as before.
+ */
+export function reservedPath(path: string): string | undefined {
+  const name = basename(path);
+  if (name.endsWith(".tasks-axi-ready")) return "a beads ready marker";
+  if (name.endsWith(".lock")) return "a tasks-axi lock file";
+  return undefined;
+}
+
+/** Descriptors of kernel locks held by this async chain (passed to br). */
+const heldFds = new AsyncLocalStorage<number[]>();
+/** The wait budget (performance.now()) shared by nested acquisitions. */
+const heldDeadline = new AsyncLocalStorage<number>();
+
+/** Lock descriptors a subprocess must inherit to keep this chain's locks. */
+export function heldLockFds(): number[] {
+  return heldFds.getStore() ?? [];
+}
+
+function lockedAfter(lockPath: string, waitedMs: number): AxiError {
+  return new AxiError(
+    `backlog is locked by another tasks-axi process: ${lockPath}; gave up after waiting ${Math.round(waitedMs)} ms`,
+    "LOCKED",
+    [
+      "Retry once that write finishes; the lock is released when the writer and its br subprocesses exit",
+    ],
+  );
+}
+
+function unsupported(lockPath: string, detail: string): AxiError {
+  return new AxiError(`cannot lock ${lockPath}: ${detail}`, "UNSUPPORTED", [
+    "The beads backend is refused on Windows; elsewhere it needs a working util-linux-compatible flock on PATH and a local filesystem that supports flock",
+  ]);
+}
+
+/** Run util-linux flock on `fd`; true when locked, false on timeout. */
+function flockFd(
+  lockPath: string,
+  fd: number,
+  waitMs: number,
+): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    let stderr = "";
+    const helper = spawn(
+      "flock",
+      [
+        "-x",
+        "-E",
+        String(FLOCK_TIMEOUT_EXIT),
+        "-w",
+        (Math.max(waitMs, 1) / 1000).toFixed(3),
+        "3",
+      ],
+      { stdio: ["ignore", "ignore", "pipe", fd] },
+    );
+    helper.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+    helper.on("error", (error) =>
+      reject(
+        errno(error) === "ENOENT"
+          ? unsupported(lockPath, "util-linux flock is not on PATH")
+          : error,
+      ),
+    );
+    helper.on("close", (code) => {
+      if (code === 0) resolve(true);
+      else if (code === FLOCK_TIMEOUT_EXIT) resolve(false);
+      else
+        reject(
+          unsupported(
+            lockPath,
+            `flock failed (exit ${code}${stderr.trim() ? `: ${stderr.trim()}` : ""})`,
+          ),
+        );
+    });
+  });
+}
+
+function readAll(fd: number): string {
+  const size = fstatSync(fd).size;
+  const buffer = Buffer.alloc(size);
+  let offset = 0;
+  while (offset < size) {
+    const read = readSync(fd, buffer, offset, size - offset, offset);
+    if (!read) break;
+    offset += read;
+  }
+  return buffer.subarray(0, offset).toString("utf8");
+}
+
+async function acquireKernel(
+  lockPath: string,
+  options: LockOptions,
+  outer: number,
+): Promise<LockHandle> {
+  if (process.platform === "win32")
+    throw unsupported(lockPath, "flock is not available on Windows");
+  const started = performance.now();
+  const deadline = Math.min(
+    started + (options.timeoutMs ?? LOCK_TIMEOUT_MS),
+    outer,
+  );
+  for (;;) {
+    // The budget is checked before every attempt, nested ones included.
+    const remaining = deadline - performance.now();
+    if (remaining <= 0)
+      throw lockedAfter(lockPath, performance.now() - started);
+    const fd = openSync(lockPath, "a+");
+    let kept = false;
+    try {
+      if (!(await flockFd(lockPath, fd, remaining)))
+        throw lockedAfter(lockPath, performance.now() - started);
+      // The lock must be on the file the name points at now; a hand removal
+      // or an older build's unlink would otherwise split writers across
+      // two inodes. Retry on the current file.
+      const held = fstatSync(fd);
+      let current;
+      try {
+        current = statSync(lockPath);
+      } catch (error) {
+        if (errno(error) !== "ENOENT") throw error;
+      }
+      if (!current || current.ino !== held.ino || current.dev !== held.dev)
+        continue;
+      if (performance.now() > deadline)
+        throw lockedAfter(lockPath, performance.now() - started);
+      const content = readAll(fd);
+      if (content === "") writeSync(fd, FLOCK_MARKER);
+      else if (content !== FLOCK_MARKER)
+        throw new AxiError(
+          `${lockPath} holds a lock record from an older tasks-axi build; refusing to remove it automatically`,
+          "LOCKED",
+          [
+            `Stop every older tasks-axi process and its br calls, then remove ${lockPath}; see the beads cutover notes in the README`,
+          ],
+        );
+      kept = true;
+      // Closing releases this process's reference only: a br child still
+      // running holds the same open file description, and with it the lock.
+      return { fd, deadline, release: () => closeSync(fd) };
+    } finally {
+      if (!kept) closeSync(fd);
+    }
+  }
+}
+
 async function acquireLock(
   targetPath: string,
   options: LockOptions = {},
 ): Promise<LockHandle> {
   const lockPath = `${targetPath}.lock`;
   mkdirSync(dirname(targetPath), { recursive: true });
+  // Nested beads locks (the init lock inside a write) share the outer wait.
+  if (options.kernel)
+    return acquireKernel(
+      lockPath,
+      options,
+      heldDeadline.getStore() ?? Infinity,
+    );
   const timeoutMs = options.timeoutMs ?? LOCK_TIMEOUT_MS;
   const retryMs = options.retryMs ?? LOCK_RETRY_MS;
   const staleMs = options.staleMs ?? LOCK_STALE_MS;
@@ -178,7 +456,7 @@ export async function withLock<T>(
 ): Promise<T> {
   const handle = await acquireLock(path, options);
   try {
-    return await fn();
+    return await holding([handle], fn);
   } finally {
     handle.release();
   }
@@ -197,7 +475,7 @@ export async function withLocks<T>(
   const handles: LockHandle[] = [];
   try {
     for (const path of ordered) handles.push(await acquireLock(path, options));
-    return await fn();
+    return await holding(handles, fn);
   } finally {
     for (const handle of handles.reverse()) handle.release();
   }

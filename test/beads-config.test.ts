@@ -172,6 +172,58 @@ describe("beads database addressing", () => {
       ).toThrow(/beads.timeout_ms/);
   });
 
+  it("configures a bounded beads lock wait from TOML or environment", () => {
+    writeFileSync(
+      join(dir, ".tasks.toml"),
+      'backend = "beads"\n[beads]\npath = "selected.db"\nlock_timeout_ms = 9000\n',
+    );
+    expect(resolveConfig({ cwd: dir, home, env: {} }).beadsLockTimeoutMs).toBe(
+      9000,
+    );
+    expect(
+      resolveConfig({
+        cwd: dir,
+        home,
+        env: { TASKS_AXI_BEADS_LOCK_TIMEOUT_MS: "4000" },
+      }).beadsLockTimeoutMs,
+    ).toBe(4000);
+    for (const value of ["", "0", "-1", "1.5", "soon", "2147483648"])
+      expect(() =>
+        resolveConfig({
+          cwd: dir,
+          home,
+          env: { TASKS_AXI_BEADS_LOCK_TIMEOUT_MS: value },
+        }),
+      ).toThrow(/beads.lock_timeout_ms/);
+  });
+
+  it("ignores a leftover beads lock_timeout_ms in a markdown-only workspace, as main does", () => {
+    for (const value of ['"disabled"', "disabled", "0", "1.5"]) {
+      writeFileSync(
+        join(dir, ".tasks.toml"),
+        `[beads]\nlock_timeout_ms = ${value}\n[markdown]\npath = "backlog.md"\n`,
+      );
+      const config = resolveConfig({ cwd: dir, home, env: {} });
+      expect(config).toMatchObject({
+        backend: "markdown",
+        path: join(dir, "backlog.md"),
+      });
+      expect(config.beadsLockTimeoutMs).toBeUndefined();
+    }
+  });
+
+  it("still validates beads lock_timeout_ms when beads is selected", () => {
+    for (const value of ['"disabled"', "disabled", "0", "1.5", "2147483648"]) {
+      writeFileSync(
+        join(dir, ".tasks.toml"),
+        `backend = "beads"\n[beads]\npath = "selected.db"\nlock_timeout_ms = ${value}\n`,
+      );
+      expect(() => resolveConfig({ cwd: dir, home, env: {} })).toThrow(
+        /beads.lock_timeout_ms/,
+      );
+    }
+  });
+
   it("resolves opt-in mirror paths with project-over-home precedence and shared Done retention", () => {
     writeFileSync(
       join(home, ".tasks-axi", "config.toml"),

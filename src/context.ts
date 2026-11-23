@@ -1,5 +1,5 @@
 import { MarkdownStore } from "./backends/markdown.js";
-import { BeadsStore } from "./backends/beads.js";
+import { BeadsStore, beadsOwnedPaths } from "./backends/beads.js";
 import {
   type ConfigOverrides,
   type ResolvedConfig,
@@ -40,6 +40,7 @@ export function createStore(config: ResolvedConfig): Store {
         binary: config.beadsBinary,
         prefix: config.beadsPrefix,
         timeoutMs: config.beadsTimeoutMs,
+        lockTimeoutMs: config.beadsLockTimeoutMs,
         mirrorPath: config.beadsMirrorPath,
         mirrorArchivePath: config.beadsMirrorArchivePath,
         doneKeep: config.doneKeep,
@@ -47,6 +48,9 @@ export function createStore(config: ResolvedConfig): Store {
     : new MarkdownStore({
         path: config.path,
         ...(config.archivePath ? { archivePath: config.archivePath } : {}),
+        ...(config.beadsConfiguredPath
+          ? { reservedPaths: beadsOwnedPaths(config.beadsConfiguredPath) }
+          : {}),
       });
 }
 

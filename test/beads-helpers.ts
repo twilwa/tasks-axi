@@ -38,7 +38,12 @@ const probe = spawnSync(
   { encoding: "utf8" },
 );
 rmSync(probeDir, { recursive: true, force: true });
-export const hasBr = realBr !== undefined && probe.status === 0;
+/** The beads backend's kernel lock needs Linux and util-linux flock. */
+export const hasFlock =
+  process.platform === "linux" &&
+  spawnSync("flock", ["--version"]).status === 0;
+/** Live beads tests: a working br, and the flock the backend requires. */
+export const hasBr = realBr !== undefined && probe.status === 0 && hasFlock;
 
 /** Per-instance real-br recorder with contained process-boundary fault hooks. */
 export function recordBr(
@@ -59,7 +64,9 @@ const args = process.argv.slice(2);
 if (args[0] !== '--db' || args[1] !== ${JSON.stringify(db)}) process.exit(99);
 fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + '\\n');
 ${hooks.before ?? ""}
-const result = spawnSync(${JSON.stringify(realBr)}, args, {input:fs.readFileSync(0), stdio:['pipe', 'inherit', 'inherit'], env:{...process.env, TASKS_AXI_BR_RECORDER:'1'}});
+// Pass inherited lock descriptors on: a Node launcher otherwise drops them.
+const lockFds = (() => { try { return fs.readdirSync('/proc/self/fd').map(Number).filter((fd) => { try { return fd > 2 && fs.readlinkSync('/proc/self/fd/' + fd).endsWith('.lock'); } catch { return false; } }); } catch { return []; } })();
+const result = spawnSync(${JSON.stringify(realBr)}, args, {input:fs.readFileSync(0), stdio:['pipe', 'inherit', 'inherit', ...lockFds], env:{...process.env, TASKS_AXI_BR_RECORDER:'1'}});
 ${hooks.after ?? ""}
 process.exit(result.status ?? 1);
 `,

@@ -1,5 +1,7 @@
-import { readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { decode } from "@toon-format/toon";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
@@ -405,6 +407,137 @@ describe.skipIf(!hasBr)("markdown to beads migration", () => {
       ),
     ).toEqual(await destination.get("first-q1"));
   }, 30_000);
+
+  it.each([
+    ["create", 2],
+    ["dep", 0],
+  ] as const)(
+    "resumes a migration killed during a %s with --allow-existing, without hand cleanup, reporting time per row",
+    async (boundary, before) => {
+      const root = fileURLToPath(new URL("..", import.meta.url));
+      const env = Object.fromEntries(
+        Object.entries(process.env).filter(
+          ([key]) => !key.startsWith("TASKS_AXI_"),
+        ),
+      );
+      const counter = join(ws.dir, "calls");
+      const paused = join(ws.dir, "paused");
+      // Pause a known br call (the third create, or the first dependency
+      // write) before it reaches br, so the kill lands on a fixed boundary.
+      const recorder = recordBr(ws.dir, ws.path, {
+        before: `if (args[2] === ${JSON.stringify(boundary)}) {
+          const n = fs.existsSync(${JSON.stringify(counter)}) ? fs.readFileSync(${JSON.stringify(counter)}, 'utf8').length : 0;
+          fs.appendFileSync(${JSON.stringify(counter)}, 'x');
+          if (n === ${before}) { fs.writeFileSync(${JSON.stringify(paused)}, String(process.pid)); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60000); }
+        }`,
+      });
+      const child = spawn(
+        process.execPath,
+        [
+          "--import",
+          pathToFileURL(join(root, "node_modules", "tsx", "dist", "loader.mjs"))
+            .href,
+          join(root, "bin", "tasks-axi.ts"),
+          "migrate",
+          "--from",
+          "markdown",
+          "--to",
+          "beads",
+          "--from-file",
+          join(ws.dir, "backlog.md"),
+          "--to-file",
+          ws.path,
+        ],
+        {
+          cwd: ws.dir,
+          env: {
+            ...env,
+            HOME: ws.dir,
+            USERPROFILE: ws.dir,
+            TASKS_AXI_BEADS_BINARY: recorder.binary,
+          },
+          stdio: "ignore",
+        },
+      );
+      let exited = false;
+      const closed = new Promise((done) =>
+        child.on("close", () => done((exited = true))),
+      );
+      let pausedPid: number | undefined;
+      try {
+        const deadline = Date.now() + 30_000;
+        while (!existsSync(paused)) {
+          if (exited) throw new Error("migration exited before the boundary");
+          if (Date.now() > deadline) throw new Error("boundary never reached");
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        pausedPid = Number(readFileSync(paused, "utf8"));
+        // The CLI dies holding the lock; its paused br call never runs.
+        child.kill("SIGKILL");
+        await closed;
+        process.kill(pausedPid, "SIGKILL");
+      } finally {
+        if (!exited) child.kill("SIGKILL");
+        try {
+          if (pausedPid) process.kill(pausedPid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
+      expect(existsSync(ws.path + ".lock")).toBe(true);
+      const partial = (
+        ws.br(["list", "--all", "--limit", "0"]) as { issues: unknown[] }
+      ).issues.length;
+
+      const output = JSON.parse(
+        await cli(
+          "migrate",
+          "--from",
+          "markdown",
+          "--to",
+          "beads",
+          "--allow-existing",
+          "--json",
+        ),
+      ) as Record<string, unknown>;
+      const total = Object.values(
+        output.counts as Record<string, number>,
+      ).reduce((a, b) => a + b, 0);
+      if (boundary === "create") {
+        expect(partial).toBe(before);
+        expect(output).toMatchObject({
+          existing: before,
+          created: total - before,
+        });
+      } else {
+        expect(partial).toBe(total);
+        expect(output).toMatchObject({ existing: total, created: 0 });
+      }
+      expect(output.elapsed_ms).toEqual(expect.any(Number));
+      // Both figures are rounded from the same unrounded elapsed time.
+      expect(
+        Math.abs(
+          (output.ms_per_row as number) - (output.elapsed_ms as number) / total,
+        ),
+      ).toBeLessThanOrEqual(1);
+      // Nobody removed the lock by hand; the kernel freed it when the CLI died.
+      expect(readFileSync(ws.path + ".lock", "utf8")).toBe(
+        "tasks-axi-lock/flock-v1\n",
+      );
+      const migrated = await resolveTasksContext({
+        backend: "beads",
+      }).store.list({});
+      expect(migrated.total).toBe(total);
+      // Every source edge arrived exactly once.
+      const sourceTasks = (
+        await new MarkdownStore({ path: join(ws.dir, "backlog.md") }).list({})
+      ).items;
+      const deps = new Map(migrated.items.map((task) => [task.id, task.deps]));
+      for (const task of sourceTasks)
+        expect(deps.get(task.id)).toEqual(task.deps);
+    },
+    60_000,
+  );
 
   it("refuses a destination containing unmanaged native tasks without permission", async () => {
     ws.br(["create", "--title", "native task"]);
