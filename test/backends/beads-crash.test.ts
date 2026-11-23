@@ -214,6 +214,71 @@ describe.skipIf(!hasBr)(
       expect(info.config.issue_prefix).toBe("fresh");
     }, 60_000);
 
+    it("uses a populated database that an older build left without a prefix", async () => {
+      // Older builds ran `br init --db <graph>/beads.db`; br ignored --db and
+      // initialized <graph>/.beads, so the real database has no prefix row.
+      const graph = join(ws.dir, "graph");
+      const db = join(graph, "beads.db");
+      mkdirSync(graph);
+      const br = (args: string[]): unknown =>
+        JSON.parse(
+          execFileSync("br", ["--db", db, ...args, "--json"], {
+            cwd: graph,
+            encoding: "utf8",
+            env: { ...process.env, BEADS_DIR: join(graph, ".beads") },
+          }),
+        );
+      br(["init", "--prefix", "old"]);
+      for (const [order, id] of ["a", "b"].entries())
+        br([
+          "create",
+          "--title",
+          id,
+          "--external-ref",
+          "tasks-axi:" + id,
+          "--agent-context",
+          JSON.stringify({
+            tasks_axi: {
+              version: 1,
+              created: "2026-07-01",
+              prioritySet: false,
+              order,
+              deps: [],
+            },
+          }),
+        ]);
+      const info = () =>
+        br(["info"]) as {
+          database_path: string;
+          issue_count: number;
+          config?: { issue_prefix?: string } | null;
+        };
+      expect(info()).toMatchObject({ database_path: db, issue_count: 2 });
+      expect(info().config?.issue_prefix).toBeUndefined();
+      const rows = () =>
+        (br(["list", "--all"]) as { issues: { external_ref: string }[] }).issues
+          .filter((row) => /:[ab]$/.test(row.external_ref))
+          .sort((x, y) => (x.external_ref < y.external_ref ? -1 : 1));
+      const before = rows();
+      expect(before).toHaveLength(2);
+
+      const run = async (...args: string[]) => {
+        const result = await cli(args, db).done;
+        expect(result.code, result.out).toBe(0);
+        return result.out;
+      };
+      const listed = await run("list");
+      expect(listed).toContain("a,");
+      expect(listed).toContain("b,");
+      expect(rows()).toEqual(before);
+      await run("add", "c", "C");
+      expect(rows()).toEqual(before);
+      await run("done", "c", "--no-prune");
+      expect(rows()).toEqual(before);
+      expect(await run("show", "c")).toContain("done");
+      expect(info().issue_count).toBe(3);
+    }, 60_000);
+
     it("only initializes the layout br initializes, and ignores inherited redirects", async () => {
       const custom = join(ws.dir, "other", ".beads", "custom.db");
       await expect(
