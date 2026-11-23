@@ -761,9 +761,14 @@ export class BeadsStore implements Store {
           );
           const at = text(info.database_path);
           if (!at || canonicalPath(at) !== this.lockKey) return "elsewhere";
+          if (typeof info.issue_count !== "number") return "unreadable";
           const empty = info.issue_count === 0;
-          if (!text(record(info.config).issue_prefix))
-            return empty ? "incomplete" : "no prefix, but has issues";
+          // Older builds ran `br init` without pinning BEADS_DIR, so a database
+          // outside `.beads` has issues but no prefix row. br chooses a
+          // prefix for new native ids, and caller ids never depend on it; only an
+          // empty database without one is an unfinished init.
+          if (empty && !text(record(info.config).issue_prefix))
+            return "incomplete";
           if (
             standard &&
             empty &&
