@@ -229,11 +229,21 @@ describe.skipIf(!hasBr)(
           }),
         );
       br(["init", "--prefix", "old"]);
-      for (const [order, id] of ["a", "b"].entries())
-        br([
+      const native: string[] = [];
+      for (const [order, id] of ["a", "b"].entries()) {
+        // b is blocked by a, saved in adapter format as well as natively.
+        const deps =
+          order === 1
+            ? [{ type: "blocked-by", id: "a", native: native[0]! }]
+            : [];
+        const created = br([
           "create",
           "--title",
           id,
+          "--description",
+          "Body of " + id,
+          "--labels",
+          "label-" + id,
           "--external-ref",
           "tasks-axi:" + id,
           "--agent-context",
@@ -243,10 +253,13 @@ describe.skipIf(!hasBr)(
               created: "2026-07-01",
               prioritySet: false,
               order,
-              deps: [],
+              deps,
             },
           }),
-        ]);
+          ...(deps.length ? ["--deps", "blocks:" + native[0]!] : []),
+        ]) as { id: string };
+        native.push(created.id);
+      }
       const info = () =>
         br(["info"]) as {
           database_path: string;
@@ -255,12 +268,22 @@ describe.skipIf(!hasBr)(
         };
       expect(info()).toMatchObject({ database_path: db, issue_count: 2 });
       expect(info().config?.issue_prefix).toBeUndefined();
-      const rows = () =>
-        (br(["list", "--all"]) as { issues: { external_ref: string }[] }).issues
-          .filter((row) => /:[ab]$/.test(row.external_ref))
-          .sort((x, y) => (x.external_ref < y.external_ref ? -1 : 1));
+      // Every field `br show` reports, updated_at included: reads change none.
+      const rows = () => br(["show", ...native]) as Record<string, unknown>[];
       const before = rows();
-      expect(before).toHaveLength(2);
+      expect(before).toMatchObject(
+        ["a", "b"].map((id, order) => ({
+          id: native[order],
+          title: id,
+          status: "open",
+          description: "Body of " + id,
+          labels: ["label-" + id],
+          external_ref: "tasks-axi:" + id,
+        })),
+      );
+      expect(before[1]!.dependencies).toMatchObject([
+        { id: native[0], dependency_type: "blocks" },
+      ]);
 
       const run = async (...args: string[]) => {
         const result = await cli(args, db).done;
