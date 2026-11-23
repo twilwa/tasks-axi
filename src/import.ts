@@ -106,7 +106,7 @@ export function checkImportGraph(
   }
   if (ready.length !== tasks.length)
     throw new AxiError(
-      "Source dependency cycle must be resolved before migration",
+      "Source dependency cycle must be resolved before importing",
       "VALIDATION_ERROR",
     );
   return unlinked;

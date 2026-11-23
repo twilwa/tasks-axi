@@ -161,6 +161,17 @@ describe.skipIf(!hasBr)("mv from a markdown outbox into beads", () => {
         (task) => task.id,
       ),
     ).toEqual(["ready-q3", "latest-d1"]);
+    // Native labels mirror kind, repo and a captain hold, as migration writes them.
+    const held = (
+      ws.br(["list", "--all", "--limit", "0"]) as {
+        issues: { external_ref?: string; labels?: string[] }[];
+      }
+    ).issues.find((issue) => issue.external_ref === "tasks-axi:held-q1");
+    expect([...(held?.labels ?? [])].sort()).toEqual([
+      "hold:captain",
+      "kind:task",
+      "repo:example",
+    ]);
     // The items left behind keep every original byte.
     expect(readFileSync(file, "utf8")).toBe(
       "# Backlog\n\n## In flight\n## Queued\n" +
