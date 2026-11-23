@@ -4,9 +4,11 @@ import {
   closeSync,
   existsSync,
   fstatSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readlinkSync,
   readSync,
   realpathSync,
   renameSync,
@@ -130,8 +132,12 @@ export function readFileSafe(path: string): string | undefined {
   }
 }
 
-/** Resolve existing symlink ancestors too, including when the leaf is new. */
-export function canonicalPath(path: string): string {
+/**
+ * Resolve existing symlink ancestors too, including when the leaf is new, and
+ * follow a dangling symlink to the path it names (a link to a lock file that
+ * does not exist yet is still that lock file).
+ */
+export function canonicalPath(path: string, depth = 0): string {
   const absolute = resolve(path);
   try {
     return realpathSync(absolute);
@@ -141,7 +147,20 @@ export function canonicalPath(path: string): string {
       dirname(absolute) === absolute
     )
       throw error;
-    return join(canonicalPath(dirname(absolute)), basename(absolute));
+    let link: string | undefined;
+    try {
+      if (lstatSync(absolute).isSymbolicLink()) link = readlinkSync(absolute);
+    } catch {
+      link = undefined;
+    }
+    if (link !== undefined) {
+      if (depth >= 40)
+        throw Object.assign(new Error(`too many symlinks: ${absolute}`), {
+          code: "ELOOP",
+        });
+      return canonicalPath(resolve(dirname(absolute), link), depth + 1);
+    }
+    return join(canonicalPath(dirname(absolute), depth), basename(absolute));
   }
 }
 
@@ -333,7 +352,11 @@ async function acquireLock(
   mkdirSync(dirname(targetPath), { recursive: true });
   // Nested beads locks (the init lock inside a write) share the outer wait.
   if (options.kernel)
-    return acquireKernel(lockPath, options, heldDeadline.getStore() ?? Infinity);
+    return acquireKernel(
+      lockPath,
+      options,
+      heldDeadline.getStore() ?? Infinity,
+    );
   const timeoutMs = options.timeoutMs ?? LOCK_TIMEOUT_MS;
   const retryMs = options.retryMs ?? LOCK_RETRY_MS;
   const staleMs = options.staleMs ?? LOCK_STALE_MS;

@@ -46,7 +46,13 @@ import type {
   PruneResult,
   Store,
 } from "../store.js";
-import { atomicWrite, readFileSafe, withLock, withLocks } from "./lock.js";
+import {
+  atomicWrite,
+  canonicalPath,
+  readFileSafe,
+  withLock,
+  withLocks,
+} from "./lock.js";
 import {
   type BacklogDoc,
   type Entry,
@@ -61,6 +67,12 @@ import {
 
 export interface MarkdownStoreOptions {
   path: string;
+  /**
+   * Canonical paths a configured beads store owns. The backlog, its lock
+   * and its archives must not resolve to any of them. Absent (Markdown
+   * only), no path is checked, exactly as before.
+   */
+  reservedPaths?: string[];
   /** Read-only archive view: recognize `## Archived YYYY-MM-DD` as Done. */
   archived?: boolean;
   /** Where pruned Done items are archived (default `<dir>/done-archive.md`). */
@@ -337,6 +349,24 @@ export class MarkdownStore implements Store {
         "Note archive path must not be the active backlog path",
         "VALIDATION_ERROR",
       );
+    }
+    if (options.reservedPaths?.length) {
+      const reserved = new Set(options.reservedPaths);
+      const targets: [string, string[]][] = [
+        [
+          this.path,
+          [canonicalPath(this.path), `${canonicalPath(this.path)}.lock`],
+        ],
+        [this.archivePath, [canonicalPath(this.archivePath)]],
+        [this.noteArchivePath, [canonicalPath(this.noteArchivePath)]],
+      ];
+      for (const [target, resolved] of targets)
+        for (const path of resolved)
+          if (reserved.has(path))
+            throw new AxiError(
+              `${resolve(target)} resolves to ${path}, which is reserved by the configured beads store; choose a different Markdown file`,
+              "VALIDATION_ERROR",
+            );
     }
     this.now = options.now ?? today;
   }

@@ -197,6 +197,33 @@ describe("beads database addressing", () => {
       ).toThrow(/beads.lock_timeout_ms/);
   });
 
+  it("ignores a leftover beads lock_timeout_ms in a markdown-only workspace, as main does", () => {
+    for (const value of ['"disabled"', "disabled", "0", "1.5"]) {
+      writeFileSync(
+        join(dir, ".tasks.toml"),
+        `[beads]\nlock_timeout_ms = ${value}\n[markdown]\npath = "backlog.md"\n`,
+      );
+      const config = resolveConfig({ cwd: dir, home, env: {} });
+      expect(config).toMatchObject({
+        backend: "markdown",
+        path: join(dir, "backlog.md"),
+      });
+      expect(config.beadsLockTimeoutMs).toBeUndefined();
+    }
+  });
+
+  it("still validates beads lock_timeout_ms when beads is selected", () => {
+    for (const value of ['"disabled"', "disabled", "0", "1.5", "2147483648"]) {
+      writeFileSync(
+        join(dir, ".tasks.toml"),
+        `backend = "beads"\n[beads]\npath = "selected.db"\nlock_timeout_ms = ${value}\n`,
+      );
+      expect(() => resolveConfig({ cwd: dir, home, env: {} })).toThrow(
+        /beads.lock_timeout_ms/,
+      );
+    }
+  });
+
   it("resolves opt-in mirror paths with project-over-home precedence and shared Done retention", () => {
     writeFileSync(
       join(home, ".tasks-axi", "config.toml"),

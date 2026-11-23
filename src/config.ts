@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { extname, isAbsolute, join, resolve } from "node:path";
+import { dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { canonicalPath, readFileSafe } from "./backends/lock.js";
 import { AxiError } from "./errors.js";
 
@@ -30,6 +30,12 @@ export interface ResolvedConfig {
   beadsLockTimeoutMs?: number;
   beadsMirrorPath?: string;
   beadsMirrorArchivePath?: string;
+  /**
+   * Markdown only, when a beads store is also configured: the canonical
+   * paths that store owns, which no Markdown target or archive may resolve
+   * to. Undefined without beads configuration, so Markdown is as on main.
+   */
+  beadsReservedPaths?: string[];
 }
 
 export interface ConfigOverrides {
@@ -47,7 +53,8 @@ interface TomlConfig {
     binary?: string;
     prefix?: string;
     timeout_ms?: number;
-    lock_timeout_ms?: number;
+    /** Raw TOML value text; parsed and validated only when beads is selected. */
+    lock_timeout_ms?: string;
     mirror?: string;
     mirror_archive?: string;
   };
@@ -97,6 +104,13 @@ export function parseConfigToml(src: string): TomlConfig {
     const key = kv[1];
     const source = configKeySource(table, key);
     if (!source) continue;
+    if (table === "beads" && key === "lock_timeout_ms") {
+      // A Markdown-only workspace ignores this beads-only setting, as before
+      // it existed; resolveConfig validates it when beads is selected.
+      config.beads ??= {};
+      config.beads.lock_timeout_ms = kv[2];
+      continue;
+    }
     const value = parseTomlValue(kv[2], source);
 
     if (table === "root") {
@@ -121,14 +135,6 @@ export function parseConfigToml(src: string): TomlConfig {
             "VALIDATION_ERROR",
           );
         config.beads.timeout_ms = value;
-      }
-      if (key === "lock_timeout_ms") {
-        if (typeof value !== "number")
-          throw new AxiError(
-            "beads.lock_timeout_ms must be an integer",
-            "VALIDATION_ERROR",
-          );
-        config.beads.lock_timeout_ms = value;
       }
       continue;
     }
@@ -237,6 +243,20 @@ function beadsDatabasePath(path: string, cwd: string): string {
   return canonicalPath(
     extname(absolute) === ".db" ? absolute : join(absolute, "beads.db"),
   );
+}
+
+/** Every path a beads store at canonical `db` writes or locks. */
+export function beadsOwnedPaths(db: string): string[] {
+  return [
+    db,
+    `${db}-wal`,
+    `${db}-shm`,
+    `${db}-journal`,
+    `${db}.lock`,
+    `${db}.init.lock`,
+    `${db}.tasks-axi-ready`,
+    join(dirname(db), "note-archive.md"),
+  ];
 }
 
 function validatePathValue(
@@ -352,11 +372,20 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ResolvedConfig {
         );
       config.beadsTimeoutMs = timeout;
     }
-    const lockTimeout =
-      env.TASKS_AXI_BEADS_LOCK_TIMEOUT_MS !== undefined
-        ? Number(env.TASKS_AXI_BEADS_LOCK_TIMEOUT_MS)
-        : (projectToml.beads?.lock_timeout_ms ??
-          homeToml.beads?.lock_timeout_ms);
+    const lockTimeoutToml =
+      projectToml.beads?.lock_timeout_ms ?? homeToml.beads?.lock_timeout_ms;
+    let lockTimeout: number | undefined;
+    if (env.TASKS_AXI_BEADS_LOCK_TIMEOUT_MS !== undefined)
+      lockTimeout = Number(env.TASKS_AXI_BEADS_LOCK_TIMEOUT_MS);
+    else if (lockTimeoutToml !== undefined) {
+      const value = parseTomlValue(lockTimeoutToml, "beads.lock_timeout_ms");
+      if (typeof value !== "number")
+        throw new AxiError(
+          "beads.lock_timeout_ms must be an integer",
+          "VALIDATION_ERROR",
+        );
+      lockTimeout = value;
+    }
     if (lockTimeout !== undefined) {
       if (
         !Number.isSafeInteger(lockTimeout) ||
@@ -400,6 +429,16 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ResolvedConfig {
         homeToml.beads?.prefix,
       "beads.prefix",
     );
+  }
+  if (backend !== "beads") {
+    const configuredDatabase =
+      env.TASKS_AXI_BEADS_PATH ??
+      projectToml.beads?.path ??
+      homeToml.beads?.path;
+    if (configuredDatabase !== undefined && configuredDatabase.trim() !== "")
+      config.beadsReservedPaths = beadsOwnedPaths(
+        beadsDatabasePath(configuredDatabase, cwd),
+      );
   }
   if (archive) {
     config.archivePath = isAbsolute(archive) ? archive : resolve(cwd, archive);

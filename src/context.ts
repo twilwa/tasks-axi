@@ -48,6 +48,9 @@ export function createStore(config: ResolvedConfig): Store {
     : new MarkdownStore({
         path: config.path,
         ...(config.archivePath ? { archivePath: config.archivePath } : {}),
+        ...(config.beadsReservedPaths
+          ? { reservedPaths: config.beadsReservedPaths }
+          : {}),
       });
 }
 
