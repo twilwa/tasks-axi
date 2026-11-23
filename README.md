@@ -262,7 +262,7 @@ Markdown is the default. The optional beads_rust backend uses the same `Store` i
 ### beads_rust
 
 Install [beads_rust](https://github.com/Dicklesworthstone/beads_rust) separately. The adapter is tested against `br` 0.7.6.
-Select an explicit workspace directory or `.db` file. It never discovers a database in a parent directory. The database must sit inside a `.beads` or `_beads` directory (directly or through a symlink), because br reads its workspace from that directory.
+Select an explicit workspace directory or `.db` file. It never discovers a database in a parent directory. The database must sit inside a `.beads` or `_beads` directory (directly or through a symlink), or beside a `.beads` workspace directory as older builds left it, because br reads its workspace from that directory.
 
 ```toml
 backend = "beads"
@@ -280,7 +280,7 @@ Project configuration can select only the bare executable names `br` or `bd` on 
 Custom executable paths or other programs require trusted home configuration or `TASKS_AXI_BEADS_BINARY`.
 `--file` and `TASKS_AXI_FILE` take precedence over the beads path setting. Relative paths resolve from the current directory.
 The directory form selects `<path>/beads.db`. Every `br` call passes that explicit database file through `--db`.
-Every `br` call also pins the workspace: `BEADS_DIR` is set to the database's own `.beads`/`_beads` directory and `BEADS_DB` and `BEADS_CACHE_DIR` are removed, so neither the environment nor directory discovery can select another workspace. A database outside any such directory is refused with `VALIDATION_ERROR` before any lock or `br` call. A workspace with a `redirect` or `routes.jsonl` file, or a town root (`mayor/town.json`) with `.beads/routes.jsonl` above it, is refused with `UNSUPPORTED`, because br would follow it to another database.
+Every `br` call also pins the workspace: `BEADS_DIR` is set to the database's own `.beads`/`_beads` directory and `BEADS_DB` and `BEADS_CACHE_DIR` are removed, so neither the environment nor directory discovery can select another workspace. A database with neither is refused with `VALIDATION_ERROR` before any lock or `br` call. A workspace with a `redirect` or `routes.jsonl` file, or a town root (`mayor/town.json`) with `.beads/routes.jsonl` above it, is refused with `UNSUPPORTED`, because br would follow it to another database.
 First use initializes only the selected database, under `<db>.init.lock`. br 0.7.6 `init` ignores `--db` (it initializes `BEADS_DIR` or `<cwd>/.beads`, and `BEADS_CACHE_DIR` can move the file), so tasks-axi creates a new database only when it is named `beads.db`, running `init` with `BEADS_DIR` set to its directory and `BEADS_CACHE_DIR`/`BEADS_DB` removed. Any other name must be initialized with br first.
 Before first use tasks-axi checks that `br info` reports that exact database and, for an empty database, that it has a prefix and that `metadata.json` and `config.yaml` exist; an init interrupted before that is redone. A database that already has issues is used even without a prefix, as older builds left it: nothing is written to repair it, and `br` chooses the prefix of new native ids. Success is recorded in `<db>.tasks-axi-ready`, bound to the database file's device, inode and birth time. Every store instance remembers the identity it verified and rechecks it before each `br` call. A replaced or removed database is verified again before use, and is refused if it is not usable. Replacing or restoring a database is a drained operation: stop every tasks-axi process using it first.
 

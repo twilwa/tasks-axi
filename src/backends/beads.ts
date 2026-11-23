@@ -865,8 +865,11 @@ export class BeadsStore implements Store {
 
   private pinnedWorkspace(): string {
     if (this.workspace) return this.workspace;
+    // Older builds left <dir>/beads.db with its workspace at <dir>/.beads.
+    const beside = join(dirname(this.path), ".beads");
+    if (existsSync(beside) && statSync(beside).isDirectory()) return beside;
     throw new AxiError(
-      `Beads database ${this.path} is not inside a .beads or _beads directory, so br would choose its workspace from the environment or the current directory`,
+      `Beads database ${this.path} is not inside a .beads or _beads directory and has no .beads workspace beside it, so br would choose its workspace from the environment or the current directory`,
       "VALIDATION_ERROR",
       ["Keep the database in a .beads directory, e.g. <dir>/.beads/beads.db"],
     );
