@@ -43,6 +43,50 @@ import {
 } from "./lock.js";
 import { writeMarkdownMirror } from "./markdown-mirror.js";
 
+/**
+ * The paths a beads store selected by `selected` uses, derived exactly as
+ * the store derives them: database, canonical lock key, ready marker and
+ * note archive.
+ */
+function beadsStorePaths(selected: string) {
+  const absolute = resolve(selected);
+  const path =
+    extname(absolute) === ".db" ? absolute : join(absolute, "beads.db");
+  const lockKey = canonicalPath(path);
+  return {
+    path,
+    lockKey,
+    readyMarker: `${lockKey}.tasks-axi-ready`,
+    noteArchivePath: join(dirname(path), "note-archive.md"),
+  };
+}
+
+/**
+ * Every pathname a beads store selected by `selected` opens, writes or locks,
+ * spelled as its own I/O spells them: the database and SQLite sidecars under
+ * both the selected and canonical name, the backlog and init locks, the
+ * ready marker, the note archive and the note archive's lock.
+ */
+export function beadsOwnedPaths(selected: string): string[] {
+  const { path, lockKey, readyMarker, noteArchivePath } =
+    beadsStorePaths(selected);
+  const owned = new Set<string>();
+  for (const db of [path, lockKey])
+    for (const suffix of [
+      "",
+      "-wal",
+      "-shm",
+      "-journal",
+      ".lock",
+      ".init.lock",
+    ])
+      owned.add(`${db}${suffix}`);
+  owned.add(readyMarker);
+  owned.add(noteArchivePath);
+  owned.add(`${canonicalPath(noteArchivePath)}.lock`);
+  return [...owned];
+}
+
 export interface BeadsStoreOptions {
   /** Explicit .beads workspace directory or .db file; never auto-discovered. */
   path: string;
@@ -463,17 +507,16 @@ export class BeadsStore implements Store {
         "An explicit beads database path is required",
         "VALIDATION_ERROR",
       );
-    const selected = resolve(options.path);
-    this.path =
-      extname(selected) === ".db" ? selected : join(selected, "beads.db");
+    const paths = beadsStorePaths(options.path);
+    this.path = paths.path;
     // init creates .beads relative to cwd, so never run it inside .beads itself.
     this.cwd =
       basename(dirname(this.path)) === ".beads"
         ? dirname(dirname(this.path))
         : dirname(this.path);
-    this.noteArchivePath = join(dirname(this.path), "note-archive.md");
-    this.lockKey = canonicalPath(this.path);
-    this.readyMarker = `${this.lockKey}.tasks-axi-ready`;
+    this.noteArchivePath = paths.noteArchivePath;
+    this.lockKey = paths.lockKey;
+    this.readyMarker = paths.readyMarker;
     this.showBatchBytes = options.showBatchBytes ?? SHOW_ARGV_BYTES;
     this.binary = options.binary ?? "br";
     this.prefix = options.prefix ?? "tasks";

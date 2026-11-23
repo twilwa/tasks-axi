@@ -17,7 +17,7 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { AxiError } from "../errors.js";
 
 /**
@@ -162,6 +162,56 @@ export function canonicalPath(path: string, depth = 0): string {
     }
     return join(canonicalPath(dirname(absolute), depth), basename(absolute));
   }
+}
+
+/**
+ * Resolve `path` the way the kernel does when it is opened: components left
+ * to right, following each symlink (the leaf only when `followLeaf`), and
+ * applying ".." to the physical directory reached so far, never lexically.
+ * Missing components are kept as spelled. Relative paths start at the cwd.
+ */
+export function physicalPath(path: string, followLeaf: boolean): string {
+  if (process.platform === "win32") return canonicalPath(path);
+  const queue = (isAbsolute(path) ? path : `${process.cwd()}/${path}`)
+    .split("/")
+    .filter((part) => part !== "");
+  let current = "/";
+  let links = 0;
+  while (queue.length) {
+    const part = queue.shift()!;
+    if (part === ".") continue;
+    if (part === "..") {
+      current = dirname(current);
+      continue;
+    }
+    const next = current === "/" ? `/${part}` : `${current}/${part}`;
+    let link: string | undefined;
+    if (queue.length || followLeaf)
+      try {
+        if (lstatSync(next).isSymbolicLink()) link = readlinkSync(next);
+      } catch {
+        link = undefined;
+      }
+    if (link === undefined) {
+      current = next;
+      continue;
+    }
+    if (++links > 40)
+      throw Object.assign(new Error(`too many symlinks: ${path}`), {
+        code: "ELOOP",
+      });
+    queue.unshift(...link.split("/").filter((p) => p !== ""));
+    if (link.startsWith("/")) current = "/";
+  }
+  return current;
+}
+
+/**
+ * The directory entry `path` names (rename and unlink act on it) and the
+ * file it reaches (open, append and truncate act on that).
+ */
+export function pathIdentities(path: string): string[] {
+  return [physicalPath(path, false), physicalPath(path, true)];
 }
 
 /** Write `content` atomically: temp file in the same dir, then rename over. */

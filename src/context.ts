@@ -1,5 +1,5 @@
 import { MarkdownStore } from "./backends/markdown.js";
-import { BeadsStore } from "./backends/beads.js";
+import { BeadsStore, beadsOwnedPaths } from "./backends/beads.js";
 import {
   type ConfigOverrides,
   type ResolvedConfig,
@@ -48,8 +48,8 @@ export function createStore(config: ResolvedConfig): Store {
     : new MarkdownStore({
         path: config.path,
         ...(config.archivePath ? { archivePath: config.archivePath } : {}),
-        ...(config.beadsReservedPaths
-          ? { reservedPaths: config.beadsReservedPaths }
+        ...(config.beadsConfiguredPath
+          ? { reservedPaths: beadsOwnedPaths(config.beadsConfiguredPath) }
           : {}),
       });
 }

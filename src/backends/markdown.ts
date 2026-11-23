@@ -48,7 +48,7 @@ import type {
 } from "../store.js";
 import {
   atomicWrite,
-  canonicalPath,
+  pathIdentities,
   readFileSafe,
   withLock,
   withLocks,
@@ -351,20 +351,20 @@ export class MarkdownStore implements Store {
       );
     }
     if (options.reservedPaths?.length) {
-      const reserved = new Set(options.reservedPaths);
-      const targets: [string, string[]][] = [
-        [
-          this.path,
-          [canonicalPath(this.path), `${canonicalPath(this.path)}.lock`],
-        ],
-        [this.archivePath, [canonicalPath(this.archivePath)]],
-        [this.noteArchivePath, [canonicalPath(this.noteArchivePath)]],
-      ];
-      for (const [target, resolved] of targets)
-        for (const path of resolved)
+      // Compare the directory entry and the file it reaches on both sides,
+      // spelled as each side's I/O spells them (the lock is the backlog's
+      // own spelling plus .lock, as acquisition derives it).
+      const reserved = new Set(options.reservedPaths.flatMap(pathIdentities));
+      for (const target of [
+        this.path,
+        `${this.path}.lock`,
+        this.archivePath,
+        this.noteArchivePath,
+      ])
+        for (const path of pathIdentities(target))
           if (reserved.has(path))
             throw new AxiError(
-              `${resolve(target)} resolves to ${path}, which is reserved by the configured beads store; choose a different Markdown file`,
+              `${target} resolves to ${path}, which is reserved by the configured beads store; choose a different Markdown file`,
               "VALIDATION_ERROR",
             );
     }

@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, extname, isAbsolute, join, resolve } from "node:path";
+import { extname, isAbsolute, join, resolve } from "node:path";
 import { canonicalPath, readFileSafe } from "./backends/lock.js";
 import { AxiError } from "./errors.js";
 
@@ -31,11 +31,12 @@ export interface ResolvedConfig {
   beadsMirrorPath?: string;
   beadsMirrorArchivePath?: string;
   /**
-   * Markdown only, when a beads store is also configured: the canonical
-   * paths that store owns, which no Markdown target or archive may resolve
-   * to. Undefined without beads configuration, so Markdown is as on main.
+   * Markdown only, when a beads store is also configured: that store's path
+   * as the beads backend would receive it. Markdown targets must not resolve
+   * to anything it owns. Undefined without beads configuration, so Markdown
+   * is exactly as on main.
    */
-  beadsReservedPaths?: string[];
+  beadsConfiguredPath?: string;
 }
 
 export interface ConfigOverrides {
@@ -245,20 +246,6 @@ function beadsDatabasePath(path: string, cwd: string): string {
   );
 }
 
-/** Every path a beads store at canonical `db` writes or locks. */
-export function beadsOwnedPaths(db: string): string[] {
-  return [
-    db,
-    `${db}-wal`,
-    `${db}-shm`,
-    `${db}-journal`,
-    `${db}.lock`,
-    `${db}.init.lock`,
-    `${db}.tasks-axi-ready`,
-    join(dirname(db), "note-archive.md"),
-  ];
-}
-
 function validatePathValue(
   value: string | undefined,
   source: string,
@@ -435,9 +422,12 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ResolvedConfig {
       env.TASKS_AXI_BEADS_PATH ??
       projectToml.beads?.path ??
       homeToml.beads?.path;
+    // Spelled as resolveStorePath would select it for the beads backend.
     if (configuredDatabase !== undefined && configuredDatabase.trim() !== "")
-      config.beadsReservedPaths = beadsOwnedPaths(
-        beadsDatabasePath(configuredDatabase, cwd),
+      config.beadsConfiguredPath = resolveStorePath(
+        configuredDatabase,
+        undefined,
+        cwd,
       );
   }
   if (archive) {
