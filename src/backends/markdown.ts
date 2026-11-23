@@ -858,11 +858,13 @@ export class MarkdownStore implements Store {
 
   /**
    * Outbox protocol: this backlog stays the durable record until the
-   * destination confirms every selected task by reading it back, then all of
-   * them leave in one atomic write. No lock is held across the destination's
-   * writes; the release re-reads under the lock and refuses if a selected item
-   * changed meanwhile, so a concurrent edit is never lost. An interrupted run
-   * leaves every item here, and a rerun reuses the rows already received.
+   * destination confirms every selected task by reading it back. The
+   * destination then calls back, still holding its own lock, and all of them
+   * leave in one atomic write; that rename is the commit point. Lock order is
+   * destination first, then this backlog, and this lock is never held across
+   * a destination write. The release re-reads under the lock and refuses if a
+   * selected item changed meanwhile, so a cooperative edit is never lost. An
+   * interrupted run leaves every item here, and a rerun reuses the rows.
    */
   private async releaseInto(
     ids: string[],
@@ -871,40 +873,63 @@ export class MarkdownStore implements Store {
     const doc = this.load();
     // Source order, so each state keeps its outbox order in the destination.
     const selected = this.allTasks(doc).filter((task) => ids.includes(task.id));
-    const absent = ids.filter((id) => !selected.some((task) => task.id === id));
-    // Ids already released by an earlier run must be in the destination.
-    for (const id of absent)
-      if (!(await destination.get(id)))
-        throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
-    if (!selected.length)
-      return { ids, already: true, created: [], existing: ids, unlinked: [] };
+    const released = ids.filter(
+      (id) => !selected.some((task) => task.id === id),
+    );
     this.requireNoStrandedDependents(doc, ids);
-    const received = await destination.receiveMany!(selected, [
-      this.path,
-      this.archivePath,
-      this.noteArchivePath,
-    ]);
-    await withLock(this.path, () => {
-      const loaded = this.loadForUpdate();
-      this.requireNoStrandedDependents(loaded.doc, ids);
-      const entries = new Set<Entry>();
-      for (const task of selected) {
-        const found = this.findEntry(loaded.doc, task.id);
-        if (!found || JSON.stringify(found.entry.task) !== JSON.stringify(task))
-          throw new AxiError(
-            `Outbox item "${task.id}" changed while it was being received; nothing was released`,
-            "CONFLICT",
-            [
-              "The destination holds the item as it was first read; reconcile the two by hand, then rerun the move",
-            ],
-          );
-        entries.add(found.entry);
-      }
-      for (const section of loaded.doc.sections)
-        section.entries = section.entries.filter((e) => !entries.has(e));
-      this.persist(loaded);
+    const received = await destination.receiveMany!(selected, {
+      readOnlyPaths: [this.path, this.archivePath, this.noteArchivePath],
+      released,
+      release: () => this.releaseReceived(selected, ids),
     });
-    return { ids, ...received, existing: [...received.existing, ...absent] };
+    return {
+      ids,
+      ...received,
+      existing: [...received.existing, ...released],
+      ...(selected.length ? {} : { already: true }),
+    };
+  }
+
+  /** Remove confirmed outbox items in one atomic write, if none changed. */
+  private async releaseReceived(selected: Task[], ids: string[]) {
+    if (!selected.length) return;
+    try {
+      await withLock(this.path, () => {
+        const loaded = this.loadForUpdate();
+        this.requireNoStrandedDependents(loaded.doc, ids);
+        const entries = new Set<Entry>();
+        for (const task of selected) {
+          const found = this.findEntry(loaded.doc, task.id);
+          if (
+            !found ||
+            JSON.stringify(found.entry.task) !== JSON.stringify(task)
+          )
+            throw new AxiError(
+              `Outbox item "${task.id}" changed while it was being received; nothing was released`,
+              "CONFLICT",
+              [
+                "The destination holds the item as it was first read; reconcile the two by hand, then rerun the move",
+              ],
+            );
+          entries.add(found.entry);
+        }
+        for (const section of loaded.doc.sections)
+          section.entries = section.entries.filter((e) => !entries.has(e));
+        this.persist(loaded);
+      });
+    } catch (error) {
+      if (!(error instanceof AxiError) || error.code !== "LOCKED") throw error;
+      const lock = `${this.path}.lock`;
+      throw new AxiError(
+        `Every row is confirmed in the destination, but the outbox lock ${lock} is held, so nothing was released`,
+        "LOCKED",
+        [
+          `The first field of ${lock} is the pid of the tasks-axi process that took it; if no process with that pid is running, the lock is dead`,
+          `Remove a dead ${lock} and rerun the same mv: the rerun reuses the confirmed rows and only releases the outbox items`,
+          "If that process is alive, wait for it to finish and rerun",
+        ],
+      );
+    }
   }
 
   /** An active task left behind must not be blocked by a task that leaves. */

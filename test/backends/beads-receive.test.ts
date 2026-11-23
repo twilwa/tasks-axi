@@ -1,11 +1,16 @@
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -51,22 +56,23 @@ function mv(...ids: string[]) {
   );
 }
 
-/** The same mv in a real CLI process, which a br hook can kill mid-move. */
-function mvProcess(ids: string[], binary: string) {
+/** tasks-axi in a real CLI process, which a br hook can pause or kill. */
+function tasksAxi(
+  args: string[],
+  options: {
+    binary?: string;
+    nodeArgs?: string[];
+    env?: NodeJS.ProcessEnv;
+  } = {},
+) {
   const child = spawn(
     process.execPath,
     [
+      ...(options.nodeArgs ?? []),
       "--import",
       pathToFileURL(createRequire(import.meta.url).resolve("tsx")).href,
       fileURLToPath(new URL("../../bin/tasks-axi.ts", import.meta.url)),
-      "mv",
-      ...ids,
-      "--file",
-      file,
-      "--to",
-      ws.path,
-      "--to-backend",
-      "beads",
+      ...args,
     ],
     {
       cwd: ws.dir,
@@ -79,7 +85,8 @@ function mvProcess(ids: string[], binary: string) {
         HOME: home,
         USERPROFILE: home,
         BEADS_DIR: join(ws.dir, ".beads"),
-        TASKS_AXI_BEADS_BINARY: binary,
+        TASKS_AXI_BEADS_BINARY: options.binary ?? "br",
+        ...options.env,
       },
       stdio: ["ignore", "pipe", "pipe"],
     },
@@ -87,9 +94,49 @@ function mvProcess(ids: string[], binary: string) {
   let out = "";
   child.stdout.on("data", (chunk: Buffer) => (out += chunk.toString()));
   child.stderr.on("data", (chunk: Buffer) => (out += chunk.toString()));
-  return new Promise<{ signal: NodeJS.Signals | null; out: string }>(
-    (resolve) => child.on("close", (_code, signal) => resolve({ signal, out })),
+  return new Promise<{
+    code: number | null;
+    signal: NodeJS.Signals | null;
+    out: string;
+    at: number;
+  }>((resolve) =>
+    child.on("close", (code, signal) =>
+      resolve({ code, signal, out, at: performance.now() }),
+    ),
   );
+}
+
+function mvProcess(
+  ids: string[],
+  binary: string,
+  options: { nodeArgs?: string[]; env?: NodeJS.ProcessEnv } = {},
+) {
+  return tasksAxi(
+    ["mv", ...ids, "--file", file, "--to", ws.path, "--to-backend", "beads"],
+    { binary, ...options },
+  );
+}
+
+async function waitFor(path: string, ms = 60_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!existsSync(path)) {
+    if (Date.now() > deadline) throw new Error("timed out waiting for " + path);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+/** Every file under `dir` with its contents, to prove nothing touched it. */
+function snapshot(dir: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const walk = (at: string) => {
+    for (const name of readdirSync(at)) {
+      const path = join(at, name);
+      if (statSync(path).isDirectory()) walk(path);
+      else out[path] = readFileSync(path, "base64");
+    }
+  };
+  walk(dir);
+  return out;
 }
 
 /** A br recorder that SIGKILLs tasks-axi once the nth `step` call has run. */
@@ -362,4 +409,207 @@ describe.skipIf(!hasBr)("mv from a markdown outbox into beads", () => {
     expect(after).toContain("Released, then audited.");
     expect(after).not.toContain("held-q1");
   }, 60_000);
+
+  it("keeps the beads lock from confirmation through the release, so a cooperative rm waits", async () => {
+    // The test holds the outbox lock, so the release has to wait for it.
+    const outboxLock = `${file}.lock`;
+    writeFileSync(outboxLock, "test-holder\n");
+    const created = join(ws.dir, "created");
+    const paused = join(ws.dir, "paused");
+    const resumed = join(ws.dir, "resumed");
+    // Pause the read-back (the first list after the create) inside the hold.
+    const binary = recordBr(ws.dir, ws.path, {
+      before:
+        `if (args[2] === 'list' && fs.existsSync(${JSON.stringify(created)}) && !fs.existsSync(${JSON.stringify(paused)})) {` +
+        ` fs.writeFileSync(${JSON.stringify(paused)}, ''); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2000); }`,
+      after:
+        `if (args[2] === 'create') fs.writeFileSync(${JSON.stringify(created)}, '');` +
+        ` if (args[2] === 'list' && fs.existsSync(${JSON.stringify(paused)}) && !fs.existsSync(${JSON.stringify(resumed)})) fs.writeFileSync(${JSON.stringify(resumed)}, '');`,
+    }).binary;
+    const move = mvProcess(["held-q1"], binary);
+    await waitFor(paused);
+    const remove = tasksAxi([
+      "rm",
+      "held-q1",
+      "--backend",
+      "beads",
+      "--file",
+      ws.path,
+    ]);
+    await waitFor(resumed);
+    // The receipt is confirmed and the move now waits on the outbox lock.
+    await new Promise((r) => setTimeout(r, 1000));
+    expect(rows()).toEqual(["held-q1"]);
+    unlinkSync(outboxLock);
+    const [moved, removed] = await Promise.all([move, remove]);
+    expect(moved.code, moved.out).toBe(0);
+    expect(removed.code, removed.out).toBe(0);
+    // rm ran only after the outbox had released the confirmed row.
+    expect(removed.at).toBeGreaterThan(moved.at);
+    expect(readFileSync(file, "utf8")).not.toContain("held-q1");
+    expect(rows()).toEqual([]);
+  }, 90_000);
+
+  it("converges when a rerun finds more of an item's edges linkable than the first run", async () => {
+    writeFileSync(
+      file,
+      "## In flight\n## Queued\n- [ ] a-q1 - Depends on two blocked-by: x-q2 blocked-by: y-q3\n## Done\n",
+    );
+    const beads = new BeadsStore({ path: ws.path });
+    await beads.create({ id: "y-q3", title: "Y" });
+    const crashed = await mvProcess(["a-q1"], killAfter("dep", 1));
+    expect(crashed.signal, crashed.out).toBe("SIGKILL");
+    expect((await beads.get("a-q1"))?.deps).toEqual([
+      { type: "blocked-by", id: "y-q3" },
+    ]);
+    // Another writer adds X before the rerun, so its edge is now linkable.
+    await beads.create({ id: "x-q2", title: "X" });
+    const { output, code } = await mv("a-q1");
+    expect(code, output).toBe(0);
+    expect(
+      [...((await beads.get("a-q1"))?.deps ?? [])].sort((a, b) =>
+        a.id.localeCompare(b.id),
+      ),
+    ).toEqual([
+      { type: "blocked-by", id: "x-q2" },
+      { type: "blocked-by", id: "y-q3" },
+    ]);
+    expect(readFileSync(file, "utf8")).not.toContain("a-q1");
+  }, 90_000);
+
+  it("pins br to the destination's own workspace despite a hostile environment", async () => {
+    // A decoy workspace where a home-directory store would live.
+    const decoy = join(home, ".beads");
+    mkdirSync(decoy);
+    const init = spawnSync(
+      "br",
+      ["--db", join(decoy, "beads.db"), "init", "--prefix", "decoy", "--json"],
+      {
+        cwd: home,
+        env: { ...process.env, HOME: home, BEADS_DIR: decoy },
+        encoding: "utf8",
+      },
+    );
+    expect(init.status, init.stdout + init.stderr).toBe(0);
+    const before = snapshot(decoy);
+    // Outside any .beads directory, so br reads the workspace from the env.
+    mkdirSync(join(ws.dir, "link"));
+    const db = join(ws.dir, "link", "alias.db");
+    symlinkSync(ws.path, db);
+    vi.stubEnv("BEADS_DIR", decoy);
+    vi.stubEnv("BEADS_DB", join(decoy, "beads.db"));
+    const { output, code } = await cli(
+      "mv",
+      "held-q1",
+      "--file",
+      file,
+      "--to",
+      db,
+      "--to-backend",
+      "beads",
+      "--json",
+    );
+    expect(code, output).toBe(0);
+    expect(rows()).toEqual(["held-q1"]);
+    expect(snapshot(decoy)).toEqual(before);
+  }, 60_000);
+
+  it("refuses a database outside any .beads directory before running br", async () => {
+    const db = join(ws.dir, "plain", "beads.db");
+    const { output, code } = await cli(
+      "mv",
+      "held-q1",
+      "--file",
+      file,
+      "--to",
+      db,
+      "--to-backend",
+      "beads",
+    );
+    expect(code, output).toBe(2);
+    expect(output).toContain("not inside a .beads or _beads directory");
+    expect(existsSync(join(ws.dir, "plain"))).toBe(false);
+    expect(readFileSync(file, "utf8")).toBe(outbox);
+  }, 60_000);
+
+  it("refuses a destination workspace that routes issue ids to another database", async () => {
+    writeFileSync(
+      join(ws.dir, ".beads", "routes.jsonl"),
+      JSON.stringify({ prefix: "test-", path: home }) + "\n",
+    );
+    const { output, code } = await mv("held-q1");
+    expect(code, output).not.toBe(0);
+    expect(output).toContain("UNSUPPORTED");
+    expect(output).toContain("routes.jsonl");
+    expect(readFileSync(file, "utf8")).toBe(outbox);
+    rmSync(join(ws.dir, ".beads", "routes.jsonl"));
+    expect(rows()).toEqual([]);
+  }, 60_000);
+
+  it("reports ids as unknown, keeping the first error, when the diagnostic read fails too", async () => {
+    const counter = join(ws.dir, "create-count");
+    const failing = join(ws.dir, "reads-fail");
+    vi.stubEnv(
+      "TASKS_AXI_BEADS_BINARY",
+      recordBr(ws.dir, ws.path, {
+        before:
+          `if (args[2] === 'list' && fs.existsSync(${JSON.stringify(failing)})) { fs.unlinkSync(${JSON.stringify(failing)}); process.stdout.write('{"error":{"code":"DATABASE_ERROR","message":"read injected"}}'); process.exit(3); }` +
+          ` if (args[2] === 'create') {` +
+          ` const c = fs.existsSync(${JSON.stringify(counter)}) ? Number(fs.readFileSync(${JSON.stringify(counter)}, 'utf8')) + 1 : 1;` +
+          ` fs.writeFileSync(${JSON.stringify(counter)}, String(c));` +
+          ` if (c === 2) { fs.writeFileSync(${JSON.stringify(failing)}, ''); process.stdout.write('{"error":{"code":"DATABASE_ERROR","message":"create injected"}}'); process.exit(3); } }`,
+      }).binary,
+    );
+    const failed = await mv("held-q1", "inspect-a2");
+    expect(failed.code, failed.output).not.toBe(0);
+    expect(failed.output).toContain("create injected");
+    expect(failed.output).toContain("unknown: inspect-a2, held-q1");
+    expect(failed.output).toContain("read injected");
+    expect(readFileSync(file, "utf8")).toBe(outbox);
+    vi.stubEnv("TASKS_AXI_BEADS_BINARY", "br");
+    const { output, code } = await mv("held-q1", "inspect-a2");
+    expect(code, output).toBe(0);
+    expect(rows()).toEqual(["held-q1", "inspect-a2"]);
+  }, 60_000);
+
+  it("names the confirmed rows and a safe recovery when killed during the release", async () => {
+    const preload = join(ws.dir, "kill-on-release.mjs");
+    writeFileSync(
+      preload,
+      `import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const rename = fs.renameSync;
+fs.renameSync = (from, to) => {
+  if (String(to) === process.env.KILL_ON_RENAME) process.kill(process.pid, "SIGKILL");
+  return rename(from, to);
+};
+syncBuiltinESMExports();
+`,
+    );
+    const crashed = await mvProcess(["held-q1"], "br", {
+      nodeArgs: ["--import", pathToFileURL(preload).href],
+      env: { KILL_ON_RENAME: file },
+    });
+    expect(crashed.signal, crashed.out).toBe("SIGKILL");
+    // Killed between taking the outbox lock and its rename: both copies, dead lock.
+    expect(rows()).toEqual(["held-q1"]);
+    expect(readFileSync(file, "utf8")).toBe(outbox);
+    const lock = `${file}.lock`;
+    const pid = Number(readFileSync(lock, "utf8").split(":")[0]);
+    expect(() => process.kill(pid, 0)).toThrow();
+    const locked = await mv("held-q1");
+    expect(locked.code, locked.output).not.toBe(0);
+    expect(locked.output).toContain("LOCKED");
+    expect(locked.output).toContain("confirmed in the destination");
+    expect(locked.output).toContain("is the pid of the tasks-axi process");
+    unlinkSync(lock);
+    const { output, code } = await mv("held-q1");
+    expect(code, output).toBe(0);
+    expect(JSON.parse(output)).toMatchObject({
+      created: [],
+      existing: ["held-q1"],
+    });
+    expect(rows()).toEqual(["held-q1"]);
+    expect(readFileSync(file, "utf8")).not.toContain("held-q1");
+  }, 90_000);
 });

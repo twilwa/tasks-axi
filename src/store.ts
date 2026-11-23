@@ -46,6 +46,19 @@ export interface ReceiveResult {
   unlinked: UnlinkedDep[];
 }
 
+export interface ReceiveOptions {
+  /** Paths the receive must never write: the outbox and its archives. */
+  readOnlyPaths: string[];
+  /** Ids already gone from the outbox; each must be in this store. */
+  released: string[];
+  /**
+   * Remove the tasks from the outbox. Called once, after every task is
+   * confirmed, while the store still holds its own lock, so no writer of this
+   * store can change a confirmed row before the outbox lets it go.
+   */
+  release(): Promise<void>;
+}
+
 export interface TransferResult extends Partial<ReceiveResult> {
   ids: string[];
   /** Every id had already left the source and was confirmed in the destination. */
@@ -115,14 +128,15 @@ export interface Store {
   transferMany?(ids: string[], destination: Store): Promise<TransferResult>;
 
   /**
-   * Receive tasks from an outbox that stays authoritative until this returns,
-   * gated on `collectionReceive`. Under the store's own lock: refuse an
-   * existing row that differs, create the missing rows, link their edges,
-   * and read every row back. Resolves only once every task is confirmed;
-   * otherwise throws, keeping the rows written so far for a rerun to reuse.
-   * Never writes `readOnlyPaths`.
+   * Receive tasks from an outbox that stays authoritative until it releases
+   * them, gated on `collectionReceive`. Under one hold of the store's own
+   * lock: check `released` ids are present, refuse an existing row that
+   * differs, create the missing rows, link their edges, read every row back,
+   * and only then call `release`. Otherwise throws without releasing,
+   * keeping the rows written so far for a rerun to reuse. Never writes
+   * `readOnlyPaths`.
    */
-  receiveMany?(tasks: Task[], readOnlyPaths: string[]): Promise<ReceiveResult>;
+  receiveMany?(tasks: Task[], options: ReceiveOptions): Promise<ReceiveResult>;
 
   // maintenance (optional, capability-gated)
   prune?(options: PruneOptions): Promise<PruneResult>;

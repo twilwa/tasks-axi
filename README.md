@@ -262,7 +262,7 @@ Markdown is the default. The optional beads_rust backend uses the same `Store` i
 ### beads_rust
 
 Install [beads_rust](https://github.com/Dicklesworthstone/beads_rust) separately. The adapter is tested against `br` 0.7.6.
-Select an explicit workspace directory or `.db` file. It never discovers a database in a parent directory.
+Select an explicit workspace directory or `.db` file. It never discovers a database in a parent directory. The database must sit inside a `.beads` or `_beads` directory (directly or through a symlink), because br reads its workspace from that directory.
 
 ```toml
 backend = "beads"
@@ -280,6 +280,7 @@ Project configuration can select only the bare executable names `br` or `bd` on 
 Custom executable paths or other programs require trusted home configuration or `TASKS_AXI_BEADS_BINARY`.
 `--file` and `TASKS_AXI_FILE` take precedence over the beads path setting. Relative paths resolve from the current directory.
 The directory form selects `<path>/beads.db`. Every `br` call passes that explicit database file through `--db`.
+Every `br` call also pins the workspace: `BEADS_DIR` is set to the database's own `.beads`/`_beads` directory and `BEADS_DB` and `BEADS_CACHE_DIR` are removed, so neither the environment nor directory discovery can select another workspace. A database outside any such directory is refused with `VALIDATION_ERROR` before any lock or `br` call. A workspace with a `redirect` or `routes.jsonl` file, or a town root (`mayor/town.json`) with `.beads/routes.jsonl` above it, is refused with `UNSUPPORTED`, because br would follow it to another database.
 First use initializes only the selected database, under `<db>.init.lock`. br 0.7.6 `init` ignores `--db` (it initializes `BEADS_DIR` or `<cwd>/.beads`, and `BEADS_CACHE_DIR` can move the file), so tasks-axi creates a new database only when it is named `beads.db`, running `init` with `BEADS_DIR` set to its directory and `BEADS_CACHE_DIR`/`BEADS_DB` removed. Any other name must be initialized with br first.
 Before first use tasks-axi checks that `br info` reports that exact database and, for an empty database, that it has a prefix and that `metadata.json` and `config.yaml` exist; an init interrupted before that is redone. A database that already has issues is used even without a prefix, as older builds left it: nothing is written to repair it, and `br` chooses the prefix of new native ids. Success is recorded in `<db>.tasks-axi-ready`, bound to the database file's device, inode and birth time. Every store instance remembers the identity it verified and rechecks it before each `br` call. A replaced or removed database is verified again before use, and is refused if it is not usable. Replacing or restoring a database is a drained operation: stop every tasks-axi process using it first.
 
@@ -426,22 +427,29 @@ Moves out of beads are refused: beads to Markdown, and beads to beads between tw
 tasks-axi mv blocker-b1 dependent-d2 --file outbox.md --to ../other/.beads --to-backend beads --json
 ```
 
-A beads database and a Markdown file share no transaction, so the move runs in three steps. The Markdown file keeps every selected item until the last step.
+A beads database and a Markdown file share no transaction, so the move runs in two steps. The Markdown file keeps every selected item until the end of the second step.
 
 1. Read the selected items from the Markdown file. No lock is held.
-2. Under the beads store's lock, held for the whole step:
+2. Take the beads store's lock and hold it to the end:
+   - Check that every requested id already missing from the Markdown file (released by an earlier run) is in beads.
    - Look up each id by its `external_ref` (`tasks-axi:<id>`), the identity the adapter maps every task id to.
    - Refuse the whole move if a row for an id exists with different content.
    - Create the rows that are missing, then add their dependency edges. This uses the same mapping as `migrate`, so title, state, kind, repo, priority, body, labels, holds, created and closed dates all carry over.
-   - Read every selected row back. The step succeeds only when each row matches its Markdown item exactly.
-3. Under the Markdown lock, read the file again. Remove all the selected items in one atomic write. Every other line keeps its bytes.
+   - Read every selected row back. Continue only when each row matches its Markdown item exactly.
+   - Take the Markdown lock, read the file again, and remove all the selected items in one atomic rename. Every other line keeps its bytes.
 
-If a `br` call fails, times out or is killed, or the tasks-axi process dies, no item is removed from the Markdown file. Rows already created stay in beads, and running the same `mv` again reuses them, so there is never more than one row per id. A failed run exits nonzero and names the ids that were confirmed in beads and the ids that were not. A rerun after a completed move finds no selected item left in the file but finds every id in beads. It exits 0 with `already: true`.
+The rename is the commit point. Locks are always taken in that order, beads first, and the Markdown lock is never held during a `br` call. Because the beads lock is still held at the rename, no other tasks-axi writer of that store (an `rm`, say) can change a confirmed row before the outbox lets it go.
+
+Before the rename, a failed, timed-out or killed `br` call or a dead tasks-axi process removes nothing from the Markdown file. Rows already created stay in beads, and running the same `mv` again reuses them, so there is never more than one row per id. A failed run exits nonzero and names the ids that were confirmed in beads and the ids that were not. If the read-back after a failure also fails, it names them as unknown and keeps the first error. A rerun reuses a row whose edges are a subset of its item's edges and adds the missing ones, so a rerun converges even when more edge targets have reached beads since the first run. After the rename the move is complete, even if the process dies before printing its result. A rerun then finds no selected item left in the file but finds every id in beads. It exits 0 with `already: true`.
+
+A process killed between taking the Markdown lock and the rename leaves `<outbox>.lock` behind, as any killed Markdown writer does. The rerun then fails with `LOCKED` and says the rows are already confirmed in beads. The lock's first field is the owning process id: if no process with that id is running, the lock is dead. Remove it and rerun the same `mv`; the rerun reuses the confirmed rows and only releases the outbox items.
 
 Conflicts are refused with `CONFLICT`, and neither side is overwritten:
 
 - A beads row for an id has different content than its outbox item. Nothing is created or removed. Reconcile the two by hand, then rerun.
 - Another writer changed a selected item in the Markdown file while it was being received. Nothing is removed from the file, and the rows created from the earlier read stay in beads. A rerun then reports the first conflict. Edits to items that are not moving are kept.
+
+Limitation: this protects writers that take the Markdown lock, such as other tasks-axi commands. An editor that saves the outbox without that lock, in the moment between the final re-read and the rename, can still lose its save, as with every Markdown write.
 
 Dependencies:
 
@@ -449,7 +457,7 @@ Dependencies:
 - `migrate` has no other case, because it refuses any edge whose target is outside the imported collection. A beads edge needs both rows to exist. So an edge whose target is in neither the moved set nor the beads store is not written. The move still succeeds and lists the edge under `unlinked_deps` (`id`, `type`, `target`, `reason`). tasks-axi already treats a blocker that is missing from a collection as resolved, so this matches how the task reads in the outbox.
 - An active task left in the Markdown file that is `blocked-by` a moving task refuses the move, as it does between Markdown backlogs. Move them together.
 
-Public-followup obligations are refused, because beads does not store them. Every `br` call names the database with `--db`. Success output adds `created` (ids created by this run), `existing` (ids found from an earlier run) and `unlinked_deps`.
+Public-followup obligations are refused, because beads does not store them. Success output adds `created` (ids created by this run), `existing` (ids found from an earlier run) and `unlinked_deps`.
 
 #### Refused directions
 

@@ -38,14 +38,36 @@ export function compatible(
   );
 }
 
-/** True when `existing` is `source` completely written, every edge included. */
-export function complete(
+function edge(dep: Dep): unknown {
+  return JSON.parse(JSON.stringify(dep)) as unknown;
+}
+
+function hasEdge(deps: Dep[], dep: Dep): boolean {
+  return deps.some((item) => isDeepStrictEqual(edge(item), edge(dep)));
+}
+
+/**
+ * Receive retry check: equal fields, and every edge `existing` already has
+ * is one of `source`'s. Order and missing edges are not compared, because
+ * which edges are linkable can change between runs as other rows arrive.
+ */
+export function edgesAgree(source: Task, existing: Task): boolean {
+  return (
+    isDeepStrictEqual(fields(source), fields(existing)) &&
+    existing.deps.every((dep) => hasEdge(source.deps, dep))
+  );
+}
+
+/** Receive confirmation: equal fields, and exactly the `linked` edges. */
+export function edgesReceived(
   source: Task,
   existing: Task,
-  deps: Dep[] = source.deps,
+  linked: Dep[],
 ): boolean {
   return (
-    compatible(source, existing, deps) && existing.deps.length === deps.length
+    edgesAgree(source, existing) &&
+    existing.deps.length === linked.length &&
+    linked.every((dep) => hasEdge(existing.deps, dep))
   );
 }
 
@@ -119,7 +141,7 @@ export function checkImportGraph(
  * finishes the same write.
  */
 export async function writeTasks(
-  store: Store,
+  store: Pick<Store, "create" | "addDep">,
   tasks: Task[],
   existing: ReadonlyMap<string, Task>,
   linked: (task: Task) => Dep[] = (task) => task.deps,
