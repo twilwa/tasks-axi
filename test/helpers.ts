@@ -95,6 +95,7 @@ export function withoutCollectionTransfer(ctx: TasksContext): TasksContext {
       ...ctx.store.capabilities(),
       backend: "stub",
       collectionTransfer: false,
+      collectionReceive: false,
     }),
     create: (input) => ctx.store.create(input),
     get: (id) => ctx.store.get(id),

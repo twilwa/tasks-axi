@@ -93,6 +93,13 @@ export function makeBeadsWorkspace() {
         input,
         maxBuffer: 16 * 1024 * 1024,
         stdio: ["pipe", "pipe", "pipe"],
+        // Pinned to this workspace: br never falls back to a home database.
+        env: {
+          ...process.env,
+          HOME: dir,
+          USERPROFILE: dir,
+          BEADS_DIR: join(dir, ".beads"),
+        },
       }),
     );
   br(["init", "--prefix", "test"]);

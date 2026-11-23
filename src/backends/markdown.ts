@@ -45,6 +45,7 @@ import type {
   PruneOptions,
   PruneResult,
   Store,
+  TransferResult,
 } from "../store.js";
 import {
   atomicWrite,
@@ -382,6 +383,7 @@ export class MarkdownStore implements Store {
       customStates: true,
       serverMintsIds: false,
       collectionTransfer: true,
+      collectionReceive: false,
       publicFollowups: true,
     };
   }
@@ -833,17 +835,87 @@ export class MarkdownStore implements Store {
     return moved;
   }
 
-  /** The upstream two-file markdown transaction; other destinations are refused. */
-  async transferMany(ids: string[], destination: Store): Promise<Task[]> {
-    if (!(destination instanceof MarkdownStore))
-      throw crossStoreMoveError(
-        { backend: "markdown", path: this.path },
-        {
-          backend: destination.capabilities().backend,
-          path: "the destination store",
-        },
+  /**
+   * The upstream two-file markdown transaction, or this backlog as the outbox
+   * of a destination that can receive; other destinations are refused.
+   */
+  async transferMany(
+    ids: string[],
+    destination: Store,
+  ): Promise<TransferResult> {
+    if (destination instanceof MarkdownStore)
+      return {
+        ids: (await this.moveManyTo(ids, destination)).map((t) => t.id),
+      };
+    const capabilities = destination.capabilities();
+    if (capabilities.collectionReceive && destination.receiveMany)
+      return this.releaseInto([...new Set(ids)], destination);
+    throw crossStoreMoveError(
+      { backend: "markdown", path: this.path },
+      { backend: capabilities.backend, path: "the destination store" },
+    );
+  }
+
+  /**
+   * Outbox protocol: this backlog stays the durable record until the
+   * destination confirms every selected task by reading it back, then all of
+   * them leave in one atomic write. No lock is held across the destination's
+   * writes; the release re-reads under the lock and refuses if a selected item
+   * changed meanwhile, so a concurrent edit is never lost. An interrupted run
+   * leaves every item here, and a rerun reuses the rows already received.
+   */
+  private async releaseInto(
+    ids: string[],
+    destination: Store,
+  ): Promise<TransferResult> {
+    const doc = this.load();
+    // Source order, so each state keeps its outbox order in the destination.
+    const selected = this.allTasks(doc).filter((task) => ids.includes(task.id));
+    const absent = ids.filter((id) => !selected.some((task) => task.id === id));
+    // Ids already released by an earlier run must be in the destination.
+    for (const id of absent)
+      if (!(await destination.get(id)))
+        throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
+    if (!selected.length)
+      return { ids, already: true, created: [], existing: ids, unlinked: [] };
+    this.requireNoStrandedDependents(doc, ids);
+    const received = await destination.receiveMany!(selected, [
+      this.path,
+      this.archivePath,
+      this.noteArchivePath,
+    ]);
+    await withLock(this.path, () => {
+      const loaded = this.loadForUpdate();
+      this.requireNoStrandedDependents(loaded.doc, ids);
+      const entries = new Set<Entry>();
+      for (const task of selected) {
+        const found = this.findEntry(loaded.doc, task.id);
+        if (!found || JSON.stringify(found.entry.task) !== JSON.stringify(task))
+          throw new AxiError(
+            `Outbox item "${task.id}" changed while it was being received; nothing was released`,
+            "CONFLICT",
+            [
+              "The destination holds the item as it was first read; reconcile the two by hand, then rerun the move",
+            ],
+          );
+        entries.add(found.entry);
+      }
+      for (const section of loaded.doc.sections)
+        section.entries = section.entries.filter((e) => !entries.has(e));
+      this.persist(loaded);
+    });
+    return { ids, ...received, existing: [...received.existing, ...absent] };
+  }
+
+  /** An active task left behind must not be blocked by a task that leaves. */
+  private requireNoStrandedDependents(doc: BacklogDoc, ids: string[]): void {
+    const moving = new Set(ids);
+    for (const id of ids) {
+      const stranded = this.activeDependents(doc, id).filter(
+        (dependent) => !moving.has(dependent),
       );
-    return this.moveManyTo(ids, destination);
+      if (stranded.length > 0) throw stillBlockingError(id, stranded);
+    }
   }
 
   /**

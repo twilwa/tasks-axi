@@ -200,7 +200,7 @@ An item's body includes every following indented or blank line, so multi-paragra
 Trailing separator blanks remain with the item's raw source for byte-exact preservation without becoming part of its structured body.
 Maintenance commands are explicit exceptions: `render` normalizes every recognized task, `prune` trims the chosen section into the archive, and `mv` writes both source and destination backlogs.
 Between markdown backlogs, `mv <id> [<id>...] --to <path-or-dir>` moves one or more tasks as one atomic cross-file transaction.
-Moves into or out of beads are refused for now; see [moving tasks between collections](#moving-tasks-between-collections).
+A Markdown backlog can also act as an outbox into beads, while moves out of beads are refused; see [moving tasks between collections](#moving-tasks-between-collections).
 To move a dependency-connected set, include every linked blocker and active dependent in the same command, unless the other endpoint already exists in the destination backlog.
 The command refuses a move that would strand a dependency across the two files, while preserving intra-set `blocked-by` links and their reason strings.
 Moved tasks are re-rendered canonically, so their multi-paragraph bodies remain intact but a trailing blank separator before the next item or section is dropped.
@@ -255,7 +255,7 @@ Markdown is the default. The optional beads_rust backend uses the same `Store` i
 | Backend                | Status  |
 | ---------------------- | ------- |
 | markdown               | shipped |
-| beads_rust (`br`)       | shipped |
+| beads_rust (`br`)      | shipped |
 | sqlite                 | planned |
 | github / jira / linear | planned |
 
@@ -311,6 +311,7 @@ Reads and writes wait for the database's `<db>.lock` for up to `lock_timeout_ms`
 The lock is a kernel lock: util-linux `flock` on one open file description of `<db>.lock`, which every `br` call inherits. The kernel releases it only when the last process holding that description exits, so the lock lasts as long as this CLI or any `br` call it started can still write. A killed tasks-axi needs no cleanup; the next writer enters as soon as its last `br` call exits, and nothing is inferred from pids, hosts or ages. The lock file is never removed and holds only `tasks-axi-lock/flock-v1`. Do not delete it while tasks-axi runs.
 The lock is keyed by the database's real path, so a symlinked or relative alias of the same file shares it.
 The lock is bound to the inode at that path. No process or operator may replace, rename over or unlink a live `<db>.lock`, `<db>.init.lock` or `<db>.tasks-axi-ready` while tasks-axi can run against that database. To keep stores from doing so:
+
 - A beads mirror or mirror archive naming any `.lock` or `.tasks-axi-ready` file is refused, whichever store owns it.
 - When a beads path is configured (`[beads] path` or `TASKS_AXI_BEADS_PATH`), a Markdown backlog, its `.lock`, its archive or its note archive is refused if it reaches a path that store owns. That covers `[markdown] path`, `[markdown] archive`, `--file` and `mv` destinations.
 - The owned paths are derived the way the beads backend derives them:
@@ -322,17 +323,18 @@ The lock is bound to the inode at that path. No process or operator may replace,
 - Both sides are resolved the way the kernel resolves them when opened: symlinks are followed component by component and `..` applies to the directory reached, never lexically. A target is refused when either its directory entry or the file it reaches is a directory entry or file the beads store uses. So a symlink on a beads path is caught, and so is a link to a lock that does not exist yet. The command fails with `VALIDATION_ERROR` and nothing is changed.
 - Limitation: the guard covers direct paths and the tested symlink cases (a symlinked lock or note archive, a symlinked database, a symlinked backlog lock, `symlink/..`). Pointing Markdown files at beads internals through other symlink arrangements is unsupported.
 - Without a configured beads path none of this runs: every Markdown path and name is handled as on main. With Markdown selected, `[beads] lock_timeout_ms` is ignored; it is read and validated only when beads is the selected backend.
-Platform: beads is refused with `UNSUPPORTED` on Windows. Everywhere else it needs a working util-linux-compatible `flock` on PATH and a local filesystem with flock semantics. If the `flock` command is missing or fails, beads also fails with `UNSUPPORTED`.
-tasks-axi cannot tell whether a mount or a third-party `flock` really behaves like flock(2). Network or shared filesystems and non-util-linux helpers are outside the tested surface, which is Linux with util-linux on ext4.
-A custom `binary` must run br with `exec` or let it inherit open descriptors (a shell wrapper does by default). A launcher that starts br without passing descriptors on (Node's `child_process` with plain stdio, for example) protects br only while the launcher itself lives.
-**Cutover prerequisite.** Earlier tasks-axi builds use the same `<db>.lock` and `<db>.init.lock` names for exclusive-create lockfiles. This build never removes such a record: a lock file holding anything but `tasks-axi-lock/flock-v1` fails with `LOCKED` and asks you to drain old CLIs.
-Switch each home in a quiet window:
+  Platform: beads is refused with `UNSUPPORTED` on Windows. Everywhere else it needs a working util-linux-compatible `flock` on PATH and a local filesystem with flock semantics. If the `flock` command is missing or fails, beads also fails with `UNSUPPORTED`.
+  tasks-axi cannot tell whether a mount or a third-party `flock` really behaves like flock(2). Network or shared filesystems and non-util-linux helpers are outside the tested surface, which is Linux with util-linux on ext4.
+  A custom `binary` must run br with `exec` or let it inherit open descriptors (a shell wrapper does by default). A launcher that starts br without passing descriptors on (Node's `child_process` with plain stdio, for example) protects br only while the launcher itself lives.
+  **Cutover prerequisite.** Earlier tasks-axi builds use the same `<db>.lock` and `<db>.init.lock` names for exclusive-create lockfiles. This build never removes such a record: a lock file holding anything but `tasks-axi-lock/flock-v1` fails with `LOCKED` and asks you to drain old CLIs.
+  Switch each home in a quiet window:
+
 1. Stop every older tasks-axi process and let its `br` calls finish.
 2. Inspect `<db>.lock` and `<db>.init.lock`. Remove one only if it holds an older record, meaning anything other than exactly `tasks-axi-lock/flock-v1`. A file holding that marker belongs to this build and stays.
 3. From then on, run only this build against that database.
 
 Older builds that meet this build's lock files wait and report them as held; they never remove them. Reverse these steps before downgrading.
-Markdown-only data operations are unchanged: the same exit codes, output and file contents as on main. Help text is the exception: `mv --help` now says moves with a beads side are refused, and `migrate --help` documents timing and restart. Each Markdown lock, including each file of a Markdown-to-Markdown `mv`, gets its own 2.5-second wait, and no lock is ever removed automatically. `scripts/markdown-parity.ts` compares any two builds on staged contention, and `test/markdown-parity.test.ts` pins this build to results recorded from the pre-PR build.
+Markdown-only data operations are unchanged: the same exit codes, output and file contents as on main. Help text is the exception: `mv --help` now describes the Markdown-to-beads outbox move and says moves out of beads are refused, and `migrate --help` documents timing and restart. Each Markdown lock, including each file of a Markdown-to-Markdown `mv`, gets its own 2.5-second wait, and no lock is ever removed automatically. `scripts/markdown-parity.ts` compares any two builds on staged contention, and `test/markdown-parity.test.ts` pins this build to results recorded from the pre-PR build.
 
 Writes that span commands are not transactions. Interrupted removal keeps a recovery identity, so the same `rm` can finish and the caller id stays reserved until then.
 Close retries retain the first closed date and do not duplicate notes. Creating an already-Done task uses one native create.
@@ -342,7 +344,7 @@ Removing an edge can leave unused reason metadata, which reads ignore. Cross-com
 After a timeout or conflict, reread and retry the same intent.
 
 Closed tasks stay in the database. This backend does not prune or support public-followup obligations.
-Live tests cover Store conformance, migration, the cross-store `mv` refusal, mirror retention, interruption recovery, and byte-identical TOON for shared markdown/br behavior. They use temporary workspaces and explicit databases, and skip when `br` or util-linux `flock` is unavailable.
+Live tests cover Store conformance, migration, the Markdown-to-beads `mv` and its crash recovery, the refusal of `mv` out of beads, mirror retention, interruption recovery, and byte-identical TOON for shared markdown/br behavior. They use temporary workspaces and explicit databases, and skip when `br` or util-linux `flock` is unavailable.
 
 #### Migrate markdown to beads
 
@@ -411,16 +413,52 @@ Fix the output path and run `tasks-axi render --backend beads`, or retry the sam
 
 ### Moving tasks between collections
 
-`mv` moves tasks between two Markdown backlogs only (see the Markdown section above). Every move with a beads side is refused for now: Markdown to beads, beads to Markdown, and beads to beads between two databases.
+`mv` supports two directions:
+
+- **Markdown to Markdown**, as one two-file transaction (see the Markdown section above).
+- **Markdown to beads**, with the Markdown file acting as an outbox.
+
+Moves out of beads are refused: beads to Markdown, and beads to beads between two databases.
+
+#### Markdown to beads
 
 ```sh
-tasks-axi mv blocker-b1 --file backlog.md --to ../other/.beads --to-backend beads
-# refused (UNSUPPORTED): cross-store moves are not supported yet: markdown <source> -> beads ../other/.beads; nothing was changed
+tasks-axi mv blocker-b1 dependent-d2 --file outbox.md --to ../other/.beads --to-backend beads --json
 ```
 
-The refusal happens before tasks-axi resolves the destination or locks, reads or writes either store, so no `br` call runs, no lock file or database is created, and both stores stay byte-identical. The command exits nonzero with `UNSUPPORTED`.
+A beads database and a Markdown file share no transaction, so the move runs in three steps. The Markdown file keeps every selected item until the last step.
 
-Why: a beads database and another collection share no transaction. A safe move has to survive a `br` call that times out or is killed partway, and still keep exactly one copy of every task. That recovery is a design of its own, and this release ships only the single-store lock fix. Rather than risk losing or duplicating tasks, cross-store moves are refused until a follow-up adds receiving into beads.
+1. Read the selected items from the Markdown file. No lock is held.
+2. Under the beads store's lock, held for the whole step:
+   - Look up each id by its `external_ref` (`tasks-axi:<id>`), the identity the adapter maps every task id to.
+   - Refuse the whole move if a row for an id exists with different content.
+   - Create the rows that are missing, then add their dependency edges. This uses the same mapping as `migrate`, so title, state, kind, repo, priority, body, labels, holds, created and closed dates all carry over.
+   - Read every selected row back. The step succeeds only when each row matches its Markdown item exactly.
+3. Under the Markdown lock, read the file again. Remove all the selected items in one atomic write. Every other line keeps its bytes.
+
+If a `br` call fails, times out or is killed, or the tasks-axi process dies, no item is removed from the Markdown file. Rows already created stay in beads, and running the same `mv` again reuses them, so there is never more than one row per id. A failed run exits nonzero and names the ids that were confirmed in beads and the ids that were not. A rerun after a completed move finds no selected item left in the file but finds every id in beads. It exits 0 with `already: true`.
+
+Conflicts are refused with `CONFLICT`, and neither side is overwritten:
+
+- A beads row for an id has different content than its outbox item. Nothing is created or removed. Reconcile the two by hand, then rerun.
+- Another writer changed a selected item in the Markdown file while it was being received. Nothing is removed from the file, and the rows created from the earlier read stay in beads. A rerun then reports the first conflict. Edits to items that are not moving are kept.
+
+Dependencies:
+
+- An edge is written when its target moves in the same call or already exists in the beads store, the same way `migrate` writes it: a native edge plus its saved reason.
+- `migrate` has no other case, because it refuses any edge whose target is outside the imported collection. A beads edge needs both rows to exist. So an edge whose target is in neither the moved set nor the beads store is not written. The move still succeeds and lists the edge under `unlinked_deps` (`id`, `type`, `target`, `reason`). tasks-axi already treats a blocker that is missing from a collection as resolved, so this matches how the task reads in the outbox.
+- An active task left in the Markdown file that is `blocked-by` a moving task refuses the move, as it does between Markdown backlogs. Move them together.
+
+Public-followup obligations are refused, because beads does not store them. Every `br` call names the database with `--db`. Success output adds `created` (ids created by this run), `existing` (ids found from an earlier run) and `unlinked_deps`.
+
+#### Refused directions
+
+```sh
+tasks-axi mv blocker-b1 --backend beads --file .beads --to ../other/backlog.md --to-backend markdown
+# refused (UNSUPPORTED): cross-store moves are not supported yet: beads <source> -> markdown ../other/backlog.md; nothing was changed
+```
+
+The refusal happens before tasks-axi resolves the destination or locks, reads or writes either store. No `br` call runs, no lock file or database is created, and both stores stay byte-identical. The command exits nonzero with `UNSUPPORTED`.
 
 ## Development
 

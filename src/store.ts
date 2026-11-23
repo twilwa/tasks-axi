@@ -1,3 +1,4 @@
+import type { UnlinkedDep } from "./import.js";
 import type { PublicFollowupMutation } from "./public-followup.js";
 import type {
   Dep,
@@ -29,8 +30,26 @@ export interface Capabilities {
   serverMintsIds: boolean;
   /** Can it move a connected set while preserving dependencies and safe recovery? */
   collectionTransfer: boolean;
+  /** Can it receive a Markdown outbox idempotently by task id (`receiveMany`)? */
+  collectionReceive: boolean;
   /** Supports the durable, receipt-gated public-followup state machine. */
   publicFollowups: boolean;
+}
+
+/** What a receiving store confirmed by reading every selected row back. */
+export interface ReceiveResult {
+  /** Ids this call created, in source order. */
+  created: string[];
+  /** Ids an earlier, interrupted call had already written. */
+  existing: string[];
+  /** Edges not written because their target is in neither collection. */
+  unlinked: UnlinkedDep[];
+}
+
+export interface TransferResult extends Partial<ReceiveResult> {
+  ids: string[];
+  /** Every id had already left the source and was confirmed in the destination. */
+  already?: boolean;
 }
 
 export interface PruneOptions {
@@ -86,13 +105,24 @@ export interface Store {
   /**
    * Move a connected set into `destination`, gated on `collectionTransfer`.
    * The adapter owns collision, dependency and obligation validation. Markdown
-   * implements it as its two-file transaction between Markdown backlogs and
-   * refuses any other destination; beads does not offer it, and the CLI
-   * refuses every move with a beads side before touching either store.
+   * implements it as its two-file transaction between Markdown backlogs, and
+   * as an outbox into a destination with `collectionReceive`; it refuses any
+   * other destination. Beads does not offer it, and the CLI refuses every
+   * move out of beads before touching either store.
    * Adapters that cannot preserve this contract omit it; the CLI offers only
    * a single-id copy-then-remove fallback.
    */
-  transferMany?(ids: string[], destination: Store): Promise<Task[]>;
+  transferMany?(ids: string[], destination: Store): Promise<TransferResult>;
+
+  /**
+   * Receive tasks from an outbox that stays authoritative until this returns,
+   * gated on `collectionReceive`. Under the store's own lock: refuse an
+   * existing row that differs, create the missing rows, link their edges,
+   * and read every row back. Resolves only once every task is confirmed;
+   * otherwise throws, keeping the rows written so far for a rerun to reuse.
+   * Never writes `readOnlyPaths`.
+   */
+  receiveMany?(tasks: Task[], readOnlyPaths: string[]): Promise<ReceiveResult>;
 
   // maintenance (optional, capability-gated)
   prune?(options: PruneOptions): Promise<PruneResult>;

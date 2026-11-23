@@ -4,6 +4,7 @@
  * Port of the bd Store concepts from RooseveltAdvisors/tasks-axi (MIT):
  * https://github.com/RooseveltAdvisors/tasks-axi/blob/8c6f96eb58924fd094053eb1a57dd57c64655bbd/src/backends/beads.ts
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, statSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
@@ -24,7 +25,13 @@ import type {
   TransitionOpts,
 } from "../model.js";
 import { HOLD_KINDS, STATES } from "../model.js";
-import type { Capabilities, Store } from "../store.js";
+import {
+  checkImportGraph,
+  compatible,
+  complete,
+  writeTasks,
+} from "../import.js";
+import type { Capabilities, ReceiveResult, Store } from "../store.js";
 import {
   deriveLinks,
   extractTags,
@@ -507,6 +514,8 @@ export class BeadsStore implements Store {
   private readonly doneKeep: number;
   /** Error translation only, never a task/read cache. */
   private readonly ids = new Map<string, string>();
+  /** Set while this async chain holds the backlog lock, so nested work reuses it. */
+  private readonly holding = new AsyncLocalStorage<true>();
 
   constructor(options: BeadsStoreOptions) {
     if (!options.path?.trim())
@@ -612,36 +621,46 @@ export class BeadsStore implements Store {
   private async mutate<T>(
     operation: (settle: (tasks: LoadedTask[]) => void) => Promise<T>,
   ): Promise<T> {
+    return this.exclusive(async () => {
+      let settled: LoadedTask[] | undefined;
+      const result = await operation((tasks) => {
+        settled = tasks;
+      });
+      if (this.mirrorPath && this.mirrorArchivePath) {
+        try {
+          const tasks = (settled ?? (await this.load())).map(
+            (item) => item.task,
+          );
+          writeMarkdownMirror(
+            tasks,
+            this.mirrorPath,
+            this.mirrorArchivePath,
+            this.doneKeep,
+          );
+        } catch (error) {
+          throw new AxiError(
+            `Beads write succeeded, but markdown mirror refresh failed: ${error instanceof Error ? error.message : String(error)}`,
+            "UNKNOWN",
+            [
+              "The database remains authoritative; fix the mirror path and run tasks-axi render --backend beads",
+            ],
+          );
+        }
+      }
+      return result;
+    });
+  }
+
+  /**
+   * Hold the backlog lock for `fn`. A flock is per open file, so a second
+   * acquisition in the same process would wait on itself: work nested inside
+   * a held lock (a receive's creates and read-back) runs under the outer one.
+   */
+  private exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.holding.getStore()) return fn();
     return withLock(
       this.lockKey,
-      async () => {
-        let settled: LoadedTask[] | undefined;
-        const result = await operation((tasks) => {
-          settled = tasks;
-        });
-        if (this.mirrorPath && this.mirrorArchivePath) {
-          try {
-            const tasks = (settled ?? (await this.load())).map(
-              (item) => item.task,
-            );
-            writeMarkdownMirror(
-              tasks,
-              this.mirrorPath,
-              this.mirrorArchivePath,
-              this.doneKeep,
-            );
-          } catch (error) {
-            throw new AxiError(
-              `Beads write succeeded, but markdown mirror refresh failed: ${error instanceof Error ? error.message : String(error)}`,
-              "UNKNOWN",
-              [
-                "The database remains authoritative; fix the mirror path and run tasks-axi render --backend beads",
-              ],
-            );
-          }
-        }
-        return result;
-      },
+      () => this.holding.run(true, fn),
       this.lockOptions,
     );
   }
@@ -656,8 +675,9 @@ export class BeadsStore implements Store {
       realtimeSync: false,
       customStates: true,
       serverMintsIds: true,
-      // Cross-store moves are refused until receiving into beads lands.
+      // Moves out of beads are refused; receiving a Markdown outbox is not.
       collectionTransfer: false,
+      collectionReceive: true,
       publicFollowups: false,
     };
   }
@@ -1044,7 +1064,7 @@ export class BeadsStore implements Store {
    * a row from before a write with counts from after it.
    */
   private locked<T>(read: () => Promise<T>): Promise<T> {
-    return withLock(this.lockKey, read, this.lockOptions);
+    return this.exclusive(read);
   }
 
   async isEmpty(): Promise<boolean> {
@@ -1110,6 +1130,80 @@ export class BeadsStore implements Store {
           `Source task "${task.id}" cannot be imported without normalizing its fields`,
         );
     }
+  }
+
+  /**
+   * Receive outbox tasks under one hold of the backlog lock, by the caller id
+   * external_ref maps (`tasks-axi:<id>`), through the migration's mapping. An
+   * edge to an id in neither the outbox set nor this store is not written (a
+   * beads edge needs both rows) and is reported instead.
+   */
+  async receiveMany(
+    tasks: Task[],
+    readOnlyPaths: string[],
+  ): Promise<ReceiveResult> {
+    return this.exclusive(async () => {
+      this.validateImport(tasks, readOnlyPaths);
+      const existing = new Map(
+        (await this.list({})).items.map((task) => [task.id, task]),
+      );
+      const unlinked = checkImportGraph(tasks, new Set(existing.keys()));
+      const linked = (task: Task) =>
+        task.deps.filter(
+          (dep) =>
+            !unlinked.some((edge) => edge.id === task.id && edge.dep === dep),
+        );
+      const conflicts = tasks
+        .filter((task) => {
+          const found = existing.get(task.id);
+          return found && !compatible(task, found, linked(task));
+        })
+        .map((task) => task.id);
+      if (conflicts.length)
+        throw new AxiError(
+          `Beads already holds different content for ${conflicts.map((id) => `"${id}"`).join(", ")}; nothing was created or released`,
+          "CONFLICT",
+          [
+            "Neither side was overwritten; reconcile the outbox item and the beads row by hand, then rerun the move",
+          ],
+        );
+      let failure: unknown;
+      let created: string[] = [];
+      try {
+        created = (await writeTasks(this, tasks, existing, linked)).created;
+      } catch (error) {
+        failure = error;
+      }
+      // The read-back, not the writes' own results, is the confirmation.
+      const after = new Map(
+        (await this.list({})).items.map((task) => [task.id, task]),
+      );
+      const confirmed = tasks
+        .filter((task) => {
+          const found = after.get(task.id);
+          return found && complete(task, found, linked(task));
+        })
+        .map((task) => task.id);
+      const pending = tasks
+        .map((task) => task.id)
+        .filter((id) => !confirmed.includes(id));
+      if (failure || pending.length) {
+        const reason =
+          failure instanceof Error ? failure.message : "read-back mismatch";
+        throw new AxiError(
+          `Receive into beads stopped (${reason}); confirmed: ${confirmed.join(", ") || "none"}; not confirmed: ${pending.join(", ") || "none"}; nothing was released`,
+          failure instanceof AxiError ? failure.code : "CONFLICT",
+          ["Rerun the same mv: confirmed rows are reused, never created twice"],
+        );
+      }
+      return {
+        created,
+        existing: tasks
+          .map((task) => task.id)
+          .filter((id) => !created.includes(id)),
+        unlinked,
+      };
+    });
   }
 
   async create(input: TaskInput): Promise<Task> {
