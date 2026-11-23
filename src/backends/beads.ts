@@ -35,6 +35,8 @@ import {
 import {
   atomicWrite,
   canonicalPath,
+  isLoop,
+  physicalPath,
   reservedPath,
   type LockOptions,
   readFileSafe,
@@ -64,26 +66,31 @@ function beadsStorePaths(selected: string) {
 /**
  * Every pathname a beads store selected by `selected` opens, writes or locks,
  * spelled as its own I/O spells them: the database and SQLite sidecars under
- * both the selected and canonical name, the backlog and init locks, the
- * ready marker, the note archive and the note archive's lock.
+ * both the selected and canonical name; the backlog lock, init lock and
+ * ready marker under the canonical lock key; the note archive; and the note
+ * archive's lock both beside the file it reaches now and beside its own
+ * directory entry (where the lock lands once the store's atomic rename
+ * replaces a symlinked note archive with a file). A note archive that is a
+ * symlink loop keeps its entry and that local lock reserved; only the lock
+ * beside its unresolvable referent is skipped.
  */
 export function beadsOwnedPaths(selected: string): string[] {
   const { path, lockKey, readyMarker, noteArchivePath } =
     beadsStorePaths(selected);
   const owned = new Set<string>();
   for (const db of [path, lockKey])
-    for (const suffix of [
-      "",
-      "-wal",
-      "-shm",
-      "-journal",
-      ".lock",
-      ".init.lock",
-    ])
+    for (const suffix of ["", "-wal", "-shm", "-journal"])
       owned.add(`${db}${suffix}`);
+  owned.add(`${lockKey}.lock`);
+  owned.add(`${lockKey}.init.lock`);
   owned.add(readyMarker);
   owned.add(noteArchivePath);
-  owned.add(`${canonicalPath(noteArchivePath)}.lock`);
+  owned.add(`${physicalPath(noteArchivePath, false)}.lock`);
+  try {
+    owned.add(`${canonicalPath(noteArchivePath)}.lock`);
+  } catch (error) {
+    if (!isLoop(error)) throw error;
+  }
   return [...owned];
 }
 

@@ -211,7 +211,19 @@ export function physicalPath(path: string, followLeaf: boolean): string {
  * file it reaches (open, append and truncate act on that).
  */
 export function pathIdentities(path: string): string[] {
-  return [physicalPath(path, false), physicalPath(path, true)];
+  const entry = physicalPath(path, false);
+  try {
+    return [entry, physicalPath(path, true)];
+  } catch (error) {
+    // A leaf that is a symlink loop reaches no file: keep only its entry.
+    if (isLoop(error)) return [entry];
+    throw error;
+  }
+}
+
+/** True for a too-many-symlinks failure (a loop), and nothing else. */
+export function isLoop(error: unknown): boolean {
+  return errno(error) === "ELOOP";
 }
 
 /** Write `content` atomically: temp file in the same dir, then rename over. */

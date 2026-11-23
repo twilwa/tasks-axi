@@ -92,7 +92,10 @@ type Case = {
   links?: [string, string][];
   /** Mixed-config only: no Markdown-only control. */
   noControl?: boolean;
+  /** Relies on POSIX symlink and ".." resolution. */
+  posix?: boolean;
 };
+const onPlatform = (c: Case) => !(c.posix && process.platform === "win32");
 const CASES: Case[] = [
   {
     name: "[markdown] archive on the beads note-archive lock",
@@ -141,6 +144,55 @@ const CASES: Case[] = [
     dirs: [".beads/sub"],
     links: [["link", ".beads/sub"]],
     noControl: true,
+    posix: true,
+  },
+  {
+    name: "the lock beside a symlinked note archive's own entry",
+    markdown: 'path = "backlog.md"\narchive = ".beads/note-archive.md.lock"',
+    args: ["add", "x", "X"],
+    dirs: [".beads", "notes"],
+    files: [["notes/shared.md", "# notes\n"]],
+    links: [[".beads/note-archive.md", "../notes/shared.md"]],
+    noControl: true,
+    posix: true,
+  },
+  {
+    name: "the lock beside the file a symlinked note archive reaches",
+    markdown: 'path = "backlog.md"\narchive = "notes/shared.md.lock"',
+    args: ["add", "x", "X"],
+    dirs: [".beads", "notes"],
+    files: [["notes/shared.md", "# notes\n"]],
+    links: [[".beads/note-archive.md", "../notes/shared.md"]],
+    noControl: true,
+    posix: true,
+  },
+  {
+    name: "the canonical lock of a symlinked database",
+    beads: ".beads/alias.db",
+    markdown: 'path = "backlog.md"\narchive = "db/beads.db.lock"',
+    args: ["add", "x", "X"],
+    dirs: [".beads", "db"],
+    links: [[".beads/alias.db", "../db/beads.db"]],
+    noControl: true,
+    posix: true,
+  },
+  {
+    name: "a note archive that is a symlink loop",
+    markdown: 'path = "backlog.md"\narchive = ".beads/note-archive.md"',
+    args: ["add", "x", "X"],
+    dirs: [".beads"],
+    links: [[".beads/note-archive.md", "note-archive.md"]],
+    noControl: true,
+    posix: true,
+  },
+  {
+    name: "the local lock of a note archive that is a symlink loop",
+    markdown: 'path = "backlog.md"\narchive = ".beads/note-archive.md.lock"',
+    args: ["add", "x", "X"],
+    dirs: [".beads"],
+    links: [[".beads/note-archive.md", "note-archive.md"]],
+    noControl: true,
+    posix: true,
   },
   {
     name: "[markdown] path on the beads lock",
@@ -212,7 +264,7 @@ function workspace(beads: boolean, c: Case) {
 }
 
 describe("markdown targets cannot name a configured beads store's paths", () => {
-  it.each(CASES)(
+  it.each(CASES.filter(onPlatform))(
     "refuses $name, before the lock exists",
     (c) => {
       const dir = workspace(true, c);
@@ -257,6 +309,36 @@ describe("markdown targets cannot name a configured beads store's paths", () => 
     60_000,
   );
 
+  it.skipIf(process.platform === "win32").each<Case>([
+    {
+      name: "an alias-spelled lock name the backend never uses",
+      beads: ".beads/alias.db",
+      markdown: 'path = "backlog.md"\narchive = ".beads/alias.db.lock"',
+      args: ["add", "x", "X"],
+      dirs: [".beads", "db"],
+      links: [[".beads/alias.db", "../db/beads.db"]],
+    },
+    {
+      name: "an unrelated root list beside a looping note archive",
+      args: ["list"],
+      dirs: [".beads"],
+      links: [[".beads/note-archive.md", "note-archive.md"]],
+    },
+  ])(
+    "accepts $name",
+    (c) => {
+      const dir = workspace(true, c);
+      try {
+        const result = cli(c.args, dir);
+        expect(result.status, result.stdout + result.stderr).toBe(0);
+        expect(readlinkSync(join(dir, c.links![0]![0]))).toBe(c.links![0]![1]);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
   it("does not refuse a backlog symlink outside the beads directory", () => {
     // The Markdown writer replaces outside.md and locks outside.md.lock; it
     // never touches the missing <db>.init the link names.
@@ -277,7 +359,7 @@ describe("markdown targets cannot name a configured beads store's paths", () => 
     }
   }, 30_000);
 
-  it.each(CASES.filter((c) => !c.symlink && !c.noControl))(
+  it.each(CASES.filter((c) => !c.symlink && !c.noControl && onPlatform(c)))(
     "without beads configured, $name is an ordinary markdown file, as on main",
     (c) => {
       const dir = workspace(false, c);
