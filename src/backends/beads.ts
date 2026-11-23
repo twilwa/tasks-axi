@@ -5,8 +5,25 @@
  * https://github.com/RooseveltAdvisors/tasks-axi/blob/8c6f96eb58924fd094053eb1a57dd57c64655bbd/src/backends/beads.ts
  */
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, statSync } from "node:fs";
-import { basename, dirname, extname, join, resolve } from "node:path";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import {
+  basename,
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { AxiError, type ErrorCode, unsupported } from "../errors.js";
 import { validateId } from "../id.js";
@@ -505,6 +522,38 @@ function runBr(
   });
 }
 
+/**
+ * Flatten a beads config.yaml of block mappings into dotted keys normalized
+ * the way br normalizes them (lowercase, `_` as `-`) with their scalar
+ * values; undefined for anything else, which the open gate then refuses.
+ */
+function configKeys(yaml: string): [string, string][] | undefined {
+  const keys: [string, string][] = [];
+  const stack: { indent: number; key: string }[] = [];
+  for (const raw of yaml.split(/\r?\n/)) {
+    const line = raw.replace(/\s+#.*$/, "");
+    if (!line.trim() || line.trimStart().startsWith("#")) continue;
+    // A list item belongs to the key above it, which is already recorded.
+    if (/^ *- /.test(line) && stack.length) continue;
+    const match =
+      /^( *)("[^"]*"|'[^']*'|[^\s:'"#-][^:]*?)\s*:(?:\s+(.*))?$/.exec(line);
+    if (!match) return undefined;
+    const indent = match[1].length;
+    while (stack.length && stack[stack.length - 1].indent >= indent)
+      stack.pop();
+    const name = match[2]
+      .replace(/^["']|["']$/g, "")
+      .toLowerCase()
+      .replaceAll("_", "-");
+    const key = [...stack.map((item) => item.key), name].join(".");
+    const value = (match[3] ?? "").trim().replace(/^["']|["']$/g, "");
+    if (value === "") stack.push({ indent, key });
+    else if (/^[|>[{]/.test(value)) return undefined;
+    keys.push([key, value]);
+  }
+  return keys;
+}
+
 /** A live hold of a store's backlog lock, passed explicitly to locked helpers. */
 class Held {
   live = true;
@@ -521,6 +570,8 @@ export class BeadsStore implements Store {
   private readonly cwd: string;
   /** The workspace br derives from `--db`; pinned in every br environment. */
   private readonly workspace: string;
+  /** Set once the open gate has passed for this instance. */
+  private selfContained = false;
   private readonly prefix: string;
   private readonly now: () => string;
   private readonly timeoutMs: number;
@@ -647,6 +698,7 @@ export class BeadsStore implements Store {
    * ambient flag lets unrelated work run inside another operation's hold.
    */
   private async hold<T>(fn: (held: Held) => Promise<T>): Promise<T> {
+    this.requireSelfContained();
     return withLock(
       this.lockKey,
       async () => {
@@ -850,70 +902,115 @@ export class BeadsStore implements Store {
    * environment names its workspace. The environment is an allowlist, never
    * the caller's environment minus known names: br reads `BEADS_DB`,
    * `BD_DB`, `BD_DATABASE`, any `BD_<config key>` and more, so any inherited
-   * variable could select another database, workspace or config. A workspace
-   * that redirects or routes issue ids elsewhere is refused, since br would
-   * follow it to another database.
+   * variable could select another database, workspace or config.
    */
-  private run(
+  private async run(
     args: string[],
     cwd: string,
     input?: string,
     workspace = this.workspace,
   ): Promise<string> {
-    this.requireUnrouted(this.workspace);
-    const home = join(this.workspace, ".tasks-axi-br-home");
-    mkdirSync(home, { recursive: true });
-    const env: NodeJS.ProcessEnv = {
-      // Node resolves a bare `br` (and br any program it runs) through PATH.
-      PATH: process.env.PATH ?? "",
-      // br merges user config from ~/.config/beads, ~/.config/bd and
-      // ~/.beads, and caches under HOME; a private empty home merges none.
-      HOME: home,
-      BEADS_DIR: workspace,
-    };
-    return runBr(this.binary, args, cwd, this.timeoutMs, input, env);
+    // A database outside any .beads directory gets its private one here.
+    mkdirSync(this.workspace, { recursive: true });
+    // A fresh HOME per call: br merges user config from ~/.config/beads,
+    // ~/.config/bd and ~/.beads and caches under HOME, so it must be empty,
+    // private, and never a path anyone could prepare in advance.
+    const home = mkdtempSync(join(tmpdir(), "tasks-axi-br-home-"));
+    try {
+      const stat = lstatSync(home);
+      if (
+        !stat.isDirectory() ||
+        (stat.mode & 0o777) !== 0o700 ||
+        readdirSync(home).length
+      )
+        throw new AxiError(
+          `Temporary br home ${home} is not a private empty directory`,
+          "UNKNOWN",
+        );
+      const env: NodeJS.ProcessEnv = {
+        // Node resolves a bare `br` (and br any program it runs) through PATH.
+        PATH: process.env.PATH ?? "",
+        HOME: home,
+        BEADS_DIR: workspace,
+      };
+      return await runBr(this.binary, args, cwd, this.timeoutMs, input, env);
+    } finally {
+      // runBr settles only after br exits, so nothing still uses the home.
+      rmSync(home, { recursive: true, force: true });
+    }
   }
 
   /**
-   * br's `show` (and its auto-import) opens the databases of any external
-   * projects named in the merged config. With HOME private and the
-   * environment an allowlist, that config is the store's own; refuse a store
-   * that names one, so a read-back never leaves the selected database.
+   * The open gate: once per store instance, before its first lock or br
+   * call, read the store's own workspace files as plain files (never through
+   * br, which would already act on them) and refuse a store that points br
+   * outside itself. A refused store gets nothing written, not even a lock.
    */
-  private async requireNoExternalProjects(): Promise<void> {
-    const config = record(await this.call(["config", "list"]));
-    const named = Object.keys(config).filter((key) =>
-      /^external[-_]projects\./i.test(key),
-    );
-    if (named.length)
-      throw new AxiError(
-        `Beads store ${this.path} names external projects (${named.join(", ")}); br would read their databases, so tasks-axi refuses it`,
-        "UNSUPPORTED",
-        ["Remove the external_projects entries from the store's beads config"],
-      );
-  }
-
-  private requireUnrouted(workspace: string): void {
-    const found = [
-      join(workspace, "redirect"),
-      join(workspace, "routes.jsonl"),
-    ].filter((path) => existsSync(path));
+  private requireSelfContained(): void {
+    if (this.selfContained) return;
+    const own = [this.workspace, dirname(this.path)];
+    const inside = (path: string) =>
+      own.some((root) => {
+        const rel = relative(root, path);
+        return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+      });
+    const found: string[] = [];
+    for (const name of ["redirect", "routes.jsonl"]) {
+      const path = join(this.workspace, name);
+      if (existsSync(path)) found.push(`${path} routes br elsewhere`);
+    }
     // br also reads routes from a town root: an ancestor with mayor/town.json.
-    for (let dir = dirname(workspace); ; dir = dirname(dir)) {
+    for (let dir = dirname(this.workspace); ; dir = dirname(dir)) {
       if (existsSync(join(dir, "mayor", "town.json"))) {
         const routes = join(dir, ".beads", "routes.jsonl");
-        if (existsSync(routes)) found.push(routes);
+        if (existsSync(routes)) found.push(`${routes} routes br elsewhere`);
       }
       if (dirname(dir) === dir) break;
     }
+    for (const root of new Set(own)) {
+      const metadataPath = join(root, "metadata.json");
+      const metadata = readFileSafe(metadataPath);
+      if (metadata !== undefined) {
+        let data: Record<string, unknown> | undefined;
+        try {
+          data = record(JSON.parse(metadata) as unknown);
+        } catch {
+          found.push(`${metadataPath} is not readable JSON`);
+        }
+        for (const key of ["database", "jsonl_export"]) {
+          const value = data?.[key];
+          if (value === undefined) continue;
+          if (typeof value !== "string" || !inside(resolve(root, value)))
+            found.push(`${metadataPath} sets ${key} outside the store`);
+        }
+      }
+      const configPath = join(root, "config.yaml");
+      const config = readFileSafe(configPath);
+      if (config === undefined) continue;
+      const keys = configKeys(config);
+      if (!keys) {
+        found.push(`${configPath} is not plain YAML mappings`);
+        continue;
+      }
+      for (const [key, value] of keys) {
+        if (/^(external-projects|routing)(\.|$)/.test(key))
+          found.push(`${configPath} sets ${key}`);
+        else if (
+          (key === "db" || key === "database") &&
+          !inside(resolve(this.workspace, value))
+        )
+          found.push(`${configPath} sets ${key} outside the store`);
+      }
+    }
     if (found.length)
       throw new AxiError(
-        `Beads workspace ${workspace} can send br to another database (${found.join(", ")}); tasks-axi uses only its explicit database`,
+        `Beads store ${this.path} points br outside itself (${found.join("; ")}); tasks-axi refuses it and wrote nothing`,
         "UNSUPPORTED",
         [
-          "Remove the redirect or routes file, or point tasks-axi at a database whose workspace has none",
+          "Remove those settings, or point tasks-axi at a store whose config and metadata stay inside its own workspace",
         ],
       );
+    this.selfContained = true;
   }
 
   private async call(args: string[], input?: string): Promise<unknown> {
@@ -1031,7 +1128,6 @@ export class BeadsStore implements Store {
   }
 
   private async show(ids: string[]): Promise<Bead[]> {
-    await this.requireNoExternalProjects();
     // Bound UTF-8 argv bytes, well below platform (Windows) command-line limits.
     const batches: string[][] = [];
     let batch: string[] = [];
@@ -1245,8 +1341,6 @@ export class BeadsStore implements Store {
     this.validateImport(tasks, options.readOnlyPaths);
     const ids = tasks.map((task) => task.id);
     return this.hold(async (held) => {
-      // Before any write, not only at the first show of a read-back.
-      await this.requireNoExternalProjects();
       const existing = new Map(
         (await this.load()).map((item) => [item.task.id, item.task]),
       );

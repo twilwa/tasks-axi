@@ -557,27 +557,96 @@ describe.skipIf(!hasBr)("mv from a markdown outbox into beads", () => {
     expect(snapshot(decoy)).toEqual(before);
   }, 60_000);
 
-  it("refuses a store whose config names an external project, before any write", async () => {
-    const decoy = decoyWorkspace(join(home, "other", ".beads"));
-    const before = snapshot(join(home, "other"));
-    const config = join(ws.dir, ".beads", "config.yaml");
-    writeFileSync(
-      config,
-      readFileSync(config, "utf8") +
-        `\nexternal_projects:\n  other: ${join(home, "other")}\n`,
+  it.each([
+    ["add", "external projects"],
+    ["add", "an outside export path"],
+    ["receive", "external projects"],
+    ["receive", "an outside export path"],
+  ] as const)(
+    "refuses an ordinary %s into a store whose own config names %s, writing nothing",
+    async (command, setting) => {
+      const other = join(home, "other");
+      decoyWorkspace(join(other, ".beads"));
+      const workspace = join(ws.dir, ".beads");
+      if (setting === "external projects") {
+        const config = join(workspace, "config.yaml");
+        writeFileSync(
+          config,
+          readFileSync(config, "utf8") +
+            `\nexternal_projects:\n  other: ${other}\n`,
+        );
+      } else {
+        const metadata = join(workspace, "metadata.json");
+        writeFileSync(
+          metadata,
+          JSON.stringify({
+            ...(JSON.parse(readFileSync(metadata, "utf8")) as object),
+            jsonl_export: join(other, ".beads", "issues.jsonl"),
+          }),
+        );
+      }
+      const store = snapshot(ws.dir);
+      const decoy = snapshot(other);
+      const { output, code } =
+        command === "add"
+          ? await cli(
+              "add",
+              "fresh-q9",
+              "A fresh task",
+              "--backend",
+              "beads",
+              "--file",
+              ws.path,
+            )
+          : await mv("held-q1");
+      expect(code, output).not.toBe(0);
+      expect(output).toContain("UNSUPPORTED");
+      expect(output).toContain("points br outside itself");
+      // Byte-identical: no row, no lock file, no export, nothing else.
+      expect(snapshot(ws.dir)).toEqual(store);
+      expect(snapshot(other)).toEqual(decoy);
+    },
+    60_000,
+  );
+
+  it("gives every br child a fresh, private, empty HOME and removes it afterwards", async () => {
+    const seen = join(ws.dir, "homes.jsonl");
+    vi.stubEnv(
+      "TASKS_AXI_BEADS_BINARY",
+      recordBr(ws.dir, ws.path, {
+        before:
+          `{ const h = process.env.HOME; const st = fs.lstatSync(h);` +
+          ` fs.appendFileSync(${JSON.stringify(seen)}, JSON.stringify({ home: h, mode: st.mode & 0o777, dir: st.isDirectory(), link: st.isSymbolicLink(), entries: fs.readdirSync(h).length }) + '\\n'); }`,
+      }).binary,
     );
-    const { output, code } = await mv("held-q1");
-    expect(code, output).not.toBe(0);
-    expect(output).toContain("UNSUPPORTED");
-    expect(output).toContain("external projects");
-    expect(readFileSync(file, "utf8")).toBe(outbox);
-    expect(snapshot(join(home, "other"))).toEqual(before);
-    expect(existsSync(decoy)).toBe(true);
-    writeFileSync(
-      config,
-      readFileSync(config, "utf8").split("\nexternal_projects:")[0],
-    );
-    expect(rows()).toEqual([]);
+    const { output, code } = await mv("held-q1", "inspect-a2");
+    expect(code, output).toBe(0);
+    const homes = readFileSync(seen, "utf8")
+      .trim()
+      .split("\n")
+      .map(
+        (line) =>
+          JSON.parse(line) as {
+            home: string;
+            mode: number;
+            dir: boolean;
+            link: boolean;
+            entries: number;
+          },
+      );
+    expect(homes.length).toBeGreaterThan(1);
+    expect(new Set(homes.map((item) => item.home)).size).toBe(homes.length);
+    for (const item of homes) {
+      expect(item).toMatchObject({
+        mode: 0o700,
+        dir: true,
+        link: false,
+        entries: 0,
+      });
+      expect(item.home).not.toBe(home);
+      expect(item.home.startsWith(ws.dir)).toBe(false);
+      expect(existsSync(item.home)).toBe(false);
+    }
   }, 60_000);
 
   it("receives into a fresh database outside any .beads directory, with a private workspace beside it", async () => {
