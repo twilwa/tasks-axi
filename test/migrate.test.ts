@@ -182,7 +182,7 @@ describe.skipIf(!hasBr)("markdown to beads migration", () => {
 
   it("preserves absent dates and honors explicit source/destination overrides", async () => {
     const selectedSource = join(ws.dir, "selected.md");
-    const selectedDatabase = join(ws.dir, "selected/.beads/beads.db");
+    const selectedDatabase = join(ws.dir, "selected/beads.db");
     writeFileSync(
       selectedSource,
       "## In flight\n- [ ] active-a1 - Active without date\n## Queued\n- [ ] queued-q1 - Queued without date\n",

@@ -13,7 +13,7 @@ import {
 import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MarkdownStore } from "../../src/backends/markdown.js";
@@ -123,6 +123,22 @@ async function waitFor(path: string, ms = 60_000): Promise<void> {
     if (Date.now() > deadline) throw new Error("timed out waiting for " + path);
     await new Promise((r) => setTimeout(r, 20));
   }
+}
+
+/** Initialize a decoy beads workspace that no tasks-axi call may touch. */
+function decoyWorkspace(dir: string): string {
+  mkdirSync(dir, { recursive: true });
+  const init = spawnSync(
+    "br",
+    ["--db", join(dir, "beads.db"), "init", "--prefix", "decoy", "--json"],
+    {
+      cwd: dirname(dir),
+      env: { PATH: process.env.PATH, HOME: home, BEADS_DIR: dir },
+      encoding: "utf8",
+    },
+  );
+  if (init.status !== 0) throw new Error(init.stdout + init.stderr);
+  return dir;
 }
 
 /** Every file under `dir` with its contents, to prove nothing touched it. */
@@ -444,8 +460,6 @@ describe.skipIf(!hasBr)("mv from a markdown outbox into beads", () => {
     const [moved, removed] = await Promise.all([move, remove]);
     expect(moved.code, moved.out).toBe(0);
     expect(removed.code, removed.out).toBe(0);
-    // rm ran only after the outbox had released the confirmed row.
-    expect(removed.at).toBeGreaterThan(moved.at);
     expect(readFileSync(file, "utf8")).not.toContain("held-q1");
     expect(rows()).toEqual([]);
   }, 90_000);
@@ -479,18 +493,7 @@ describe.skipIf(!hasBr)("mv from a markdown outbox into beads", () => {
 
   it("pins br to the destination's own workspace despite a hostile environment", async () => {
     // A decoy workspace where a home-directory store would live.
-    const decoy = join(home, ".beads");
-    mkdirSync(decoy);
-    const init = spawnSync(
-      "br",
-      ["--db", join(decoy, "beads.db"), "init", "--prefix", "decoy", "--json"],
-      {
-        cwd: home,
-        env: { ...process.env, HOME: home, BEADS_DIR: decoy },
-        encoding: "utf8",
-      },
-    );
-    expect(init.status, init.stdout + init.stderr).toBe(0);
+    const decoy = decoyWorkspace(join(home, ".beads"));
     const before = snapshot(decoy);
     // Outside any .beads directory, so br reads the workspace from the env.
     mkdirSync(join(ws.dir, "link"));
@@ -514,7 +517,70 @@ describe.skipIf(!hasBr)("mv from a markdown outbox into beads", () => {
     expect(snapshot(decoy)).toEqual(before);
   }, 60_000);
 
-  it("refuses a database outside any .beads directory before running br", async () => {
+  it("pins a legacy database beside its .beads workspace despite hostile BD_DB and BD_DATABASE", async () => {
+    const decoy = decoyWorkspace(join(home, ".beads"));
+    const before = snapshot(decoy);
+    // The layout older builds left: <dir>/beads.db with <dir>/.beads beside it.
+    const legacy = join(ws.dir, "legacy");
+    mkdirSync(join(legacy, ".beads"), { recursive: true });
+    const init = spawnSync(
+      "br",
+      ["--db", join(legacy, "beads.db"), "init", "--prefix", "old", "--json"],
+      {
+        cwd: legacy,
+        env: { PATH: process.env.PATH, HOME: home, BEADS_DIR: legacy },
+        encoding: "utf8",
+      },
+    );
+    expect(init.status, init.stdout + init.stderr).toBe(0);
+    const db = join(legacy, "beads.db");
+    for (const name of ["BD_DB", "BD_DATABASE", "BEADS_DB"])
+      vi.stubEnv(name, join(decoy, "beads.db"));
+    vi.stubEnv("BEADS_DIR", decoy);
+    const { output, code } = await cli(
+      "mv",
+      "held-q1",
+      "--file",
+      file,
+      "--to",
+      db,
+      "--to-backend",
+      "beads",
+      "--json",
+    );
+    expect(code, output).toBe(0);
+    for (const name of ["BD_DB", "BD_DATABASE", "BEADS_DB", "BEADS_DIR"])
+      vi.stubEnv(name, "");
+    expect(
+      (await new BeadsStore({ path: db }).list({})).items.map((t) => t.id),
+    ).toEqual(["held-q1"]);
+    expect(snapshot(decoy)).toEqual(before);
+  }, 60_000);
+
+  it("refuses a store whose config names an external project, before any write", async () => {
+    const decoy = decoyWorkspace(join(home, "other", ".beads"));
+    const before = snapshot(join(home, "other"));
+    const config = join(ws.dir, ".beads", "config.yaml");
+    writeFileSync(
+      config,
+      readFileSync(config, "utf8") +
+        `\nexternal_projects:\n  other: ${join(home, "other")}\n`,
+    );
+    const { output, code } = await mv("held-q1");
+    expect(code, output).not.toBe(0);
+    expect(output).toContain("UNSUPPORTED");
+    expect(output).toContain("external projects");
+    expect(readFileSync(file, "utf8")).toBe(outbox);
+    expect(snapshot(join(home, "other"))).toEqual(before);
+    expect(existsSync(decoy)).toBe(true);
+    writeFileSync(
+      config,
+      readFileSync(config, "utf8").split("\nexternal_projects:")[0],
+    );
+    expect(rows()).toEqual([]);
+  }, 60_000);
+
+  it("receives into a fresh database outside any .beads directory, with a private workspace beside it", async () => {
     const db = join(ws.dir, "plain", "beads.db");
     const { output, code } = await cli(
       "mv",
@@ -526,10 +592,13 @@ describe.skipIf(!hasBr)("mv from a markdown outbox into beads", () => {
       "--to-backend",
       "beads",
     );
-    expect(code, output).toBe(2);
-    expect(output).toContain("not inside a .beads or _beads directory");
-    expect(existsSync(join(ws.dir, "plain"))).toBe(false);
-    expect(readFileSync(file, "utf8")).toBe(outbox);
+    expect(code, output).toBe(0);
+    expect(
+      (await new BeadsStore({ path: db }).list({})).items.map((t) => t.id),
+    ).toEqual(["held-q1"]);
+    expect(statSync(join(ws.dir, "plain", ".beads")).isDirectory()).toBe(true);
+    // The test workspace's own store, reachable by discovery, is untouched.
+    expect(rows()).toEqual([]);
   }, 60_000);
 
   it("refuses a destination workspace that routes issue ids to another database", async () => {

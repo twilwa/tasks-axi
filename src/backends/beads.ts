@@ -520,7 +520,7 @@ export class BeadsStore implements Store {
   private readonly noteArchivePath: string;
   private readonly cwd: string;
   /** The workspace br derives from `--db`; pinned in every br environment. */
-  private readonly workspace?: string;
+  private readonly workspace: string;
   private readonly prefix: string;
   private readonly now: () => string;
   private readonly timeoutMs: number;
@@ -551,9 +551,13 @@ export class BeadsStore implements Store {
         ? dirname(dirname(this.path))
         : dirname(this.path);
     // br takes the nearest .beads/_beads ancestor of --db as its workspace;
-    // otherwise it reads BEADS_DIR, which must name such a directory, so a
-    // symlinked database uses the workspace of the file it reaches.
-    this.workspace = beadsWorkspace(this.path) ?? beadsWorkspace(paths.lockKey);
+    // otherwise it reads BEADS_DIR, which must name such a directory. So a
+    // symlinked database uses the workspace of the file it reaches, and any
+    // other database gets a private .beads beside it (as older builds left).
+    this.workspace =
+      beadsWorkspace(this.path) ??
+      beadsWorkspace(paths.lockKey) ??
+      join(dirname(this.path), ".beads");
     this.noteArchivePath = paths.noteArchivePath;
     this.lockKey = paths.lockKey;
     this.readyMarker = paths.readyMarker;
@@ -643,8 +647,6 @@ export class BeadsStore implements Store {
    * ambient flag lets unrelated work run inside another operation's hold.
    */
   private async hold<T>(fn: (held: Held) => Promise<T>): Promise<T> {
-    // Refuse an unpinnable database before the lock creates its directory.
-    this.pinnedWorkspace();
     return withLock(
       this.lockKey,
       async () => {
@@ -844,35 +846,51 @@ export class BeadsStore implements Store {
   }
 
   /**
-   * Run br pinned to this store: `--db` names the database, and the
-   * environment names its workspace, so neither `BEADS_DB`, `BEADS_DIR`,
-   * `BEADS_CACHE_DIR` nor directory discovery can select another one. A
-   * workspace that redirects or routes issue ids elsewhere is refused, since
-   * br would follow it to another database.
+   * Run br pinned to this store: `--db` names the database, and an explicit
+   * environment names its workspace. The environment is an allowlist, never
+   * the caller's environment minus known names: br reads `BEADS_DB`,
+   * `BD_DB`, `BD_DATABASE`, any `BD_<config key>` and more, so any inherited
+   * variable could select another database, workspace or config. A workspace
+   * that redirects or routes issue ids elsewhere is refused, since br would
+   * follow it to another database.
    */
   private run(
     args: string[],
     cwd: string,
     input?: string,
-    workspace = this.pinnedWorkspace(),
+    workspace = this.workspace,
   ): Promise<string> {
-    this.requireUnrouted(this.pinnedWorkspace());
-    const env: NodeJS.ProcessEnv = { ...process.env, BEADS_DIR: workspace };
-    delete env.BEADS_CACHE_DIR;
-    delete env.BEADS_DB;
+    this.requireUnrouted(this.workspace);
+    const home = join(this.workspace, ".tasks-axi-br-home");
+    mkdirSync(home, { recursive: true });
+    const env: NodeJS.ProcessEnv = {
+      // Node resolves a bare `br` (and br any program it runs) through PATH.
+      PATH: process.env.PATH ?? "",
+      // br merges user config from ~/.config/beads, ~/.config/bd and
+      // ~/.beads, and caches under HOME; a private empty home merges none.
+      HOME: home,
+      BEADS_DIR: workspace,
+    };
     return runBr(this.binary, args, cwd, this.timeoutMs, input, env);
   }
 
-  private pinnedWorkspace(): string {
-    if (this.workspace) return this.workspace;
-    // Older builds left <dir>/beads.db with its workspace at <dir>/.beads.
-    const beside = join(dirname(this.path), ".beads");
-    if (existsSync(beside) && statSync(beside).isDirectory()) return beside;
-    throw new AxiError(
-      `Beads database ${this.path} is not inside a .beads or _beads directory and has no .beads workspace beside it, so br would choose its workspace from the environment or the current directory`,
-      "VALIDATION_ERROR",
-      ["Keep the database in a .beads directory, e.g. <dir>/.beads/beads.db"],
+  /**
+   * br's `show` (and its auto-import) opens the databases of any external
+   * projects named in the merged config. With HOME private and the
+   * environment an allowlist, that config is the store's own; refuse a store
+   * that names one, so a read-back never leaves the selected database.
+   */
+  private async requireNoExternalProjects(): Promise<void> {
+    const config = record(await this.call(["config", "list"]));
+    const named = Object.keys(config).filter((key) =>
+      /^external[-_]projects\./i.test(key),
     );
+    if (named.length)
+      throw new AxiError(
+        `Beads store ${this.path} names external projects (${named.join(", ")}); br would read their databases, so tasks-axi refuses it`,
+        "UNSUPPORTED",
+        ["Remove the external_projects entries from the store's beads config"],
+      );
   }
 
   private requireUnrouted(workspace: string): void {
@@ -899,7 +917,6 @@ export class BeadsStore implements Store {
   }
 
   private async call(args: string[], input?: string): Promise<unknown> {
-    this.pinnedWorkspace();
     try {
       await this.ensureInitialized();
       // Every subprocess, reads included, is pinned to this exact database.
@@ -1014,6 +1031,7 @@ export class BeadsStore implements Store {
   }
 
   private async show(ids: string[]): Promise<Bead[]> {
+    await this.requireNoExternalProjects();
     // Bound UTF-8 argv bytes, well below platform (Windows) command-line limits.
     const batches: string[][] = [];
     let batch: string[] = [];
@@ -1227,6 +1245,8 @@ export class BeadsStore implements Store {
     this.validateImport(tasks, options.readOnlyPaths);
     const ids = tasks.map((task) => task.id);
     return this.hold(async (held) => {
+      // Before any write, not only at the first show of a read-back.
+      await this.requireNoExternalProjects();
       const existing = new Map(
         (await this.load()).map((item) => [item.task.id, item.task]),
       );
