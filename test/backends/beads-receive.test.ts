@@ -609,6 +609,71 @@ describe.skipIf(!hasBr)("mv from a markdown outbox into beads", () => {
     60_000,
   );
 
+  it.each(["add", "receive"] as const)(
+    "refuses the %s into a store whose config names external projects through an escaped YAML key",
+    async (command) => {
+      const other = join(home, "other");
+      decoyWorkspace(join(other, ".beads"));
+      const config = join(ws.dir, ".beads", "config.yaml");
+      // Decodes to external_projects, as br's YAML parser reads it.
+      writeFileSync(
+        config,
+        readFileSync(config, "utf8") +
+          `\n"external\\u005fprojects":\n  other: ${other}\n`,
+      );
+      const store = snapshot(ws.dir);
+      const decoy = snapshot(other);
+      const { output, code } =
+        command === "add"
+          ? await cli(
+              "add",
+              "fresh-q9",
+              "A fresh task",
+              "--backend",
+              "beads",
+              "--file",
+              ws.path,
+            )
+          : await mv("held-q1");
+      expect(code, output).not.toBe(0);
+      expect(output).toContain("points br outside itself");
+      expect(snapshot(ws.dir)).toEqual(store);
+      expect(snapshot(other)).toEqual(decoy);
+    },
+    60_000,
+  );
+
+  it("refuses a workspace whose canonical parent is a town with routes, even through an alias outside it", async () => {
+    // A town (mayor/town.json) whose routes would send br elsewhere.
+    const town = join(home, "town");
+    mkdirSync(join(town, "mayor"), { recursive: true });
+    writeFileSync(join(town, "mayor", "town.json"), "{}\n");
+    decoyWorkspace(join(town, ".beads"));
+    writeFileSync(
+      join(town, ".beads", "routes.jsonl"),
+      JSON.stringify({ prefix: "test-", path: "." }) + "\n",
+    );
+    mkdirSync(join(town, "proj"));
+    // Reached through an alias whose lexical parents never meet the town.
+    const alias = join(ws.dir, "alias-proj");
+    symlinkSync(join(town, "proj"), alias);
+    const before = snapshot(town);
+    const { output, code } = await cli(
+      "mv",
+      "held-q1",
+      "--file",
+      file,
+      "--to",
+      join(alias, ".beads", "beads.db"),
+      "--to-backend",
+      "beads",
+    );
+    expect(code, output).not.toBe(0);
+    expect(output).toContain("routes br elsewhere");
+    expect(snapshot(town)).toEqual(before);
+    expect(readFileSync(file, "utf8")).toBe(outbox);
+  }, 60_000);
+
   it("gives every br child a fresh, private, empty HOME and removes it afterwards", async () => {
     const seen = join(ws.dir, "homes.jsonl");
     vi.stubEnv(

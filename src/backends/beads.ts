@@ -25,6 +25,7 @@ import {
   resolve,
 } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { isAlias, isMap, isScalar, isSeq, parseDocument } from "yaml";
 import { AxiError, type ErrorCode, unsupported } from "../errors.js";
 import { validateId } from "../id.js";
 import type {
@@ -523,35 +524,44 @@ function runBr(
 }
 
 /**
- * Flatten a beads config.yaml of block mappings into dotted keys normalized
- * the way br normalizes them (lowercase, `_` as `-`) with their scalar
- * values; undefined for anything else, which the open gate then refuses.
+ * Flatten a beads config.yaml into dotted keys the way br does (br decodes
+ * it with a YAML parser, joins nested mapping keys with `.` and skips
+ * non-string keys), normalized like br (lowercase, `_` as `-`), with their
+ * scalar values. Quoting, escapes, tags and aliases are decoded first, and a
+ * merge key is followed as well, so no spelling can hide a key. Undefined
+ * when the file is not valid YAML, which the open gate then refuses.
  */
 function configKeys(yaml: string): [string, string][] | undefined {
+  const doc = parseDocument(yaml, { uniqueKeys: true });
+  if (doc.errors.length) return undefined;
   const keys: [string, string][] = [];
-  const stack: { indent: number; key: string }[] = [];
-  for (const raw of yaml.split(/\r?\n/)) {
-    const line = raw.replace(/\s+#.*$/, "");
-    if (!line.trim() || line.trimStart().startsWith("#")) continue;
-    // A list item belongs to the key above it, which is already recorded.
-    if (/^ *- /.test(line) && stack.length) continue;
-    const match =
-      /^( *)("[^"]*"|'[^']*'|[^\s:'"#-][^:]*?)\s*:(?:\s+(.*))?$/.exec(line);
-    if (!match) return undefined;
-    const indent = match[1].length;
-    while (stack.length && stack[stack.length - 1].indent >= indent)
-      stack.pop();
-    const name = match[2]
-      .replace(/^["']|["']$/g, "")
-      .toLowerCase()
-      .replaceAll("_", "-");
-    const key = [...stack.map((item) => item.key), name].join(".");
-    const value = (match[3] ?? "").trim().replace(/^["']|["']$/g, "");
-    if (value === "") stack.push({ indent, key });
-    else if (/^[|>[{]/.test(value)) return undefined;
-    keys.push([key, value]);
-  }
-  return keys;
+  const seen = new Set<unknown>();
+  const walk = (node: unknown, prefix: string): void => {
+    if (isAlias(node)) node = node.resolve(doc);
+    if (isMap(node)) {
+      if (seen.has(node)) return;
+      seen.add(node);
+      for (const pair of node.items) {
+        const key = isAlias(pair.key) ? pair.key.resolve(doc) : pair.key;
+        if (!isScalar(key) || typeof key.value !== "string") continue;
+        const name = key.value.toLowerCase().replaceAll("_", "-");
+        walk(
+          pair.value,
+          name === "<<" ? prefix : prefix ? `${prefix}.${name}` : name,
+        );
+      }
+      seen.delete(node);
+      return;
+    }
+    if (isSeq(node)) {
+      keys.push([prefix, ""]);
+      for (const item of node.items) walk(item, prefix);
+      return;
+    }
+    keys.push([prefix, isScalar(node) ? String(node.value ?? "") : ""]);
+  };
+  walk(doc.contents, "");
+  return keys.filter(([key]) => key !== "");
 }
 
 /** A live hold of a store's backlog lock, passed explicitly to locked helpers. */
@@ -960,13 +970,19 @@ export class BeadsStore implements Store {
       if (existsSync(path)) found.push(`${path} routes br elsewhere`);
     }
     // br also reads routes from a town root: an ancestor with mayor/town.json.
-    for (let dir = dirname(this.workspace); ; dir = dirname(dir)) {
-      if (existsSync(join(dir, "mayor", "town.json"))) {
-        const routes = join(dir, ".beads", "routes.jsonl");
-        if (existsSync(routes)) found.push(`${routes} routes br elsewhere`);
+    // br canonicalizes the workspace first (follow_redirects), so walk the
+    // real parents as well as the spelled ones.
+    for (const start of new Set([
+      this.workspace,
+      canonicalPath(this.workspace),
+    ]))
+      for (let dir = dirname(start); ; dir = dirname(dir)) {
+        if (existsSync(join(dir, "mayor", "town.json"))) {
+          const routes = join(dir, ".beads", "routes.jsonl");
+          if (existsSync(routes)) found.push(`${routes} routes br elsewhere`);
+        }
+        if (dirname(dir) === dir) break;
       }
-      if (dirname(dir) === dir) break;
-    }
     for (const root of new Set(own)) {
       const metadataPath = join(root, "metadata.json");
       const metadata = readFileSafe(metadataPath);
@@ -989,11 +1005,11 @@ export class BeadsStore implements Store {
       if (config === undefined) continue;
       const keys = configKeys(config);
       if (!keys) {
-        found.push(`${configPath} is not plain YAML mappings`);
+        found.push(`${configPath} is not valid YAML`);
         continue;
       }
       for (const [key, value] of keys) {
-        if (/^(external-projects|routing)(\.|$)/.test(key))
+        if (/^(external-projects|routing|routes|redirect)(\.|$)/.test(key))
           found.push(`${configPath} sets ${key}`);
         else if (
           (key === "db" || key === "database") &&
