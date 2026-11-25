@@ -528,7 +528,8 @@ function runBr(
  * it with a YAML parser, joins nested mapping keys with `.` and skips
  * non-string keys), normalized like br (lowercase, `_` as `-`), with their
  * scalar values. Quoting, escapes, tags and aliases are decoded first, and a
- * merge key is followed as well, so no spelling can hide a key. Undefined
+ * merge key is followed as well; this catches ordinary misconfiguration, not
+ * a key crafted to be read differently by br. Undefined
  * when the file is not valid YAML, which the open gate then refuses.
  */
 function configKeys(yaml: string): [string, string][] | undefined {
