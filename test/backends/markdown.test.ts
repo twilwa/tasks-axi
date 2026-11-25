@@ -1453,7 +1453,7 @@ describe("MarkdownStore", () => {
           ["cert-cleanup"],
           target.store,
         );
-        expect(moved.map((task) => task.id)).toEqual(["cert-cleanup"]);
+        expect(moved.ids).toEqual(["cert-cleanup"]);
         expect(b.read()).not.toContain("cert-cleanup");
         expect(target.read()).toContain("cert-cleanup");
       } finally {

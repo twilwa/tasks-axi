@@ -1,7 +1,6 @@
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import type { Task } from "../model.js";
 import {
   requireNonEmptySingleLineFlagValue,
   requirePositionals,
@@ -13,6 +12,7 @@ import { resolveTasksContext } from "../context.js";
 import { renderMutation } from "../confirm.js";
 import { AxiError } from "../errors.js";
 import { encode } from "@toon-format/toon";
+import { checkImportGraph, compatible, writeTasks } from "../import.js";
 
 export const MIGRATE_HELP = `usage: tasks-axi migrate --from markdown --to beads [flags]
 flags:
@@ -28,23 +28,6 @@ notes:
   elapsed_ms / ms_per_row report the run's wall time, per source row.
   An interrupted run resumes with --allow-existing; its lock clears itself.
 `;
-
-/** Compare persisted task values, ignoring storage-only timestamps and absent fields. */
-function fields(task: Task): unknown {
-  const copy: Partial<Task> = { ...task };
-  delete copy.deps;
-  delete copy.updated;
-  return JSON.parse(JSON.stringify(copy)) as unknown;
-}
-
-function compatible(source: Task, existing: Task): boolean {
-  return (
-    isDeepStrictEqual(fields(source), fields(existing)) &&
-    existing.deps.every((dep, index) =>
-      isDeepStrictEqual(dep, source.deps[index]),
-    )
-  );
-}
 
 export async function migrateCommand(rawArgs: string[]): Promise<string> {
   const started = performance.now();
@@ -93,48 +76,7 @@ export async function migrateCommand(rawArgs: string[]): Promise<string> {
       throw new AxiError(`Duplicate source id "${task.id}"`, "CONFLICT");
     ids.add(task.id);
   }
-  for (const task of tasks) {
-    const targets = new Set<string>();
-    for (const dep of task.deps) {
-      if (!ids.has(dep.id) || dep.id === task.id) {
-        throw new AxiError(
-          `Invalid source dependency "${task.id}" -> "${dep.id}"`,
-          "VALIDATION_ERROR",
-        );
-      }
-      if (targets.has(dep.id)) {
-        throw new AxiError(
-          `Beads supports only one dependency per task pair: "${task.id}" -> "${dep.id}"`,
-          "VALIDATION_ERROR",
-        );
-      }
-      targets.add(dep.id);
-    }
-  }
-  const remaining = new Map(tasks.map((task) => [task.id, task.deps.length]));
-  const dependents = new Map<string, string[]>();
-  for (const task of tasks) {
-    for (const dep of task.deps) {
-      const next = dependents.get(dep.id) ?? [];
-      next.push(task.id);
-      dependents.set(dep.id, next);
-    }
-  }
-  const ready = tasks
-    .filter((task) => task.deps.length === 0)
-    .map((task) => task.id);
-  for (let i = 0; i < ready.length; i++) {
-    for (const id of dependents.get(ready[i]) ?? []) {
-      const count = remaining.get(id)! - 1;
-      remaining.set(id, count);
-      if (count === 0) ready.push(id);
-    }
-  }
-  if (ready.length !== tasks.length)
-    throw new AxiError(
-      "Source dependency cycle must be resolved before migration",
-      "VALIDATION_ERROR",
-    );
+  checkImportGraph(tasks);
   destination.store.validateImport?.(tasks, [source.config.path, archivePath]);
   const existing = new Map(
     (await destination.store.list({})).items.map((task) => [task.id, task]),
@@ -176,28 +118,11 @@ export async function migrateCommand(rawArgs: string[]): Promise<string> {
         "CONFLICT",
       );
   }
-  let created = 0;
-  let dependenciesAdded = 0;
   const counts = { in_flight: 0, queued: 0, done: 0 };
-  const ordered = [
-    ...tasks.filter((task) => task.state === "in_flight").reverse(),
-    ...tasks.filter((task) => task.state !== "in_flight"),
-  ];
-  for (const task of ordered) {
-    counts[task.state]++;
-    if (existing.has(task.id)) continue;
-    await destination.store.create({
-      ...task,
-      created: task.created ?? null,
-      deps: [],
-    });
-    created++;
-  }
-  for (const task of tasks) {
-    for (const dep of task.deps) {
-      if (await destination.store.addDep(task.id, dep)) dependenciesAdded++;
-    }
-  }
+  for (const task of tasks) counts[task.state]++;
+  const written = await writeTasks(destination.store, tasks, existing);
+  const created = written.created.length;
+  const dependenciesAdded = written.dependenciesAdded;
   if (destination.config.beadsMirrorPath) await destination.store.render?.();
   const elapsed = performance.now() - started;
   const result = {

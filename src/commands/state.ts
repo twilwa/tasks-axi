@@ -43,7 +43,8 @@ import {
   PUBLIC_FOLLOWUP_KIND,
   clonePublicFollowup,
 } from "../public-followup.js";
-import type { Store } from "../store.js";
+import type { Store, TransferResult } from "../store.js";
+import { encode } from "@toon-format/toon";
 import { getSuggestions } from "../suggestions.js";
 import { renderHelp, renderOutput } from "../toon.js";
 import { renderTaskDetail, renderTaskList, showFullTextHint } from "../view.js";
@@ -108,21 +109,29 @@ ready_public_followups group; use tasks-axi public-followup ready for their full
 Held work is excluded by default; --include-held shows it in a separate held group.`;
 
 export const MV_HELP = `usage: tasks-axi mv <id> [<id>...] --to <path-or-dir> [--to-backend markdown|beads]
-Move a connected set to another Markdown backlog in one two-file transaction.
-Moves into or out of a beads store are refused for now (cross-store moves are not
-supported yet): nothing is locked, read or changed, and the command exits nonzero.
+Move a connected set to another Markdown backlog in one two-file transaction,
+or from a Markdown backlog into a beads store (--to-backend beads). Into beads,
+the Markdown file is the outbox: it keeps every item until each is created
+(by task id, never twice) and read back from beads, then releases them all in
+one write. A failed or killed move releases nothing; rerun the same mv to finish.
+A beads row whose content differs from its outbox item is a conflict.
+Moves out of a beads store are refused for now: nothing is locked, read or
+changed, and the command exits nonzero.
 Pass a whole connected set (a blocker and its dependents) to move it together;
 their blocked-by links and reason strings are preserved byte-exact.
 Duplicate ids are ignored after their first occurrence.
 Refuses if a moved item's dependency or active dependent would be stranded in the other
-collection - include the whole set, or move the missing endpoint there first.
-A moved id that already exists in the destination is a collision.
+collection - include the whole set, or move the missing endpoint there first. Into
+beads only an active dependent left behind refuses: an edge to an id in neither
+store is not written into beads and is reported as unlinked_deps instead.
+A moved id that already exists in a Markdown destination is a collision.
 flags:
-  --to-backend markdown|beads   destination backend (default: source backend; beads is refused for now)
+  --to-backend markdown|beads   destination backend (default: source backend)
   --json   print the result as a JSON object
 examples:
   tasks-axi mv hibit-cert-cleanup --to ../homemux/data/backlog.md
-  tasks-axi mv blocker-b1 dependent-d2 --to ../homemux/data/backlog.md`;
+  tasks-axi mv blocker-b1 dependent-d2 --to ../homemux/data/backlog.md
+  tasks-axi mv blocker-b1 --file outbox.md --to ../other/.beads --to-backend beads`;
 
 export async function startCommand(
   rawArgs: string[],
@@ -794,11 +803,12 @@ export async function mvCommand(
   }
   const ids = [...new Set(positionals.map((p) => requireId(p, "id")))];
 
-  // Any move with a beads side is refused here, before the destination is
+  // Any move out of beads is refused here, before the destination is
   // resolved or either store is locked, read or written. A beads "move" onto
-  // its own path still gets the current-backlog error below.
+  // its own path still gets the current-backlog error below. Markdown into
+  // beads is the outbox receive that transferMany owns.
   if (
-    (config.backend === "beads" || toBackend === "beads") &&
+    config.backend === "beads" &&
     !(toBackend === config.backend && resolve(to) === resolve(config.path))
   )
     throw crossStoreMoveError(
@@ -828,6 +838,7 @@ export async function mvCommand(
     ...resolveConfig({ backend: toBackend, file: targetPath }),
     archivePath: undefined,
   });
+  let result: TransferResult | undefined;
   if (capabilities.collectionTransfer) {
     if (!store.transferMany) {
       throw new AxiError(
@@ -835,7 +846,7 @@ export async function mvCommand(
         "UNSUPPORTED",
       );
     }
-    await store.transferMany(ids, target);
+    result = await store.transferMany(ids, target);
   } else if (ids.length === 1) {
     // Without an atomic transfer the copy and the removal are two writes, so a
     // multi-task move could strand a dependency edge halfway. One task is still
@@ -866,17 +877,34 @@ export async function mvCommand(
   }
 
   const single = ids.length === 1;
+  // A receiving destination reports what it confirmed; Markdown moves do not.
+  const received = result?.created
+    ? {
+        created: result.created,
+        existing: result.existing ?? [],
+        unlinked_deps: (result.unlinked ?? []).map(({ id, dep }) => ({
+          id,
+          type: dep.type,
+          target: dep.id,
+          ...(dep.reason ? { reason: dep.reason } : {}),
+        })),
+      }
+    : undefined;
   return renderMutation({
     json,
     confirm: single
       ? `mv ${ids[0]} -> ${targetPath}`
       : `mv ${ids.join(" ")} -> ${targetPath}`,
+    already: result?.already,
+    detail: received ? encode(received) : undefined,
     jsonPayload: {
       ok: true,
       action: "mv",
+      ...(result?.already ? { already: true } : {}),
       ...(single ? { id: ids[0] } : { ids }),
       from: config.path,
       to: targetPath,
+      ...received,
     },
     suggestions: getSuggestions({
       action: "mv",

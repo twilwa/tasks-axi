@@ -45,6 +45,7 @@ import type {
   PruneOptions,
   PruneResult,
   Store,
+  TransferResult,
 } from "../store.js";
 import {
   atomicWrite,
@@ -382,6 +383,7 @@ export class MarkdownStore implements Store {
       customStates: true,
       serverMintsIds: false,
       collectionTransfer: true,
+      collectionReceive: false,
       publicFollowups: true,
     };
   }
@@ -833,17 +835,112 @@ export class MarkdownStore implements Store {
     return moved;
   }
 
-  /** The upstream two-file markdown transaction; other destinations are refused. */
-  async transferMany(ids: string[], destination: Store): Promise<Task[]> {
-    if (!(destination instanceof MarkdownStore))
-      throw crossStoreMoveError(
-        { backend: "markdown", path: this.path },
-        {
-          backend: destination.capabilities().backend,
-          path: "the destination store",
-        },
+  /**
+   * The upstream two-file markdown transaction, or this backlog as the outbox
+   * of a destination that can receive; other destinations are refused.
+   */
+  async transferMany(
+    ids: string[],
+    destination: Store,
+  ): Promise<TransferResult> {
+    if (destination instanceof MarkdownStore)
+      return {
+        ids: (await this.moveManyTo(ids, destination)).map((t) => t.id),
+      };
+    const capabilities = destination.capabilities();
+    if (capabilities.collectionReceive && destination.receiveMany)
+      return this.releaseInto([...new Set(ids)], destination);
+    throw crossStoreMoveError(
+      { backend: "markdown", path: this.path },
+      { backend: capabilities.backend, path: "the destination store" },
+    );
+  }
+
+  /**
+   * Outbox protocol: this backlog stays the durable record until the
+   * destination confirms every selected task by reading it back. The
+   * destination then calls back, still holding its own lock, and all of them
+   * leave in one atomic write; that rename is the commit point. Lock order is
+   * destination first, then this backlog, and this lock is never held across
+   * a destination write. The release re-reads under the lock and refuses if a
+   * selected item changed meanwhile, so a cooperative edit is never lost. An
+   * interrupted run leaves every item here, and a rerun reuses the rows.
+   */
+  private async releaseInto(
+    ids: string[],
+    destination: Store,
+  ): Promise<TransferResult> {
+    const doc = this.load();
+    // Source order, so each state keeps its outbox order in the destination.
+    const selected = this.allTasks(doc).filter((task) => ids.includes(task.id));
+    const released = ids.filter(
+      (id) => !selected.some((task) => task.id === id),
+    );
+    this.requireNoStrandedDependents(doc, ids);
+    const received = await destination.receiveMany!(selected, {
+      readOnlyPaths: [this.path, this.archivePath, this.noteArchivePath],
+      released,
+      release: () => this.releaseReceived(selected, ids),
+    });
+    return {
+      ids,
+      ...received,
+      existing: [...received.existing, ...released],
+      ...(selected.length ? {} : { already: true }),
+    };
+  }
+
+  /** Remove confirmed outbox items in one atomic write, if none changed. */
+  private async releaseReceived(selected: Task[], ids: string[]) {
+    if (!selected.length) return;
+    try {
+      await withLock(this.path, () => {
+        const loaded = this.loadForUpdate();
+        this.requireNoStrandedDependents(loaded.doc, ids);
+        const entries = new Set<Entry>();
+        for (const task of selected) {
+          const found = this.findEntry(loaded.doc, task.id);
+          if (
+            !found ||
+            JSON.stringify(found.entry.task) !== JSON.stringify(task)
+          )
+            throw new AxiError(
+              `Outbox item "${task.id}" changed while it was being received; nothing was released`,
+              "CONFLICT",
+              [
+                "The destination holds the item as it was first read; reconcile the two by hand, then rerun the move",
+              ],
+            );
+          entries.add(found.entry);
+        }
+        for (const section of loaded.doc.sections)
+          section.entries = section.entries.filter((e) => !entries.has(e));
+        this.persist(loaded);
+      });
+    } catch (error) {
+      if (!(error instanceof AxiError) || error.code !== "LOCKED") throw error;
+      const lock = `${this.path}.lock`;
+      throw new AxiError(
+        `Every row is confirmed in the destination, but the outbox lock ${lock} is held, so nothing was released`,
+        "LOCKED",
+        [
+          `The first field of ${lock} is the pid of the tasks-axi process that took it; if no process with that pid is running, the lock is dead`,
+          `Remove a dead ${lock} and rerun the same mv: the rerun reuses the confirmed rows and only releases the outbox items`,
+          "If that process is alive, wait for it to finish and rerun",
+        ],
       );
-    return this.moveManyTo(ids, destination);
+    }
+  }
+
+  /** An active task left behind must not be blocked by a task that leaves. */
+  private requireNoStrandedDependents(doc: BacklogDoc, ids: string[]): void {
+    const moving = new Set(ids);
+    for (const id of ids) {
+      const stranded = this.activeDependents(doc, id).filter(
+        (dependent) => !moving.has(dependent),
+      );
+      if (stranded.length > 0) throw stillBlockingError(id, stranded);
+    }
   }
 
   /**

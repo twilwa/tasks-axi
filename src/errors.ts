@@ -92,8 +92,8 @@ export function partialMoveError(
 }
 
 /**
- * mv between two stores where either is beads. Refused before any lock, read
- * or write: receiving into beads is a separate, later change.
+ * mv out of a beads store (to Markdown or another beads database). Refused
+ * before any lock, read or write; only Markdown sources can act as an outbox.
  */
 export function crossStoreMoveError(
   from: { backend: string; path: string },
@@ -103,8 +103,8 @@ export function crossStoreMoveError(
     `cross-store moves are not supported yet: ${from.backend} ${from.path} -> ${to.backend} ${to.path}; nothing was changed`,
     "UNSUPPORTED",
     [
-      "Moves into or out of a beads store are refused until a follow-up adds receiving into beads",
-      "Moves between two Markdown backlogs still work",
+      "Moves out of a beads store are refused for now",
+      "Markdown to Markdown and Markdown to beads moves work",
     ],
   );
 }

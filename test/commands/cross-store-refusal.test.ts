@@ -16,11 +16,11 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { BeadsStore } from "../../src/backends/beads.js";
-import { MarkdownStore } from "../../src/backends/markdown.js";
 import { hasBr, makeBeadsWorkspace } from "../beads-helpers.js";
 
-// Cross-store moves are refused before any lock, read or write: no br call,
-// no lockfile, and every byte of both stores unchanged.
+// Moves out of beads are refused before any lock, read or write: no br call,
+// no lockfile, and every byte of both stores unchanged. Markdown into beads is
+// the outbox receive (test/backends/beads-receive.test.ts).
 const SEED =
   "# Backlog\n\n## In flight\n\n## Queued\n\n- [ ] root - Root\n- [ ] work - Work blocked-by: root\n\n## Done\n";
 const EMPTY = "# Backlog\n\n## In flight\n\n## Queued\n\n## Done\n";
@@ -80,9 +80,6 @@ const CASES: {
   fresh?: boolean;
   freshSource?: boolean;
 }[] = [
-  { from: "markdown", to: "beads", ids: ["root"] },
-  { from: "markdown", to: "beads", ids: ["work", "root"] },
-  { from: "markdown", to: "beads", ids: ["work", "root"], fresh: true },
   { from: "beads", to: "markdown", ids: ["root"] },
   { from: "beads", to: "markdown", ids: ["work", "root"] },
   { from: "beads", to: "markdown", ids: ["root"], freshSource: true },
@@ -202,30 +199,7 @@ describe.skipIf(!hasBr)("cross-store mv is refused", () => {
   }, 30_000);
 });
 
-describe("store-level cross-store transfers are refused", () => {
-  it("MarkdownStore.transferMany refuses a beads destination without touching either side", async () => {
-    const home = mkdtempSync(join(tmpdir(), "tasks-axi-refuse-"));
-    try {
-      const src = join(home, "backlog.md");
-      writeFileSync(src, SEED);
-      const markdown = new MarkdownStore({ path: src });
-      const db = join(home, "dst", ".beads", "beads.db");
-      const beads = new BeadsStore({ path: db });
-      const before = snapshot(home);
-      await expect(
-        markdown.transferMany(["root"], beads),
-      ).rejects.toMatchObject({
-        code: "UNSUPPORTED",
-        message: expect.stringContaining(
-          "cross-store moves are not supported yet",
-        ),
-      });
-      expect(snapshot(home)).toEqual(before);
-    } finally {
-      rmSync(home, { recursive: true, force: true });
-    }
-  });
-
+describe("store-level transfers out of beads are refused", () => {
   it("the beads backend does not offer collection transfer", () => {
     const beads = new BeadsStore({
       path: join(tmpdir(), "tasks-axi-none", ".beads", "beads.db"),
