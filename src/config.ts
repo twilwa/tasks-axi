@@ -386,14 +386,26 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ResolvedConfig {
         );
       config.beadsLockTimeoutMs = lockTimeout;
     }
-    const mirror = validatePathValue(
-      projectToml.beads?.mirror ?? homeToml.beads?.mirror,
-      "beads.mirror",
-    );
-    const mirrorArchive = validatePathValue(
-      projectToml.beads?.mirror_archive ?? homeToml.beads?.mirror_archive,
-      "beads.mirror_archive",
-    );
+    const mirror =
+      env.TASKS_AXI_BEADS_MIRROR !== undefined
+        ? validatePathValue(
+            env.TASKS_AXI_BEADS_MIRROR,
+            "TASKS_AXI_BEADS_MIRROR",
+          )
+        : validatePathValue(
+            projectToml.beads?.mirror ?? homeToml.beads?.mirror,
+            "beads.mirror",
+          );
+    const mirrorArchive =
+      env.TASKS_AXI_BEADS_MIRROR_ARCHIVE !== undefined
+        ? validatePathValue(
+            env.TASKS_AXI_BEADS_MIRROR_ARCHIVE,
+            "TASKS_AXI_BEADS_MIRROR_ARCHIVE",
+          )
+        : validatePathValue(
+            projectToml.beads?.mirror_archive ?? homeToml.beads?.mirror_archive,
+            "beads.mirror_archive",
+          );
     const configuredDatabase =
       env.TASKS_AXI_BEADS_PATH ??
       projectToml.beads?.path ??

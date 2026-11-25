@@ -275,7 +275,8 @@ timeout_ms = 30000           # optional; kills the owned child at the deadline
 lock_timeout_ms = 120000     # optional; how long a writer waits for the backlog lock
 ```
 
-`TASKS_AXI_BEADS_PATH`, `TASKS_AXI_BEADS_BINARY`, `TASKS_AXI_BEADS_PREFIX`, `TASKS_AXI_BEADS_TIMEOUT_MS`, and `TASKS_AXI_BEADS_LOCK_TIMEOUT_MS` override the matching TOML values.
+`TASKS_AXI_BEADS_PATH`, `TASKS_AXI_BEADS_BINARY`, `TASKS_AXI_BEADS_PREFIX`, `TASKS_AXI_BEADS_TIMEOUT_MS`, `TASKS_AXI_BEADS_LOCK_TIMEOUT_MS`, `TASKS_AXI_BEADS_MIRROR`, and `TASKS_AXI_BEADS_MIRROR_ARCHIVE` override the matching TOML values (the last two override `beads.mirror` and `beads.mirror_archive`, see [Read-only markdown mirrors](#read-only-markdown-mirrors)).
+A variable set to an empty or whitespace-only value is a validation error; it does not fall back to TOML. Unset it instead.
 Project configuration can select only the bare executable names `br` or `bd` on PATH.
 Custom executable paths or other programs require trusted home configuration or `TASKS_AXI_BEADS_BINARY`.
 `--file` and `TASKS_AXI_FILE` take precedence over the beads path setting. Relative paths resolve from the current directory.
@@ -396,7 +397,8 @@ mirror_archive = "mirror/done-archive.md" # optional; defaults beside mirror
 ```
 
 After each successful tasks-axi beads mutation, including idempotent writes, the adapter rewrites these canonical markdown projections while holding the database's Store lock.
-Mirrors belong to the configured beads database; a different `--file` database does not inherit them.
+`TASKS_AXI_BEADS_MIRROR` and `TASKS_AXI_BEADS_MIRROR_ARCHIVE` set the same two paths and take precedence over project `.tasks.toml`, which takes precedence over `~/.tasks-axi/config.toml`. Relative paths, from the environment or TOML alike, resolve from the current directory.
+Mirrors belong to the configured beads database (`TASKS_AXI_BEADS_PATH`, else `[beads] path`); a different `--file` or `mv --to` database does not inherit them, whether the mirror paths come from the environment or TOML.
 Reads do not write mirrors. `tasks-axi render --backend beads` rebuilds them without changing native tasks; without `beads.mirror`, render is unsupported.
 Treat both generated files as read-only. Edits are overwritten, not imported. Do not point a markdown writer at them.
 Migration refuses output paths that overlap its sources, including symlink aliases. Mirror outputs also cannot overlap each other, the database, its sidecars or locks, or the note archive.
