@@ -299,6 +299,66 @@ describe.skipIf(!hasBr)("mv between markdown and beads collections", () => {
     30_000,
   );
 
+  it.each(["source", "destination"])(
+    "writes environment-configured mirrors only for the configured database when it is the move's %s",
+    async (role) => {
+      const configured = makeBeadsWorkspace();
+      const peer = makeBeadsWorkspace();
+      const home = join(configured.dir, "home");
+      const mirror = join(configured.dir, "mirror", "backlog.md");
+      const archive = join(configured.dir, "mirror", "done-archive.md");
+      mkdirSync(home);
+      const env = {
+        TASKS_AXI_BEADS_PATH: configured.path,
+        TASKS_AXI_BEADS_MIRROR: "mirror/backlog.md",
+        TASKS_AXI_BEADS_MIRROR_ARCHIVE: "mirror/done-archive.md",
+      };
+      const owner = new BeadsStore({ path: configured.path });
+      const other = new BeadsStore({ path: peer.path });
+      const source = role === "source" ? owner : other;
+      const sourcePath = role === "source" ? configured.path : peer.path;
+      const targetPath = role === "source" ? peer.path : configured.path;
+      try {
+        await owner.create({
+          id: "kept",
+          title: "Configured database task",
+          created: null,
+        });
+        await other.create({ id: "peer", title: "Peer task", created: null });
+        await source.create({ id: "root", title: "Moved task", created: null });
+        const moved = runMoveToBeads(
+          sourcePath,
+          targetPath,
+          home,
+          env,
+          "beads",
+          configured.dir,
+        );
+        expect(moved.error).toBeUndefined();
+        expect(moved.status).toBe(0);
+        expect(JSON.parse(moved.stdout)).toMatchObject({
+          ok: true,
+          action: "mv",
+          id: "root",
+        });
+        expect(
+          await new BeadsStore({ path: targetPath }).get("root"),
+        ).toMatchObject({ title: "Moved task" });
+        expect(
+          (await new MarkdownStore({ path: mirror }).list({})).items.map(
+            (task) => task.id,
+          ),
+        ).toEqual(role === "source" ? ["kept"] : ["kept", "root"]);
+        expect(existsSync(archive)).toBe(true);
+        expect(existsSync(join(peer.dir, "mirror"))).toBe(false);
+      } finally {
+        configured.cleanup();
+        peer.cleanup();
+      }
+    },
+    30_000,
+  );
+
   for (const [from, to] of [
     ["markdown", "beads"],
     ["beads", "markdown"],

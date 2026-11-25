@@ -188,6 +188,76 @@ describe("beads database addressing", () => {
     });
   });
 
+  it("resolves env mirror paths over project and home TOML, relative to cwd", () => {
+    writeFileSync(
+      join(home, ".tasks-axi", "config.toml"),
+      '[beads]\nmirror = "home-mirror/backlog.md"\nmirror_archive = "home-mirror/archive.md"\n',
+    );
+    writeFileSync(
+      join(dir, ".tasks.toml"),
+      'backend = "beads"\n[beads]\npath = "selected.db"\nmirror = "project-mirror/backlog.md"\nmirror_archive = "project-mirror/archive.md"\n',
+    );
+    expect(
+      resolveConfig({
+        cwd: dir,
+        home,
+        env: {
+          TASKS_AXI_BEADS_MIRROR: "env-mirror/backlog.md",
+          TASKS_AXI_BEADS_MIRROR_ARCHIVE: "env-mirror/archive.md",
+        },
+      }),
+    ).toMatchObject({
+      beadsMirrorPath: join(dir, "env-mirror/backlog.md"),
+      beadsMirrorArchivePath: join(dir, "env-mirror/archive.md"),
+    });
+  });
+
+  it.each([
+    ["TASKS_AXI_BEADS_MIRROR", ""],
+    ["TASKS_AXI_BEADS_MIRROR", "   "],
+    ["TASKS_AXI_BEADS_MIRROR_ARCHIVE", ""],
+    ["TASKS_AXI_BEADS_MIRROR_ARCHIVE", "   "],
+  ])(
+    "rejects an empty %s (%j) instead of falling back to TOML",
+    (name, value) => {
+      writeFileSync(
+        join(dir, ".tasks.toml"),
+        'backend = "beads"\n[beads]\npath = "selected.db"\nmirror = "m.md"\nmirror_archive = "a.md"\n',
+      );
+      expect(() =>
+        resolveConfig({ cwd: dir, home, env: { [name]: value } }),
+      ).toThrow(new RegExp(`${name} must not be empty`));
+    },
+  );
+
+  it("attaches env mirrors only to the env-configured database, not a --file or mv --to peer", () => {
+    const env = {
+      TASKS_AXI_BACKEND: "beads",
+      TASKS_AXI_BEADS_PATH: ".beads",
+      TASKS_AXI_BEADS_MIRROR: "data/backlog.md",
+      TASKS_AXI_BEADS_MIRROR_ARCHIVE: "data/done-archive.md",
+    };
+    expect(resolveConfig({ cwd: dir, home, env })).toMatchObject({
+      path: join(dir, ".beads"),
+      beadsMirrorPath: join(dir, "data/backlog.md"),
+      beadsMirrorArchivePath: join(dir, "data/done-archive.md"),
+    });
+    expect(
+      resolveConfig({ cwd: dir, home, env, file: ".beads/beads.db" }),
+    ).toMatchObject({ beadsMirrorPath: join(dir, "data/backlog.md") });
+    // mv --to resolves its destination through resolveConfig({ backend, file }).
+    const peer = resolveConfig({
+      cwd: dir,
+      home,
+      env,
+      backend: "beads",
+      file: "peer.db",
+    });
+    expect(peer.path).toBe(join(dir, "peer.db"));
+    expect(peer.beadsMirrorPath).toBeUndefined();
+    expect(peer.beadsMirrorArchivePath).toBeUndefined();
+  });
+
   it.each(["mirror", "mirror_archive"])(
     "rejects empty or non-string beads.%s",
     (key) => {
